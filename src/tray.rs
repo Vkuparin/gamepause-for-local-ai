@@ -15,6 +15,7 @@ use std::{
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
     Graphics::Gdi::{CreateBitmap, DeleteObject},
+    System::Diagnostics::Debug::MessageBeep,
     System::LibraryLoader::GetModuleHandleW,
     UI::{Shell::*, WindowsAndMessaging::*},
 };
@@ -37,6 +38,7 @@ struct UI {
     icon: HICON,
     taskbar_message: u32,
     last_error: String,
+    last_kind: StateKind,
     menu_open: bool,
 }
 thread_local! {static UI_STATE:RefCell<Option<UI>>=const{RefCell::new(None)};}
@@ -202,6 +204,91 @@ unsafe fn notification(hwnd: HWND, operation: u32, ui: &UI) {
         Shell_NotifyIconW(operation, &data);
     }
 }
+/// The engine's user-facing state, classified from the current status message
+/// plus the manual-pause flag. Single source of truth for the toast (P1-5) and
+/// the state-colored tray icon (P1-6).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StateKind {
+    /// Healthy / idle — the base icon. A successful restore lands here ("AI restored").
+    Idle,
+    /// AI is paused for gaming (automatic) or manually paused.
+    Paused,
+    /// Something needs human attention (a pause/restore failure, or repeated
+    /// transient errors).
+    Attention,
+}
+pub fn state_kind(message: &str, manual_pause: bool) -> StateKind {
+    // Attention wins: a restore failure or repeated transient error must be
+    // surfaced even if a pause message is also present.
+    if message.starts_with("Restore failed") || message.starts_with("Needs attention") {
+        return StateKind::Attention;
+    }
+    if message.starts_with("AI paused") || manual_pause {
+        return StateKind::Paused;
+    }
+    StateKind::Idle
+}
+/// Toast severity. Pure data so the mapping is unit-testable (P1-5 acceptance).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Severity {
+    /// Pause-success or restore-success — the "good" system sound.
+    Success,
+    /// Any failure — the warning system sound.
+    Error,
+}
+/// The toast title + severity for a given state (the "mapping table" the plan
+/// wants asserted). The body is always the engine's own message, so the user
+/// sees exactly what the engine said.
+pub struct ToastSpec {
+    pub title: &'static str,
+    pub severity: Severity,
+}
+pub fn toast_spec(kind: StateKind) -> ToastSpec {
+    match kind {
+        StateKind::Attention => ToastSpec {
+            title: "GamePause needs attention",
+            severity: Severity::Error,
+        },
+        StateKind::Paused => ToastSpec {
+            title: "GamePause",
+            severity: Severity::Success,
+        },
+        StateKind::Idle => ToastSpec {
+            title: "GamePause",
+            severity: Severity::Success,
+        },
+    }
+}
+/// The system sound for a state. The "tiny indirection" the plan asks for:
+/// tests assert this mapping instead of calling a live `MessageBeep`.
+pub fn beep_code(kind: StateKind) -> u32 {
+    match kind {
+        StateKind::Attention => MB_ICONASTERISK,
+        // Pause-success and restore-success are both "good" → the OK sound.
+        StateKind::Idle | StateKind::Paused => MB_OK,
+    }
+}
+unsafe fn state_toast(hwnd: HWND, message: &str, kind: StateKind) {
+    unsafe {
+        let spec = toast_spec(kind);
+        let mut data: NOTIFYICONDATAW = std::mem::zeroed();
+        data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        data.hWnd = hwnd;
+        data.uID = 1;
+        data.uFlags = NIF_INFO;
+        data.dwInfoFlags = if spec.severity == Severity::Error {
+            NIIF_ERROR
+        } else {
+            NIIF_INFO
+        };
+        let title: Vec<_> = spec.title.encode_utf16().collect();
+        data.szInfoTitle[..title.len()].copy_from_slice(&title);
+        let info: Vec<_> = message.encode_utf16().take(255).collect();
+        data.szInfo[..info.len()].copy_from_slice(&info);
+        Shell_NotifyIconW(NIM_MODIFY, &data);
+        MessageBeep(beep_code(kind));
+    }
+}
 unsafe fn menu(hwnd: HWND, ui: &UI) {
     unsafe {
         let menu = CreatePopupMenu();
@@ -317,36 +404,42 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, w: WPARAM, l: LP
                     .map(|s| s.message.clone())
                     .unwrap_or_default();
                 let pending = ui.shared.lock().map(|s| s.pending).unwrap_or(true);
-                let show_error = UI_STATE.with(|state| {
+                let manual_pause = ui.shared.lock().map(|s| s.manual_pause).unwrap_or(false);
+                // Keep the tray tooltip's "current attention" line in sync with
+                // the state. This display bookkeeping is asserted by
+                // `timer_can_reenter_while_menu_context_is_alive`: set the line
+                // when a "Needs attention" message changes, clear it once a
+                // healthy message arrives with no pending work, otherwise leave
+                // it untouched.
+                UI_STATE.with(|state| {
                     let mut state = state.borrow_mut();
                     let Some(current) = state.as_mut() else {
-                        return false;
+                        return;
                     };
                     if text.starts_with("Needs attention:") && text != current.last_error {
                         current.last_error = text.clone();
-                        true
-                    } else {
-                        if !text.starts_with("Needs attention:") && !pending {
-                            current.last_error.clear();
-                        }
-                        false
+                    } else if !text.starts_with("Needs attention:") && !pending {
+                        current.last_error.clear();
                     }
                 });
-                if show_error {
-                    unsafe {
-                        let mut data: NOTIFYICONDATAW = std::mem::zeroed();
-                        data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-                        data.hWnd = hwnd;
-                        data.uID = 1;
-                        data.uFlags = NIF_INFO;
-                        data.dwInfoFlags = NIIF_WARNING;
-                        let title: Vec<_> = "GamePause needs attention".encode_utf16().collect();
-                        data.szInfoTitle[..title.len()].copy_from_slice(&title);
-                        let info: Vec<_> = text.encode_utf16().take(255).collect();
-                        data.szInfo[..info.len()].copy_from_slice(&info);
-                        Shell_NotifyIconW(NIM_MODIFY, &data);
+                // Edge-triggered toast + system sound on a state *transition*
+                // (pause-success, restore-success, restore/pause-failure), not on
+                // every tick — a held state toasts exactly once. The mapping and
+                // the `MessageBeep` code live in `state_toast` so the table is
+                // unit-testable (P1-5).
+                let kind = state_kind(&text, manual_pause);
+                UI_STATE.with(|state| {
+                    let mut state = state.borrow_mut();
+                    let Some(current) = state.as_mut() else {
+                        return;
+                    };
+                    if kind != current.last_kind {
+                        current.last_kind = kind;
+                        unsafe {
+                            state_toast(hwnd, &text, kind);
+                        }
                     }
-                }
+                });
             }
             0
         }
@@ -429,6 +522,7 @@ pub fn run(shared: SharedState, tx: Sender<Action>, folder: PathBuf, show: bool)
             icon: icon(),
             taskbar_message: RegisterWindowMessageW(taskbar.as_ptr()),
             last_error: String::new(),
+            last_kind: StateKind::Idle,
             menu_open: false,
         };
         UI_STATE.with(|state| *state.borrow_mut() = Some(ui));
@@ -492,6 +586,51 @@ fn bail_message() -> Result<()> {
 mod tests {
     use super::*;
     #[test]
+    fn state_kind_maps_engine_messages_to_states() {
+        // Pause-success moment.
+        assert_eq!(state_kind("AI paused for gaming", false), StateKind::Paused);
+        assert_eq!(state_kind("AI paused for gaming", true), StateKind::Paused);
+        // Restore-success moment: a successful restore lands idle.
+        assert_eq!(state_kind("AI restored", false), StateKind::Idle);
+        assert_eq!(state_kind("AI available", false), StateKind::Idle);
+        // Restore-failure and pause-failure both need attention.
+        assert_eq!(
+            state_kind("Restore failed — AI not restored: embed", false),
+            StateKind::Attention
+        );
+        assert_eq!(
+            state_kind("Needs attention: embed", false),
+            StateKind::Attention
+        );
+        // A failure beats a concurrent pause flag: attention wins.
+        assert_eq!(
+            state_kind("Needs attention: embed", true),
+            StateKind::Attention
+        );
+        // Manual pause with no failure message.
+        assert_eq!(state_kind("AI available", true), StateKind::Paused);
+    }
+    #[test]
+    fn toast_spec_returns_right_title_and_severity_per_state() {
+        // Pause-success and restore-success → the "good" sound, plain title.
+        let paused = toast_spec(StateKind::Paused);
+        assert_eq!(paused.title, "GamePause");
+        assert_eq!(paused.severity, Severity::Success);
+        let idle = toast_spec(StateKind::Idle);
+        assert_eq!(idle.title, "GamePause");
+        assert_eq!(idle.severity, Severity::Success);
+        // Restore/pause-failure → error style, attention title.
+        let attention = toast_spec(StateKind::Attention);
+        assert_eq!(attention.title, "GamePause needs attention");
+        assert_eq!(attention.severity, Severity::Error);
+    }
+    #[test]
+    fn beep_code_maps_success_to_ok_and_failure_to_warning() {
+        assert_eq!(beep_code(StateKind::Idle), MB_OK);
+        assert_eq!(beep_code(StateKind::Paused), MB_OK);
+        assert_eq!(beep_code(StateKind::Attention), MB_ICONASTERISK);
+    }
+    #[test]
     fn timer_can_reenter_while_menu_context_is_alive() {
         use crate::app::Shared;
         use std::sync::{Arc, Mutex, mpsc};
@@ -519,6 +658,7 @@ mod tests {
                 icon: null_mut(),
                 taskbar_message: WM_APP + 9,
                 last_error: String::new(),
+                last_kind: StateKind::Idle,
                 menu_open: false,
             })
         });
