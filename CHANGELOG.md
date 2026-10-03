@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.3.0 — 2026-10-04 (preview)
+
+### Resilience
+- Degrade instead of dying when the data directory is temporarily unavailable; recovery state is preserved and control resumes when the path is writable again.
+- Contain a panicking game-discovery adapter behind the last-good inventory, so a single bad launcher can no longer take down detection.
+- Log uncaught panics to the local `gamepause.log` (best-effort, local-only) and surface an explicit "Restore failed — AI not restored, click Restore" status while keeping the recovery journal intact and resumable.
+
+### UX and native polish
+- Per-Monitor v2 DPI with `WM_DPICHANGED` relayout, so the dashboard stays crisp and unstretched across mixed-DPI multi-monitor setups.
+- Follow the Windows theme: DWM dark caption for the window and tray-anchored panel, and control colors taken from system brushes so light and dark both look native.
+- Group-box sectioning (Games / Settings / Actions) and a tighter, single-source-of-truth layout grid.
+- State toasts plus an optional system sound on pause, restore, and failure.
+- Tray icon now reflects state — idle, paused, and attention.
+- Usage-path fixes and expanded acceptance tests.
+
+### Development and scripting
+- **Test round-trip (verify AI):** run the full capture → unload → confirm-server-emptied → restore → field-compare cycle on demand from the dashboard, the tray, or `GamePauseCLI.exe --verify`, and see which step failed.
+- **Diagnostics core:** a structured doctor report (LM Studio version, server state, loaded models, data-dir writability) backing both the `--doctor` panel and the CLI.
+- **Stable CLI output for scripting:** `--status` (key=value state) and `--games` (name / launcher / path), plus `--doctor` and `--verify`; the read-only commands work while a GUI instance is running.
+- **Per-capture/restore WS logging:** each WebSocket step records the LM Studio version and a `success` or `failed:<field>` line (naming the diverged field) to the local log.
+
+### Documentation
+- README "Recovery" section: what to do if GamePause disappears mid-pause — relaunch it and the restore resumes.
+
+### Deferred to a follow-up
+- CI for the interactive popup-reentrancy test (Windows runner only); kept as an ignored local test for now.
+
 ## 0.2.0 — 2026-10-03 (preview)
 
 - Enable automatic pausing by default and migrate the old observation/active setup.
