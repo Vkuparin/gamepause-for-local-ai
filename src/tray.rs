@@ -1,6 +1,6 @@
 use crate::{
     app::{Action, SharedState},
-    wide,
+    dashboard, wide,
 };
 use anyhow::{Context, Result};
 use std::{
@@ -21,6 +21,7 @@ use windows_sys::Win32::{
 use winreg::{RegKey, enums::*};
 
 const CALLBACK: u32 = WM_APP + 1;
+const SHOW_DASHBOARD: u32 = WM_APP + 2;
 const STARTUP_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 static WINDOW: AtomicIsize = AtomicIsize::new(0);
 static FINISHED: AtomicBool = AtomicBool::new(false);
@@ -70,6 +71,21 @@ fn begin_menu() -> Option<MenuSession> {
         Some(MenuSession { ui: ui.clone() })
     })
 }
+fn window_class(folder: &Path) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    folder.to_string_lossy().to_lowercase().hash(&mut hasher);
+    format!("GamePauseTrayWindow-{:x}", hasher.finish())
+}
+pub fn show_existing(folder: &Path) -> bool {
+    unsafe {
+        let window = FindWindowW(wide(&window_class(folder)).as_ptr(), null());
+        if window.is_null() {
+            return false;
+        }
+        PostMessageW(window, SHOW_DASHBOARD, 0, 0) != 0
+    }
+}
 pub fn request_exit() {
     FINISHED.store(true, Ordering::Relaxed);
     let window = WINDOW.load(Ordering::Relaxed);
@@ -99,7 +115,7 @@ pub fn startup_enabled() -> bool {
 }
 pub fn startup_command(executable: &Path, folder: &Path) -> String {
     format!(
-        "\"{}\" --data-dir \"{}\"",
+        "\"{}\" --background --data-dir \"{}\"",
         executable.display(),
         folder.display()
     )
@@ -192,6 +208,7 @@ unsafe fn menu(hwnd: HWND, ui: &UI) {
         let state = ui.shared.lock().unwrap();
         let items = [
             (0, state.message.clone(), MF_GRAYED),
+            (9, "Open GamePause".into(), 0),
             (
                 1,
                 "Pause AI manually".into(),
@@ -214,11 +231,15 @@ unsafe fn menu(hwnd: HWND, ui: &UI) {
             ),
             (
                 3,
-                "Disable detection".into(),
-                if state.disabled { MF_CHECKED } else { 0 },
+                "Automatically pause AI while gaming".into(),
+                if state.config.automation_enabled {
+                    MF_CHECKED
+                } else {
+                    0
+                },
             ),
             (4, "Refresh installed games".into(), 0),
-            (5, "Open configuration".into(), 0),
+            (5, "Settings and games".into(), 0),
             (6, "Open logs and status folder".into(), 0),
             (
                 7,
@@ -251,8 +272,8 @@ unsafe fn menu(hwnd: HWND, ui: &UI) {
             3 => Some(Action::Disable),
             4 => Some(Action::Refresh),
             8 => Some(Action::Quit),
-            5 => {
-                open_path(&ui.folder.join("config.json"));
+            5 | 9 => {
+                dashboard::show(ui.shared.clone(), ui.tx.clone(), ui.folder.clone());
                 None
             }
             6 => {
@@ -329,8 +350,20 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, w: WPARAM, l: LP
             }
             0
         }
+        SHOW_DASHBOARD => {
+            if let Some(ui) = ui_snapshot() {
+                dashboard::show(ui.shared, ui.tx, ui.folder);
+            }
+            0
+        }
         CALLBACK => {
-            if (l as u32 == WM_RBUTTONUP || l as u32 == WM_LBUTTONUP)
+            if l as u32 == WM_LBUTTONUP {
+                if let Some(ui) = ui_snapshot() {
+                    dashboard::show(ui.shared, ui.tx, ui.folder);
+                }
+                return 0;
+            }
+            if l as u32 == WM_RBUTTONUP
                 && let Some(session) = begin_menu()
             {
                 unsafe {
@@ -351,6 +384,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, w: WPARAM, l: LP
             0
         }
         WM_DESTROY => {
+            dashboard::close();
             if let Some(ui) = ui_snapshot() {
                 unsafe {
                     notification(hwnd, NIM_DELETE, &ui);
@@ -383,10 +417,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, w: WPARAM, l: LP
         }
     }
 }
-pub fn run(shared: SharedState, tx: Sender<Action>, folder: PathBuf) -> Result<()> {
+pub fn run(shared: SharedState, tx: Sender<Action>, folder: PathBuf, show: bool) -> Result<()> {
     unsafe {
         let instance = GetModuleHandleW(null());
-        let class = wide("GamePauseTrayWindow");
+        let class = wide(&window_class(&folder));
         let taskbar = wide("TaskbarCreated");
         let ui = UI {
             shared,
@@ -429,6 +463,9 @@ pub fn run(shared: SharedState, tx: Sender<Action>, folder: PathBuf) -> Result<(
             notification(window, NIM_ADD, &ui);
         }
         SetTimer(window, 1, 2000, None);
+        if show {
+            PostMessageW(window, SHOW_DASHBOARD, 0, 0);
+        }
         let mut msg: MSG = std::mem::zeroed();
         loop {
             let status = GetMessageW(&mut msg, null_mut(), 0, 0);
@@ -437,6 +474,9 @@ pub fn run(shared: SharedState, tx: Sender<Action>, folder: PathBuf) -> Result<(
             }
             if status == -1 {
                 bail_message()?;
+            }
+            if dashboard::is_dialog_message(&msg) {
+                continue;
             }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
@@ -462,6 +502,14 @@ mod tests {
             manual_pause: false,
             pending: true,
             active_mode: false,
+            config: crate::config::Config::default(),
+            games: vec![],
+            active_games: vec![],
+            running_apps: vec![],
+            discovery_errors: Default::default(),
+            settings_error: String::new(),
+            revision: 0,
+            discovery_ready: false,
         }));
         UI_STATE.with(|state| {
             *state.borrow_mut() = Some(UI {
@@ -512,6 +560,14 @@ mod tests {
             manual_pause: false,
             pending: false,
             active_mode: false,
+            config: crate::config::Config::default(),
+            games: vec![],
+            active_games: vec![],
+            running_apps: vec![],
+            discovery_errors: Default::default(),
+            settings_error: String::new(),
+            revision: 0,
+            discovery_ready: false,
         }));
         let (tx, _rx) = mpsc::channel();
         let driver = std::thread::spawn(|| {
@@ -525,7 +581,7 @@ mod tests {
             for _ in 0..3 {
                 let before = MENU_TIMER_TICKS.load(Ordering::Relaxed);
                 unsafe {
-                    PostMessageW(hwnd, CALLBACK, 0, WM_LBUTTONUP as LPARAM);
+                    PostMessageW(hwnd, CALLBACK, 0, WM_RBUTTONUP as LPARAM);
                 }
                 let deadline = Instant::now() + Duration::from_secs(10);
                 while MENU_TIMER_TICKS.load(Ordering::Relaxed) < before + 2
@@ -542,7 +598,7 @@ mod tests {
             request_exit();
             counts
         });
-        run(shared, tx, PathBuf::from(".")).unwrap();
+        run(shared, tx, PathBuf::from("."), false).unwrap();
         let counts = driver.join().unwrap();
         assert_eq!(
             MENU_OPENINGS.load(Ordering::Relaxed),
@@ -563,7 +619,7 @@ mod tests {
         );
         assert_eq!(
             command,
-            r#""C:\Program Files\GamePause\GamePause.exe" --data-dir "D:\AI Data\GamePause""#
+            r#""C:\Program Files\GamePause\GamePause.exe" --background --data-dir "D:\AI Data\GamePause""#
         );
     }
 }

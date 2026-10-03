@@ -1,55 +1,50 @@
 # Usage and recovery
 
-## First session
+## Everyday use
 
-Keep LM Studio open, with its server running and the models you want available after gaming.
-Run GamePause in observation mode, launch a game, and check its detected name. Correct
-exclusions or missing locations before switching to active mode. Restart after config edits.
+Keep LM Studio open and load whichever models you want available after gaming. Install GamePause and launch your games normally. Automatic pausing is enabled by default; there is no observation-mode setup or model-name list.
 
-In active mode, the first detected game creates a durable snapshot. GamePause stops the
-HTTP server by default and unloads the original instances. Additional games share the same
-snapshot. Alt-tabbing does not end a gaming session. A process exit or crash does.
+GamePause discovers Steam, Epic, EA, Ubisoft Connect, Battle.net, and Xbox installations automatically. Small launcher inventories refresh every 30 seconds. A new unfamiliar process in a known Steam library requests an early metadata refresh. It does not classify arbitrary executables as games just because they are in that library. Xbox package discovery refreshes every five minutes while idle; expensive refreshes defer during gaming.
 
-When no recognized games remain, the 30-second timer starts. Starting another game cancels
-that timer. Restoration reloads the saved models and checks their settings. The server is
-returned to its original running state. If nothing was loaded initially, nothing is loaded
-afterward.
+When a recognized game starts, GamePause captures all loaded models and their settings before unloading. It uses the existing local server's port, or temporarily starts the server to capture settings and closes it again. The original server state is remembered. Known launchers, background utilities, installers, crash reporters, and anti-cheat helpers do not start gaming sessions.
+
+Additional games share the original snapshot. Alt-tabbing keeps the session active. After the last recognized game exits, the default 30-second delay starts. A new game cancels the countdown. Restoration checks the saved model identities and settings and returns the server to its original running/stopped state. If nothing was loaded, nothing is loaded afterward.
+
+## Dashboard
+
+Left-click the tray icon or open GamePause from Start. Closing the window leaves monitoring running in the tray. Right-click the tray icon for quick actions; **Quit** stops the watcher and keeps pending recovery.
+
+- **Games:** search discovered installations, see running status and recognition source, and ignore or enable an entry. New recognized games are enabled automatically.
+- **Running apps:** select a missed game and click **Add selected as game**. Accessible running applications are listed only while this page is open. Select the actual game executable, not a launcher.
+- **Add game…:** browse for a standalone game's executable. Its full path is saved; the installation directory is not broadly classified.
+- **Ignored:** re-enable games or saved path exclusions. Built-in launcher/helper exclusions remain automatic.
+- **Refresh now:** request discovery immediately. Routine use does not require it.
+- **Automatically pause AI while gaming:** takes effect without restarting and is remembered. Turning it off does not discard captured models: an existing session waits for recognized games to exit, then restores normally.
+- **Start when I sign in to Windows:** controls per-user startup. Sign-in starts quietly in the tray.
+- **Settings:** reveal optional **Restore after (seconds)** and **Local API** fields, saved with **Save settings**. **Locate lms…** handles unusual CLI installations. Normal launcher/LM Studio setups need no edits.
+
+Selected rows show their path and why they are recognized. Discovery and save errors appear in the window. A missing LM Studio connection retains models/recovery and is retried automatically.
+
+## Manual actions
+
+**Pause / resume AI manually** holds the session open without a game. Release it to allow restoration after the delay. **Restore AI now** removes the delay; recognized games still prevent restoring. The tray menu exposes the same actions.
 
 ## Background AI applications
 
-Clients using LM Studio's HTTP server will be unavailable during gaming. Pause background
-agents that can independently restart the server or explicitly load models. With
-`stop_server_during_gaming: false`, GamePause only unloads the originals; a client using JIT
-loading can immediately reload them. This setting is suitable only if clients are quiet.
+Clients using LM Studio's HTTP server are unavailable during gaming. Pause agents that independently restart the server or explicitly load models. With `stop_server_during_gaming: false`, a client using JIT loading can reload models immediately. GamePause does not prevent every later model load.
 
-## Manual controls
+Busy inference defers capture and unloading until idle. Continuous background inference can therefore delay VRAM release.
 
-**Pause AI manually** holds the same session open even without a recognized game.
-Untick it to release that hold. **Restore AI now** removes the exit delay, but recognized
-games still prevent restoration. **Disable detection** freezes actions without deleting
-recovery. You may restore manually while detection is disabled and no game remains.
+## Recovery
 
-## Recovery after a crash or quit
+The durable journal is `%LOCALAPPDATA%\GamePause\state.json`. It records intention before model/server changes and retains the session's game paths even if an entry is removed or ignored. Relaunching waits for discovery before resuming an existing session, including when automatic pausing has been turned off; the models are restored after recognized games exit. Observation (`--observe`) is an advanced diagnostic override and never controls models or executes recovery.
 
-The recovery journal is `state.json`. It records intention before destructive transitions,
-including each instance's unload/load stage. Relaunching in active mode resumes the same
-session instead of overwriting the original snapshot. Observation mode never executes recovery.
+If LM Studio was closed, reopen it. GamePause retries without requiring a restart. Missing models, incompatible protocols, or changed load settings keep recovery pending and show an error. Never delete the journal just to clear an error.
 
-With GamePause exited and no game running:
+With GamePause quit and no game running, diagnostics can retry recovery:
 
 ```powershell
 .\GamePauseCLI.exe --restore
 ```
 
-For source runs:
-
-```powershell
-.\target\release\GamePauseCLI.exe --restore
-```
-
-If you use `--data-dir`, supply the **same directory** to recovery. Another instance is blocked
-from modifying that directory concurrently. Never delete `state.json` just to clear an error;
-first inspect logs and restore the models manually if necessary.
-
-GamePause doesn't automatically reopen LM Studio after you close it. Pending recovery stays
-on disk. Reopen LM Studio and restart GamePause or run recovery when you want AI available again.
+For a custom `--data-dir`, use the same directory. Restore before uninstalling or deleting model/configuration files.

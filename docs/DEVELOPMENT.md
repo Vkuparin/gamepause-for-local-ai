@@ -12,14 +12,15 @@ cargo build --locked --release
 .\target\release\GamePauseCLI.exe --observe --headless --duration 10 --data-dir .\scratch
 ```
 
-Default behavior observes only. Use a private data directory for development. Do not overwrite a real pending journal, and do not commit runtime files.
+Default behavior automatically pauses AI. For non-mutating diagnostics, explicitly pass `--observe`. Use a private data directory for development. Do not overwrite a real pending journal, and do not commit runtime files.
 
 ## Architecture
 
 | Module | Responsibility |
 |---|---|
 | `app.rs` | CLI, watcher lifecycle, discovery worker, shared tray status, diagnostics, bounded logging |
-| `tray.rs` | Win32 hidden window, notification icon/menu, sign-in registration |
+| `tray.rs` | Win32 hidden window, notification icon/menu, dashboard routing, sign-in registration |
+| `dashboard.rs` | On-demand native controls, game search/registration, exclusions, live settings |
 | `processes.rs` | Toolhelp process snapshots, creation-time/path cache, folder matching and exclusions |
 | `discovery.rs` | Launcher metadata adapters, incremental inventory, safe parser boundaries |
 | `lmstudio.rs` | Bounded CLI commands, local REST, WebSocket capture/load, restoration verification |
@@ -28,11 +29,11 @@ Default behavior observes only. Use a private data directory for development. Do
 
 The watcher polls native process metadata every two seconds. It only queries executable paths for new `(PID, creation time)` pairs. Inventory refresh runs on a separate worker and retains the previous successful adapter inventory after errors. No installed-game directory tree is recursively scanned. Xbox package discovery uses a bounded occasional PowerShell query and is deferred during gaming.
 
-The UI uses Win32 directly: no webview, GUI framework, or async runtime. Completed gaming pauses do not repeatedly contact LM Studio or rewrite the journal. Runtime status is written only when it changes, with bounded log rotation.
+The UI uses Win32 directly: no webview, GUI framework, or async runtime. Completed gaming pauses do not repeatedly contact LM Studio or rewrite the journal. Runtime status is written only when it changes, with bounded log rotation. The dashboard is created on demand and destroyed when closed; running-app rows are produced only on request. Settings travel through the worker action channel, validate and save atomically before replacing scanner/backend configuration. Turning off automatic pausing still allows recovery after recognized games exit. The old broad Steam-library fallback is replaced by a one-shot refresh request for new unfamiliar processes inside known libraries.
 
 ## LM Studio integration
 
-The CLI supplies model/server inventories and unload/start/stop operations. Native `/api/v1/models` supplies additional settings. The internal `/llm` and `/embedding` WebSocket interfaces supply raw load configuration and load models using an API override layer. This preserves settings outside the public SDK's simplified configuration surface.
+The CLI supplies model/server inventories and unload/start/stop operations. Native `/api/v1/models` supplies additional settings. The internal `/llm` and `/embedding` WebSocket interfaces supply raw load configuration and load models using an API override layer. Capture can temporarily start the server when it was initially stopped, and always attempts to stop that temporary server even if capture fails. Recovery uses the recorded server port and original running state. This preserves settings outside the public SDK's simplified configuration surface.
 
 The protocol is an internal dependency, not a stability promise. Relevant primary references: [LM Studio CLI](https://lmstudio.ai/docs/cli), [native REST API](https://lmstudio.ai/docs/developer/rest), [LM Studio Python SDK source](https://github.com/lmstudio-ai/lmstudio-python), and [Windows Toolhelp process snapshots](https://learn.microsoft.com/en-us/windows/win32/toolhelp/taking-a-snapshot-and-viewing-processes). Check protocol changes against the official SDK source and run a full live cycle before shipping.
 
@@ -47,6 +48,8 @@ CLI inventories may report a base `modelKey` plus `selectedVariant` before loadi
 5. Clear recovery only after all captured instances and the original server state are verified.
 
 Observation mode does not execute pending recovery. Unknown journal formats are rejected. The exclusive Windows file handle prevents concurrent mutation through one data directory. Grace and retry timing use monotonic elapsed time.
+
+Recovery waits for the first discovery result. The journal also remembers games seen during its session; removing or ignoring an entry cannot make an already-running game disappear from recovery checks. Old journals without these paths remain readable. Manual restoration uses the same discovery gate and checks recognized games even when user exclusions disable new pausing.
 
 ## Packaging
 

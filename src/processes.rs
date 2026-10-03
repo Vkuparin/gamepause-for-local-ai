@@ -45,6 +45,7 @@ pub const HELPERS: &[&str] = &[
     "gamingservicesnet.exe",
     "gamelaunchhelper.exe",
     "redlauncher.exe",
+    "redprelauncher.exe",
     "setup.exe",
     "uninstall.exe",
     "unins000.exe",
@@ -64,9 +65,16 @@ pub struct ActiveGame {
     pub pid: u32,
     pub game: String,
     pub launcher: String,
+    pub path: String,
+}
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct RunningApp {
+    pub name: String,
+    pub path: String,
 }
 pub struct Scanner {
     cache: HashMap<(u32, u64), String>,
+    candidates_seen: HashSet<(u32, u64)>,
     pub inaccessible: usize,
     config: Config,
     patterns: Vec<regex::Regex>,
@@ -91,6 +99,7 @@ impl Scanner {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(Self {
             cache: HashMap::new(),
+            candidates_seen: HashSet::new(),
             inaccessible: 0,
             config,
             patterns,
@@ -182,6 +191,7 @@ impl Scanner {
                                     pid: key.0,
                                     game: game.name.clone(),
                                     launcher: game.launcher.clone(),
+                                    path: game.path.clone(),
                                 });
                             }
                         } else {
@@ -197,12 +207,80 @@ impl Scanner {
         self.cache.retain(|key, _| live.contains(key));
         Ok(active)
     }
+    pub fn running_apps(&self) -> Vec<RunningApp> {
+        let mut paths = HashSet::new();
+        let mut apps: Vec<_> = self
+            .cache
+            .values()
+            .filter_map(|path| {
+                let name = path.rsplit(['\\', '/']).next().unwrap_or("");
+                if self.excluded(name, path) || !paths.insert(canonical(path)) {
+                    return None;
+                }
+                Some(RunningApp {
+                    name: name.into(),
+                    path: path.clone(),
+                })
+            })
+            .collect();
+        apps.sort_by_key(|app| app.name.to_lowercase());
+        apps
+    }
+    pub fn lmstudio_running(&self) -> bool {
+        self.cache.values().any(|path| {
+            path.rsplit(['\\', '/'])
+                .next()
+                .is_some_and(|name| name.eq_ignore_ascii_case("LM Studio.exe"))
+        })
+    }
+    pub fn new_game_candidate(&mut self, games: &[Game], roots: &[String]) -> bool {
+        self.candidates_seen
+            .retain(|key| self.cache.contains_key(key));
+        let candidates: Vec<_> = self
+            .cache
+            .iter()
+            .filter(|(_, path)| {
+                self.match_path(path, games).is_none()
+                    && !self.excluded(path.rsplit(['\\', '/']).next().unwrap_or(""), path)
+                    && roots.iter().any(|root| inside(path, root))
+            })
+            .map(|(key, _)| *key)
+            .collect();
+        let mut found = false;
+        for key in candidates {
+            found |= self.candidates_seen.insert(key);
+        }
+        found
+    }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
+    fn new_steam_candidate_requests_refresh_once_without_classifying_it_as_game() {
+        let mut scanner = Scanner::new(Config::default()).unwrap();
+        scanner.cache.insert(
+            (42, 1),
+            r"D:\Steam\steamapps\common\New Game\play.exe".into(),
+        );
+        let roots = vec![r"D:\Steam\steamapps\common".into()];
+        assert!(scanner.new_game_candidate(&[], &roots));
+        assert!(!scanner.new_game_candidate(&[], &roots));
+        assert!(
+            scanner
+                .match_path(r"D:\Steam\steamapps\common\New Game\play.exe", &[])
+                .is_none()
+        );
+        scanner.cache.insert(
+            (42, 2),
+            r"D:\Steam\steamapps\common\New Game\play.exe".into(),
+        );
+        assert!(scanner.new_game_candidate(&[], &roots));
+    }
+    #[test]
     fn helpers_and_exclusions() {
+        let default = Scanner::new(Config::default()).unwrap();
+        assert!(default.excluded("REDprelauncher.exe", r"D:\Games\Witcher\REDprelauncher.exe"));
         let c = Config {
             excluded_executables: vec!["helper*.exe".into()],
             ..Default::default()
@@ -211,6 +289,13 @@ mod tests {
         assert!(s.excluded("REDlauncher.exe", r"D:\Games\Witcher\REDlauncher.exe"));
         assert!(s.excluded("helper64.exe", r"D:\Games\helper64.exe"));
         assert!(s.excluded("a.exe", r"D:\Games\x\__Installer\a.exe"));
+    }
+    #[test]
+    fn registered_executable_does_not_classify_neighboring_applications() {
+        let scanner = Scanner::new(Config::default()).unwrap();
+        let games = vec![Game::new("Custom", "Game", "Game", r"D:\Games\play.exe")];
+        assert!(scanner.match_path(r"d:\games\PLAY.exe", &games).is_some());
+        assert!(scanner.match_path(r"D:\Games\other.exe", &games).is_none());
     }
     #[test]
     fn nested_folder_wins() {

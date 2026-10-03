@@ -30,6 +30,8 @@ pub struct Snapshot {
     pub models: Vec<Model>,
     #[serde(default)]
     pub pause_complete: bool,
+    #[serde(default)]
+    pub games: Vec<crate::discovery::Game>,
 }
 pub trait Backend {
     fn snapshot(&mut self) -> Result<Snapshot>;
@@ -38,6 +40,26 @@ pub trait Backend {
     fn start_server(&mut self, port: u16) -> Result<()>;
     fn unload(&mut self, id: &str) -> Result<()>;
     fn restore(&mut self, model: &Model) -> Result<()>;
+}
+fn capture_with_server<B: Backend, T>(
+    backend: &mut B,
+    temporary: bool,
+    port: u16,
+    capture: impl FnOnce(&mut B) -> Result<T>,
+) -> Result<T> {
+    if temporary && let Err(start_error) = backend.start_server(port) {
+        backend
+            .stop_server()
+            .context("Could not clean up temporary server after a failed start")?;
+        return Err(start_error);
+    }
+    let captured = capture(backend);
+    if temporary {
+        backend
+            .stop_server()
+            .context("Could not close temporary LM Studio server; models remain loaded")?;
+    }
+    captured
 }
 pub struct LMStudio {
     pub config: Config,
@@ -68,9 +90,75 @@ impl LMStudio {
         let lms = candidates
             .into_iter()
             .find(|p| p.is_file())
-            .context("LM Studio CLI not found; set lms_path")?;
+            .context("Waiting for LM Studio: its CLI could not be found. Open LM Studio and install its CLI, or use Locate lms in GamePause")?;
         Ok(Self { config, lms })
     }
+    fn capture_snapshot(&mut self, loaded: Vec<Value>, server: Value) -> Result<Snapshot> {
+        let mut snapshot = Snapshot {
+            games: vec![],
+            schema: 2,
+            server: server.clone(),
+            server_stopped: false,
+            models: vec![],
+            pause_complete: false,
+        };
+        if loaded.is_empty() {
+            return Ok(snapshot);
+        }
+        if loaded.iter().any(|m| {
+            m["status"].as_str().is_some_and(|s| s != "idle")
+                || m["queued"].as_u64().unwrap_or(0) > 0
+        }) {
+            bail!("AI is busy; pause deferred until idle");
+        }
+        let native = self.native()?;
+        for info in &loaded {
+            let id = info["identifier"]
+                .as_str()
+                .context("Missing instance identifier")?;
+            let namespace = if info["type"] == "embedding" {
+                "embedding"
+            } else {
+                "llm"
+            };
+            let config = self.raw_config(namespace, id)?;
+            let instance = native["models"]
+                .as_array()
+                .context("Unexpected native inventory")?
+                .iter()
+                .flat_map(|m| m["loaded_instances"].as_array().into_iter().flatten())
+                .find(|m| m["id"] == id)
+                .context("Inventory changed during snapshot")?;
+            snapshot.models.push(Model {
+                identifier: id.into(),
+                model_key: resolved_key(info)?,
+                base_key: info["modelKey"]
+                    .as_str()
+                    .context("Missing model key")?
+                    .split('@')
+                    .next()
+                    .unwrap()
+                    .into(),
+                namespace: namespace.into(),
+                ttl_ms: info["ttlMs"].as_u64(),
+                load_config: config,
+                native_config: instance["config"].clone(),
+                stage: "planned".into(),
+            });
+        }
+        let after = self.loaded()?;
+        if after.len() != loaded.len()
+            || after.iter().any(|m| {
+                !loaded
+                    .iter()
+                    .any(|a| a["identifier"] == m["identifier"] && a["modelKey"] == m["modelKey"])
+            })
+        {
+            bail!("Models changed during snapshot; retry later");
+        }
+        Ok(snapshot)
+    }
+
     pub fn cli(&self, args: &[&str]) -> Result<Value> {
         let output = run_command(&self.lms.to_string_lossy(), args, Duration::from_secs(25))?;
         if args.contains(&"--json") {
@@ -279,28 +367,9 @@ impl Backend for LMStudio {
     }
     fn snapshot(&mut self) -> Result<Snapshot> {
         let loaded = self.loaded()?;
-        let server = self.cli(&["server", "status", "--json"])?;
-        let mut snapshot = Snapshot {
-            schema: 2,
-            server: server.clone(),
-            server_stopped: false,
-            models: vec![],
-            pause_complete: false,
-        };
+        let mut server = self.cli(&["server", "status", "--json"])?;
         if loaded.is_empty() {
-            return Ok(snapshot);
-        }
-        if server["running"] != true {
-            bail!("Start LM Studio's API server before automating loaded models");
-        }
-        if server["port"].as_u64()
-            != self
-                .config
-                .api_host
-                .rsplit_once(':')
-                .and_then(|(_, p)| p.parse().ok())
-        {
-            bail!("Configured API port differs from running server");
+            return self.capture_snapshot(loaded, server);
         }
         if loaded.iter().any(|m| {
             m["status"].as_str().is_some_and(|s| s != "idle")
@@ -308,58 +377,30 @@ impl Backend for LMStudio {
         }) {
             bail!("AI is busy; pause deferred until idle");
         }
-        let native = self.native()?;
-        for info in &loaded {
-            let id = info["identifier"]
-                .as_str()
-                .context("Missing instance identifier")?;
-            let namespace = if info["type"] == "embedding" {
-                "embedding"
-            } else {
-                "llm"
-            };
-            let config = self.raw_config(namespace, id)?;
-            let instance = native["models"]
-                .as_array()
-                .context("Unexpected native inventory")?
-                .iter()
-                .flat_map(|m| m["loaded_instances"].as_array().into_iter().flatten())
-                .find(|m| m["id"] == id)
-                .context("Inventory changed during snapshot")?;
-            snapshot.models.push(Model {
-                identifier: id.into(),
-                model_key: resolved_key(info)?,
-                base_key: info["modelKey"]
-                    .as_str()
-                    .context("Missing model key")?
-                    .split('@')
-                    .next()
-                    .unwrap()
-                    .into(),
-                namespace: namespace.into(),
-                ttl_ms: info["ttlMs"].as_u64(),
-                load_config: config,
-                native_config: instance["config"].clone(),
-                stage: "planned".into(),
-            });
-        }
-        let after = self.loaded()?;
-        if after.len() != loaded.len()
-            || after.iter().any(|m| {
-                !loaded
-                    .iter()
-                    .any(|a| a["identifier"] == m["identifier"] && a["modelKey"] == m["modelKey"])
-            })
-        {
-            bail!("Models changed during snapshot; retry later");
-        }
-        Ok(snapshot)
+        let temporary = server["running"] != true;
+        let port = if temporary {
+            self.config
+                .api_host
+                .rsplit_once(':')
+                .and_then(|(_, p)| p.parse::<u16>().ok())
+                .unwrap_or(1234)
+        } else {
+            server["port"]
+                .as_u64()
+                .context("LM Studio server port missing")? as u16
+        };
+        self.config.api_host = format!("127.0.0.1:{port}");
+        server["port"] = json!(port);
+        capture_with_server(self, temporary, port, |backend| {
+            backend.capture_snapshot(loaded, server)
+        })
     }
     fn stop_server(&mut self) -> Result<()> {
         self.cli(&["server", "stop"])?;
         Ok(())
     }
     fn start_server(&mut self, port: u16) -> Result<()> {
+        self.config.api_host = format!("127.0.0.1:{port}");
         self.cli(&["server", "start", "--port", &port.to_string()])?;
         Ok(())
     }
@@ -433,6 +474,77 @@ pub fn run_command(program: &str, args: &[&str], timeout: Duration) -> Result<Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[derive(Default)]
+    struct ServerOnly {
+        events: Vec<&'static str>,
+        fail_start: bool,
+        fail_stop: bool,
+    }
+    impl Backend for ServerOnly {
+        fn snapshot(&mut self) -> Result<Snapshot> {
+            unreachable!()
+        }
+        fn loaded(&mut self) -> Result<Vec<Value>> {
+            unreachable!()
+        }
+        fn start_server(&mut self, _: u16) -> Result<()> {
+            self.events.push("start");
+            if self.fail_start {
+                bail!("start failed")
+            };
+            Ok(())
+        }
+        fn stop_server(&mut self) -> Result<()> {
+            self.events.push("stop");
+            if self.fail_stop {
+                bail!("stop failed")
+            };
+            Ok(())
+        }
+        fn unload(&mut self, _: &str) -> Result<()> {
+            unreachable!()
+        }
+        fn restore(&mut self, _: &Model) -> Result<()> {
+            unreachable!()
+        }
+    }
+    #[test]
+    fn temporary_capture_closes_server_on_success_and_failure() {
+        let mut backend = ServerOnly::default();
+        let value = capture_with_server(&mut backend, true, 1234, |b| {
+            b.events.push("capture");
+            Ok(42)
+        })
+        .unwrap();
+        assert_eq!(value, 42);
+        assert_eq!(backend.events, vec!["start", "capture", "stop"]);
+        backend.events.clear();
+        let result: Result<()> = capture_with_server(&mut backend, true, 1234, |b| {
+            b.events.push("capture");
+            bail!("capture failed")
+        });
+        assert!(result.is_err());
+        assert_eq!(backend.events, vec!["start", "capture", "stop"]);
+        backend.events.clear();
+        capture_with_server(&mut backend, false, 1234, |b| {
+            b.events.push("capture");
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(backend.events, vec!["capture"]);
+    }
+    #[test]
+    fn temporary_server_failures_do_not_report_successful_capture() {
+        let mut backend = ServerOnly {
+            fail_start: true,
+            ..Default::default()
+        };
+        assert!(capture_with_server(&mut backend, true, 1234, |_| Ok(())).is_err());
+        assert_eq!(backend.events, vec!["start", "stop"]);
+        backend.fail_start = false;
+        backend.fail_stop = true;
+        assert!(capture_with_server(&mut backend, true, 1234, |_| Ok(())).is_err());
+    }
     #[test]
     fn identity_prefers_variant_then_file() {
         assert_eq!(

@@ -1,5 +1,5 @@
 #ifndef AppVersion
-  #define AppVersion "0.1.1"
+  #define AppVersion "0.2.0"
 #endif
 
 [Setup]
@@ -42,7 +42,7 @@ Name: "{group}\Uninstall GamePause"; Filename: "{uninstallexe}"
 Name: "{userdesktop}\GamePause"; Filename: "{app}\GamePause.exe"; Tasks: desktopicon
 
 [Registry]
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "GamePause"; ValueData: """{app}\GamePause.exe"""; Tasks: startup; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "GamePause"; ValueData: """{app}\GamePause.exe"" --background"; Tasks: startup; Flags: uninsdeletevalue
 
 [Run]
-Filename: "{app}\GamePause.exe"; Description: "Launch GamePause (starts in observation mode until configured)"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\GamePause.exe"; Description: "Launch GamePause (automatic pausing is enabled)"; Flags: nowait postinstall skipifsilent

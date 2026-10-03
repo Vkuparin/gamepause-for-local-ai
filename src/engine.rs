@@ -14,6 +14,7 @@ pub struct Engine<B: Backend> {
     pub last_error: String,
     pub disabled: bool,
     pub manual_pause: bool,
+    pub remembered_games: Vec<crate::discovery::Game>,
     quiet_since: Option<f64>,
     retry_at: f64,
 }
@@ -29,6 +30,13 @@ impl<B: Backend> Engine<B> {
             bail!("Unsupported recovery format; preserve state.json and inspect manually");
         }
         if let Some(snapshot) = &state {
+            if snapshot
+                .games
+                .iter()
+                .any(|g| g.name.is_empty() || !std::path::Path::new(&g.path).is_absolute())
+            {
+                bail!("Invalid recovery game location; recovery retained");
+            }
             let mut identifiers = std::collections::BTreeSet::new();
             for model in &snapshot.models {
                 if model.identifier.is_empty()
@@ -45,7 +53,9 @@ impl<B: Backend> Engine<B> {
                 }
             }
         }
+        let remembered_games = state.as_ref().map(|s| s.games.clone()).unwrap_or_default();
         Ok(Self {
+            remembered_games,
             backend,
             config,
             state,
@@ -61,6 +71,30 @@ impl<B: Backend> Engine<B> {
     fn save(&self) -> Result<()> {
         write_json(&self.path, &self.state)
     }
+    pub fn settings_changed(&mut self) {
+        self.retry_at = 0.;
+        self.disabled = false;
+    }
+    pub fn remember_games(&mut self, games: Vec<crate::discovery::Game>) -> Result<()> {
+        if self.state.is_none() {
+            self.remembered_games = games;
+            return Ok(());
+        }
+        let mut changed = false;
+        for game in games {
+            if !self.remembered_games.iter().any(|g| {
+                crate::discovery::canonical(&g.path) == crate::discovery::canonical(&game.path)
+            }) {
+                self.remembered_games.push(game);
+                changed = true;
+            }
+        }
+        if changed {
+            self.state.as_mut().unwrap().games = self.remembered_games.clone();
+            self.save()?;
+        }
+        Ok(())
+    }
     pub fn step(&mut self, gaming: bool, now: f64, cancelled: &mut dyn FnMut() -> bool) {
         if self.disabled {
             self.message = "Detection disabled; recovery retained".into();
@@ -74,6 +108,18 @@ impl<B: Backend> Engine<B> {
             }
             .into();
             return;
+        }
+        if !self.config.automation_enabled && !self.manual_pause {
+            if self.state.is_none() {
+                self.message = "Automatic pausing is off".into();
+                return;
+            }
+            if gaming {
+                self.quiet_since = None;
+                self.message =
+                    "Automatic pausing is off; saved AI will return after the game exits".into();
+                return;
+            }
         }
         if gaming || self.manual_pause {
             self.quiet_since = None;
@@ -91,6 +137,8 @@ impl<B: Backend> Engine<B> {
                 self.attempt(result, now);
             }
         } else {
+            self.last_error.clear();
+            self.retry_at = 0.;
             self.message = "AI available".into();
         }
     }
@@ -114,6 +162,7 @@ impl<B: Backend> Engine<B> {
         }
         if self.state.is_none() {
             self.state = Some(self.backend.snapshot()?);
+            self.state.as_mut().unwrap().games = self.remembered_games.clone();
             self.save()?;
         }
         if self.config.stop_server_during_gaming
@@ -179,6 +228,7 @@ impl<B: Backend> Engine<B> {
             self.backend.stop_server()?;
         }
         self.state = None;
+        self.remembered_games.clear();
         self.save()?;
         self.quiet_since = None;
         self.message = "AI restored".into();
@@ -223,6 +273,7 @@ mod tests {
         fn snapshot(&mut self) -> Result<Snapshot> {
             self.events.push("snapshot".into());
             Ok(Snapshot {
+                games: vec![],
                 schema: 2,
                 server: json!({"running":self.running,"port":1234}),
                 server_stopped: false,
@@ -290,11 +341,17 @@ mod tests {
     }
     fn engine(mut backend: Fake) -> Engine<Fake> {
         let folder = std::env::temp_dir().join(format!(
-            "gamepause-engine-{}-{}",
+            "gamepause-engine-{}-{}-{}",
             std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
             SERIAL.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::create_dir_all(&folder).unwrap();
+        // Windows can reuse a PID from an earlier test run whose journal remains.
+        // Require a fresh directory rather than accepting an existing recovery file.
+        fs::create_dir(&folder).unwrap();
         backend.journal = folder.join("state.json");
         Engine::new(
             Config {
@@ -330,6 +387,43 @@ mod tests {
         e.pause().unwrap();
         assert_eq!(e.backend.events, events);
         assert!(!bytes.is_empty());
+    }
+    #[test]
+    fn automation_off_does_not_start_pause_but_recovers_existing_session() {
+        let mut e = engine(Fake::new());
+        e.config.automation_enabled = false;
+        e.step(true, 0., &mut || false);
+        assert!(e.backend.events.is_empty());
+        e.config.automation_enabled = true;
+        e.step(true, 1., &mut || false);
+        let saved = fs::read(&e.path).unwrap();
+        e.config.automation_enabled = false;
+        e.step(true, 200., &mut || false);
+        assert_eq!(saved, fs::read(&e.path).unwrap());
+        assert!(e.backend.current.is_empty());
+        e.step(false, 201., &mut || false);
+        e.step(false, 231., &mut || false);
+        assert!(e.state.is_none());
+        assert_eq!(e.backend.current.len(), 2);
+    }
+    #[test]
+    fn abandoned_pause_error_clears_when_no_game_or_recovery_remains() {
+        let mut e = engine(Fake::new());
+        e.last_error = "AI is busy".into();
+        e.step(false, 0., &mut || false);
+        assert!(e.last_error.is_empty());
+        assert_eq!(e.message, "AI available");
+    }
+    #[test]
+    fn recovery_remembers_game_paths_across_registration_changes_and_restart() {
+        let mut e = engine(Fake::new());
+        let game = crate::discovery::Game::new("Custom", "Game", "Game", r"D:\Game\play.exe");
+        e.remember_games(vec![game.clone()]).unwrap();
+        e.pause().unwrap();
+        e.remember_games(vec![]).unwrap();
+        let resumed = Engine::new(e.config.clone(), e.backend.clone(), e.path.clone()).unwrap();
+        assert_eq!(resumed.remembered_games.len(), 1);
+        assert_eq!(resumed.remembered_games[0].path, game.path);
     }
     #[test]
     fn partial_unload_preserves_snapshot() {

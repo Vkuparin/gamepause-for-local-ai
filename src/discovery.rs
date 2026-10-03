@@ -37,6 +37,16 @@ pub fn inside(path: &str, root: &str) -> bool {
     let r = canonical(root);
     !r.is_empty() && (p == r || p.starts_with(&(r + "\\")))
 }
+fn background_utility(game: &Game) -> bool {
+    [
+        "wallpaper engine",
+        "lossless scaling",
+        "steamworks common redistributables",
+        "gog galaxy",
+        "fps monitor",
+    ]
+    .contains(&game.name.to_lowercase().as_str())
+}
 pub fn parse_vdf(text: &str) -> Result<Value> {
     let token = regex::Regex::new(r#"//[^\n]*|"((?:\\.|[^"\\])*)"|([{}])"#)?;
     let tokens: Vec<String> = token
@@ -181,7 +191,11 @@ impl Discovery {
         self.retained
             .values()
             .flatten()
-            .filter(|g| Path::new(&g.path).is_dir() && seen.insert(canonical(&g.path)))
+            .filter(|g| {
+                !background_utility(g)
+                    && Path::new(&g.path).exists()
+                    && seen.insert(canonical(&g.path))
+            })
             .cloned()
             .collect()
     }
@@ -558,6 +572,51 @@ pub fn protobuf_fields(mut bytes: &[u8]) -> Result<Vec<(u64, &[u8])>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn steam_metadata_refresh_finds_new_installation_without_restart() {
+        let root =
+            std::env::temp_dir().join(format!("gamepause-steam-refresh-{}", std::process::id()));
+        let apps = root.join("steamapps");
+        let common = apps.join("common");
+        fs::create_dir_all(common.join("Fixture One")).unwrap();
+        fs::create_dir_all(common.join("Fixture Two")).unwrap();
+        let one = apps.join("appmanifest_900000001.acf");
+        let two = apps.join("appmanifest_900000002.acf");
+        fs::write(&one, r#""AppState" { "appid" "900000001" "name" "GamePause Fixture One" "installdir" "Fixture One" "StateFlags" "4" }"#).unwrap();
+        let config = Config {
+            steam_roots: vec![root.to_string_lossy().into_owned()],
+            ..Config::default()
+        };
+        let mut discovery = Discovery::default();
+        let initial = discovery.steam(&config).unwrap();
+        assert!(initial.iter().any(|g| g.identity == "900000001"));
+        assert!(!initial.iter().any(|g| g.identity == "900000002"));
+        fs::write(&two, r#""AppState" { "appid" "900000002" "name" "GamePause Fixture Two" "installdir" "Fixture Two" "StateFlags" "4" }"#).unwrap();
+        let refreshed = discovery.steam(&config).unwrap();
+        assert!(refreshed.iter().any(|g| g.identity == "900000002"));
+        fs::remove_file(one).unwrap();
+        fs::remove_file(two).unwrap();
+        fs::remove_dir(common.join("Fixture One")).unwrap();
+        fs::remove_dir(common.join("Fixture Two")).unwrap();
+        fs::remove_dir(common).unwrap();
+        fs::remove_dir(apps).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
+    #[test]
+    fn background_utilities_are_not_games() {
+        assert!(background_utility(&Game::new(
+            "Steam",
+            "431960",
+            "Wallpaper Engine",
+            r"D:\Steam\Wallpaper"
+        )));
+        assert!(!background_utility(&Game::new(
+            "Steam",
+            "292030",
+            "The Witcher 3",
+            r"D:\Steam\Witcher"
+        )));
+    }
     #[test]
     fn path_boundaries() {
         assert!(inside(

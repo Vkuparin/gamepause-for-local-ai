@@ -15,6 +15,9 @@ pub struct Config {
     pub restore_delay_seconds: f64,
     pub retry_seconds: f64,
     pub mode: String,
+    pub settings_version: u32,
+    pub automation_enabled: bool,
+    pub ignored_games: Vec<String>,
     pub stop_server_during_gaming: bool,
     pub lms_path: String,
     pub api_host: String,
@@ -38,7 +41,10 @@ impl Default for Config {
             discovery_seconds: 30.,
             restore_delay_seconds: 30.,
             retry_seconds: 30.,
-            mode: "observe".into(),
+            mode: "active".into(),
+            settings_version: 2,
+            automation_enabled: true,
+            ignored_games: vec![],
             stop_server_during_gaming: true,
             lms_path: String::new(),
             api_host: "127.0.0.1:1234".into(),
@@ -57,9 +63,15 @@ impl Config {
             write_json(path, &Self::default())?;
         }
         let text = fs::read_to_string(path)?;
-        let config: Self = serde_json::from_str(text.trim_start_matches('\u{feff}'))
+        let mut config: Self = serde_json::from_str(text.trim_start_matches('\u{feff}'))
             .context("Invalid configuration")?;
         config.validate()?;
+        let raw: serde_json::Value = serde_json::from_str(text.trim_start_matches('\u{feff}'))?;
+        if raw.get("settings_version").is_none() {
+            config.mode = "active".into();
+            config.settings_version = 2;
+            write_json(path, &config)?;
+        }
         Ok(config)
     }
     pub fn validate(&self) -> Result<()> {
@@ -75,6 +87,9 @@ impl Config {
         }
         if !["active", "observe"].contains(&self.mode.as_str()) {
             bail!("mode must be active or observe");
+        }
+        if self.settings_version != 2 {
+            bail!("Unsupported settings version; configuration retained");
         }
         let (host, port) = self
             .api_host
@@ -157,6 +172,22 @@ mod tests {
     #[test]
     fn unknown_settings_refused() {
         assert!(serde_json::from_str::<Config>(r#"{"poll_secnds":2}"#).is_err());
+    }
+    #[test]
+    fn legacy_observation_migrates_once_and_user_disable_survives_restart() {
+        let path = std::env::temp_dir()
+            .join(format!("gamepause-migration-{}", std::process::id()))
+            .join("config.json");
+        write_json(&path, &serde_json::json!({"mode":"observe","restore_delay_seconds":42,"excluded_paths":["D:\\Games\\Tool"]})).unwrap();
+        let mut config = Config::load(&path).unwrap();
+        assert_eq!(config.mode, "active");
+        assert!(config.automation_enabled);
+        assert_eq!(config.restore_delay_seconds, 42.);
+        assert_eq!(config.excluded_paths.len(), 1);
+        config.automation_enabled = false;
+        write_json(&path, &config).unwrap();
+        assert!(!Config::load(&path).unwrap().automation_enabled);
+        fs::remove_file(path).unwrap();
     }
     #[test]
     fn atomic_replace() {

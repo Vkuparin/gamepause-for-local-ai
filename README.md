@@ -6,7 +6,7 @@
 
 **Give your games room. Bring your local AI back afterward.**
 
-GamePause is a small native Rust tray app for Windows. It notices when a game starts, saves the models currently loaded in LM Studio, unloads them, and restores them afterward. The model name can change: there is no fixed model list to maintain.
+GamePause is a small native Rust app for Windows. It notices when a game starts, saves the models currently loaded in LM Studio, unloads them, and restores them afterward. The model name can change: there is no fixed model list to maintain.
 
 ## Features
 
@@ -16,17 +16,19 @@ GamePause is a small native Rust tray app for Windows. It notices when a game st
 - Stops LM Studio's HTTP server during gaming by default to prevent HTTP clients from immediately loading models again.
 - Waits 30 seconds after the last game exits. Starting another game cancels the delay; alt-tabbing keeps AI paused.
 - Keeps a durable recovery journal through partial failures and restarts.
-- Includes native tray controls, automatic startup at Windows sign-in, a per-user installer, and a portable ZIP.
+- Includes a native dashboard, searchable games, live settings, tray controls, automatic startup at Windows sign-in, a per-user installer, and a portable ZIP.
 
 No Python runtime, administrator service, telemetry, recursive game scans, or permanent model-name configuration. Model control uses localhost.
 
 ## Get started
 
-1. Download the **Setup.exe** from [Releases](https://github.com/Vkuparin/gamepause-lmstudio/releases). Run the installer. Startup at sign-in is checked by default.
-2. Keep LM Studio open, start its local server on port **1234**, and load the models you want restored. Its `lms` command must be installed; see [Installation](docs/INSTALLATION.md).
-3. Launch GamePause. First run uses **observation mode**, which detects games without changing AI state. Launch a game and hover over its tray icon to check detection.
-4. Right-click the tray icon, choose **Open configuration**, and change `"mode": "observe"` to `"mode": "active"`. Save, quit GamePause, and reopen it.
-5. Launch games normally. Use the tray menu for manual pause, restore, detection, logs, configuration, and startup settings.
+1. Download the **Setup.exe** from [Releases](https://github.com/Vkuparin/gamepause-lmstudio/releases) and install it. Startup at sign-in is checked by default.
+2. Keep LM Studio open with the models you want available. Its `lms` CLI must be installed; GamePause finds it automatically. See [Installation](docs/INSTALLATION.md).
+3. Launch games normally. **Automatic pausing is on by default.** GamePause discovers supported launcher installations, saves and unloads your currently loaded models, and restores them after gaming.
+
+Left-click the tray icon or open GamePause from Start to see its dashboard. The **Games** list shows what was discovered and what is running. Newly installed games become available automatically; no observation-mode trial, tooltip inspection, JSON edit, restart, or fixed model list is needed. If a game is missed, use **Running apps → Add selected as game**, or **Add game…** to select its executable.
+
+You do not need to start LM Studio's HTTP server manually. GamePause uses an already-running server's port, or temporarily opens the local server to capture loaded model settings, then returns it to its original state. Automatic-pausing, startup, exclusions, and optional connection/delay settings are controlled in the app.
 
 Quit retains pending recovery for the next active run. Finish restoration before uninstalling. The installer and executables are currently unsigned; Windows may show a publisher warning. Download from this repository and compare the supplied SHA-256 checksums.
 
@@ -43,9 +45,9 @@ Quit retains pending recovery for the next active run. Finish restoration before
 
 ## Performance and compatibility
 
-On one Windows 11 / RTX 5090 PC with 16 logical CPUs, the native watcher used **15.7 MiB RAM** and **0.076% of total CPU capacity** during a 45-second Witcher 3 menu sample, including an inventory refresh. This measures the watcher, not FPS or all machines. See [Validation](docs/VALIDATION.md).
+On one Windows 11 / RTX 5090 PC with 16 logical CPUs, the installed v0.2.0 watcher used **14.1 MiB RAM** and **0.055% of total CPU capacity** during a 46-second Witcher 3 menu sample, including an inventory refresh. The dashboard was closed. This measures the watcher, not FPS or all machines. See [Validation](docs/VALIDATION.md).
 
-This is a **0.1.1 preview**. Discovery is best effort. Protected processes, unconventional installations, and unusual helpers may require configuration. Only the Steam / Witcher 3 lifecycle has been tested live. Other adapters have been checked against local installed metadata, not complete gameplay sessions.
+This is a **0.2.0 preview**. Discovery is best effort. Protected processes and unconventional installations can require registering a game through the dashboard. Only the Steam / Witcher 3 lifecycle has been tested live. Other adapters have been checked against local installed metadata, not complete gameplay sessions.
 
 Complete settings preservation currently requires LM Studio's internal WebSocket protocol alongside its CLI and native REST API. Protocol changes can require a GamePause update. Run `GamePauseCLI.exe --doctor` after upgrading LM Studio. If a recoverable snapshot cannot be captured, GamePause refuses to unload. It does not launch LM Studio or supervise clients that independently restart its server.
 

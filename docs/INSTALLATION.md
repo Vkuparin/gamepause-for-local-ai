@@ -3,7 +3,7 @@
 ## Requirements
 
 - Windows 10/11 x64 and LM Studio with its `lms` CLI installed.
-- LM Studio open, with its local server running on the configured port (default `127.0.0.1:1234`). GamePause does not start LM Studio itself.
+- LM Studio open. GamePause handles the local HTTP server automatically and does not launch the LM Studio application itself.
 - Your desired models loaded before gaming. Model names are captured dynamically.
 
 Destination PCs do not need Python, Node.js, Rust, or administrator rights. The development tools below are needed only to build from source.
@@ -13,18 +13,18 @@ Destination PCs do not need Python, Node.js, Rust, or administrator rights. The 
 Download the setup EXE and `SHA256SUMS.txt` from [the same release](https://github.com/Vkuparin/gamepause-lmstudio/releases). Compare the published hash with:
 
 ```powershell
-Get-FileHash .\GamePause-0.1.1-Setup.exe -Algorithm SHA256
+Get-FileHash .\GamePause-0.2.0-Setup.exe -Algorithm SHA256
 ```
 
 The default installation path is `%LOCALAPPDATA%\Programs\GamePause`. Setup creates Start menu shortcuts and a Windows Installed apps entry. **Start GamePause automatically when I sign in to Windows** is checked by default. The desktop shortcut is optional.
 
-First run uses observation mode. Follow [Usage](USAGE.md) before enabling active mode. Configuration and recovery live separately in `%LOCALAPPDATA%\GamePause`.
+Automatic pausing is enabled on first run. Launch games normally; use the native dashboard to see discovery and session status. No mode switch or configuration edit is required. Configuration and recovery live separately in `%LOCALAPPDATA%\GamePause`.
 
 ## Automatic startup
 
 Use the installer checkbox or tray **Start with Windows** option. They register a per-user `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` value named `GamePause`. It starts after sign-in, not as a service before login. Windows Startup apps settings may also disable it.
 
-The tray startup command includes a custom data directory when used. Keep the executable in a stable location. Startup uses the saved mode; change `mode` to `active` once detection is verified.
+The tray startup command includes a custom data directory when used. Keep the executable in a stable location. Startup uses `--background` to remain in the tray and remembers the automatic-pausing switch. Opening the Start menu shortcut shows the existing dashboard rather than starting a second watcher.
 
 ## Portable ZIP
 
@@ -32,17 +32,17 @@ Extract the whole ZIP into a permanent directory. Run `GamePause.exe` for the tr
 
 ## LM Studio configuration
 
-GamePause searches `PATH` and standard CLI locations. If `--doctor` cannot find `lms`, install/bootstrap the CLI through LM Studio or set `lms_path` to its absolute location:
+GamePause searches `PATH` and standard CLI locations. GamePause stays running and retries if the CLI is unavailable. Install/bootstrap it through LM Studio; for an unusual installation, use **Locate lms…** in the dashboard. Advanced file-based configuration remains supported:
 
 ```json
 "lms_path": "D:\\Tools\\LMStudio\\bin\\lms.exe"
 ```
 
-Set `api_host` for a different local port. Only `localhost` and `127.0.0.1` are accepted. If REST authentication is enabled, provide `GAMEPAUSE_LM_API_TOKEN` in the app's environment. Never share the token. Internal WebSocket compatibility is checked separately; a REST token does not guarantee internal control access.
+An already-running server port is detected automatically. The optional **Local API** dashboard field selects the port used when GamePause opens a temporary server. Only `localhost` and `127.0.0.1` are accepted. If REST authentication is enabled, provide `GAMEPAUSE_LM_API_TOKEN` in the app's environment. Never share the token. Internal WebSocket compatibility is checked separately; a REST token does not guarantee internal control access.
 
 ## Upgrade and uninstall
 
-Restore AI and quit GamePause before upgrading. Install into the same directory. Configuration and recovery persist in the separate data folder. An incompatible journal is retained and reported.
+Restore AI and quit GamePause before upgrading. Install into the same directory. Configuration and recovery persist in the separate data folder. An incompatible journal is retained and reported. Upgrading from v0.1 migrates the old observation/active setup to automatic pausing, preserving model recovery, exclusions, connection settings, and delays. After migration, switching automatic pausing off is remembered across restarts.
 
 Uninstall from Windows Installed apps or the Start menu shortcut. Application files and its startup entry are removed. `%LOCALAPPDATA%\GamePause` is deliberately preserved. Restore models before deleting that folder. Uninstall does not restore paused models.
 

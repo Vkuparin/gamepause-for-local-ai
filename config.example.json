@@ -1,5 +1,5 @@
 {
-  "mode": "observe",
+  "mode": "active",
   "poll_seconds": 2,
   "discovery_seconds": 30,
   "restore_delay_seconds": 30,
@@ -12,5 +12,8 @@
   "game_roots": [],
   "extra_games": [],
   "excluded_executables": [],
-  "excluded_paths": []
+  "excluded_paths": [],
+  "settings_version": 2,
+  "automation_enabled": true,
+  "ignored_games": []
 }

@@ -1,10 +1,12 @@
 # Validation
 
-Results below describe the native Rust preview tested on Windows with LM Studio 0.4.25 on 2026-10-03. Automated tests, metadata compatibility, live behavior, and benchmarks are separate evidence.
+Results below describe v0.2.0 tested on Windows with LM Studio 0.4.25 on 2026-10-03, with earlier release evidence identified separately. Automated tests, metadata compatibility, live behavior, and benchmarks are separate evidence.
 
 ## Automated checks
 
-28 tests pass (plus one interactive desktop test excluded from the default suite). Cargo formatting and Clippy checks pass with warnings treated as errors. Coverage includes validated configuration, atomic replacement, KeyValues/protobuf parser boundaries, executable path boundaries, nested installations, helper exclusions, startup command quoting, equivalent model identity representations, exact settings comparisons, and recovery behavior.
+42 tests pass (plus one interactive desktop test excluded from the default suite). Cargo formatting and Clippy checks pass with warnings treated as errors. Coverage includes validated configuration, atomic replacement, KeyValues/protobuf parser boundaries, executable path boundaries, nested installations, helper exclusions, startup command quoting, equivalent model identity representations, exact settings comparisons, and recovery behavior.
+
+New v0.2.0 cases cover migration to automatic defaults, remembering an explicitly disabled setting, live settings persistence/rejection, searchable dashboard rows and recognition details, exact executable registration, newly installed Steam metadata without restarting, one-shot unfamiliar-process refresh, background utility and REDprelauncher exclusions, temporary-server cleanup on capture success/failure, recovery while automatic pausing is off, remembered game paths across restart, initial discovery gating, and clearing abandoned capture errors.
 
 Recovery tests cover multiple models, empty snapshots, observation, grace periods, switching games, disabled detection, manual holds, journal-before-unload ordering, partial unload, partial restore after restart, failed server shutdown, game restart before/between restoration, and unknown/corrupt journal stages.
 
@@ -18,9 +20,24 @@ The regular unit suite holds a menu session open while invoking the actual timer
 
 ## Local discovery compatibility
 
-The Rust inventory found 41 installed locations across Steam, Epic, Xbox, EA, Ubisoft Connect, and Battle.net using this PC's launcher metadata. No adapter errors were reported. This checks discovery, not every game's process behavior or a full live lifecycle on every launcher.
+The v0.2.0 inventory found 37 game locations across Steam, Epic, Xbox, EA, Ubisoft Connect, and Battle.net using this PC's launcher metadata. Known background utilities are now filtered out (the earlier inventory contained 41 locations). No adapter errors were reported. This checks discovery, not every game's process behavior or a full live lifecycle on every launcher.
 
-## Steam acceptance test
+## Installed v0.2.0 Steam acceptance tests
+
+The per-user installed app was upgraded and started through its normal background startup command. Automatic pausing was on through normal configuration migration/defaults. No active-mode argument, edited game list, or test-only detection bypass was used. The dashboard was closed during gaming.
+
+The Witcher 3 was launched using Steam's Play button and REDlauncher's Play button, reached its main menu, and exited using its normal Exit menu action. Two complete cycles passed:
+
+- With the HTTP server initially running, the currently loaded chat model was captured, unloaded, and the server stopped. After game exit and the normal 30-second delay, the model and running server returned and recovery cleared.
+- With the HTTP server initially stopped and the model still loaded, capture temporarily started the server. During gaming the model inventory was empty and the server stopped. Automatic restoration returned the model and left the server stopped; recovery cleared. The server was then returned to the user's pre-test running state.
+- An independent read-only verifier compared the restored variant, identifier, TTL policy, 98,304-token context, four parallel slots, all 11 current raw load fields, and all exposed native configuration fields against the baseline after each cycle. Both comparisons passed. This test used the user's one currently loaded model; it did not reintroduce the earlier embedding model.
+- The real launch flow exposed a REDprelauncher helper being treated as a game. It is now excluded, covered by a regression test, and the corrected launcher-only state was checked before starting the actual game. Earlier busy-capture errors were also corrected to clear after an abandoned session with no journal.
+
+The optimized interactive tray regression passed again: three native popup openings, each spanning at least two timer callbacks. The installed dashboard's search, recognition details, ignore/re-enable and automatic-pausing controls were checked. Running-app rows populated on demand. The optional restore delay was saved as 31 seconds without restarting and then returned to 30 seconds. The standard executable picker opened and cancelled without changing registration. Full executable registration is covered by unit tests. Optional controls remain hidden until Settings is opened. Opening the already-running installed app showed the dashboard without a second watcher.
+
+These were game-menu sessions. No FPS/frame-time gain is claimed. Custom identifiers and non-null TTL restoration are implemented but have not been exercised in the live game tests. Complete live lifecycle coverage remains Steam only. New-installation behavior is tested with metadata fixtures, not by downloading a new game during this test.
+
+## Earlier v0.1.0 Steam acceptance test
 
 The Witcher 3 was launched through Steam and REDlauncher, reached the main menu, and exited normally. REDlauncher alone did not trigger pausing; the actual game process did.
 
@@ -38,10 +55,11 @@ CPU share = process CPU seconds / wall seconds / logical CPU count × 100. Worki
 
 | Implementation | Sample | CPU seconds | Logical CPUs | Total CPU share | Maximum working set |
 |---|---:|---:|---:|---:|---:|
+| Installed v0.2.0, dashboard closed | 46.31 s | 0.4062 s | 16 | 0.0548% | 14.07 MiB |
 | Native Rust preview | 45.21 s | 0.5469 s | 16 | 0.0756% | 15.72 MiB |
 | Earlier private Python prototype | 45.28 s | 1.6094 s | 16 | 0.2221% | 47.42 MiB |
 
-Both samples came from the same Windows 11 / RTX 5090 PC in the Witcher 3 menu. They are short observations, not a controlled cross-machine benchmark. Runtime resources, C runtime linking, and error handling received small changes afterward; these figures describe the sampled native build. A paired gameplay frame-time benchmark remains separate work.
+These samples came from the same Windows 11 / RTX 5090 PC in the Witcher 3 menu. They are short observations, not a controlled cross-machine benchmark. The v0.2.0 sample used a freshly started background watcher, with its dashboard closed, and included a local inventory refresh. The older native/Python samples describe earlier builds. A paired gameplay frame-time benchmark remains separate work.
 
 ## Distribution validation
 

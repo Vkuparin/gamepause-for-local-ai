@@ -1,11 +1,14 @@
 # Configuration
 
-Default location: `%LOCALAPPDATA%\GamePause\config.json`. All changes require restart.
+Normal use requires no file edits. Use the dashboard for automatic pausing, game registration/exclusions, startup, restore delay, and connection settings; those changes apply immediately. Advanced configuration lives in `%LOCALAPPDATA%\GamePause\config.json`; direct file edits require restarting the watcher.
 The complete starting configuration is [config.example.json](../config.example.json).
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `mode` | `observe` | `observe` detects only; `active` changes model/server state |
+| `mode` | `active` | Advanced diagnostic mode; ordinary users use the automatic-pausing switch |
+| `automation_enabled` | `true` | Automatically pause for games; existing recovery still completes when off |
+| `settings_version` | `2` | Configuration format/migration marker; do not edit |
+| `ignored_games` | `[]` | Installation/executable paths disabled through the dashboard |
 | `poll_seconds` | `2` | Process check interval, minimum 0.5 seconds |
 | `discovery_seconds` | `30` | Local inventory refresh, minimum 10 seconds |
 | `restore_delay_seconds` | `30` | Grace period after the last detected game exits; 0 disables delay |
@@ -16,12 +19,12 @@ The complete starting configuration is [config.example.json](../config.example.j
 | `steam_roots` | `[]` | Extra Steam client/library roots containing `steamapps` |
 | `epic_manifest_dirs` | `[]` | Extra directories containing Epic `.item` manifests |
 | `game_roots` | `[]` | Parent folders whose immediate subfolders are individual games |
-| `extra_games` | `[]` | Explicit `{ "name": "...", "path": "..." }` game installation directories |
+| `extra_games` | `[]` | Explicit `{ "name": "...", "path": "..." }` game installation directories or exact executable paths |
 | `excluded_executables` | `[]` | Additional executable names/globs (`*`, `?`), case-insensitive |
 | `excluded_paths` | `[]` | Directories to exclude from gaming detection |
 
 CLI `--active` and `--observe` override `mode` for that run without modifying config.
-Other switches: `--headless`, `--duration N`, `--discover`, `--doctor`, `--restore`,
+Other switches: `--background` (quiet tray startup), `--headless`, `--duration N`, `--discover`, `--doctor`, `--restore`,
 `--data-dir DIRECTORY`, `--version`.
 
 ## Standalone or missed installations
@@ -37,7 +40,7 @@ Example additions (merge into your existing configuration):
 }
 ```
 
-`path` means the game directory, **not** its executable. Avoid broad roots such as `C:\\`,
+`path` accepts a game directory or an exact executable. The dashboard saves an exact executable for manually added games. Avoid broad roots such as `C:\\`,
 `Program Files`, or a folder containing unrelated applications. `game_roots` treats each
 child directory as a game; installed folder contents are not recursively scanned.
 

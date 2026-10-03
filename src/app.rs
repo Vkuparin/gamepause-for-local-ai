@@ -3,7 +3,7 @@ use crate::{
     discovery::{Discovery, Game},
     engine::Engine,
     lmstudio::{Backend, LMStudio},
-    processes::Scanner,
+    processes::{ActiveGame, RunningApp, Scanner},
     tray,
 };
 use anyhow::{Context, Result, bail};
@@ -16,26 +16,37 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum Action {
     Pause,
     Restore,
     Disable,
     Refresh,
     Quit,
+    Settings(Box<Config>),
 }
+#[derive(Clone, Default)]
 pub struct Shared {
     pub message: String,
     pub disabled: bool,
     pub manual_pause: bool,
     pub pending: bool,
     pub active_mode: bool,
+    pub config: Config,
+    pub games: Vec<Game>,
+    pub active_games: Vec<ActiveGame>,
+    pub running_apps: Vec<RunningApp>,
+    pub discovery_errors: std::collections::BTreeMap<String, String>,
+    pub settings_error: String,
+    pub revision: u64,
+    pub discovery_ready: bool,
 }
 pub type SharedState = Arc<Mutex<Shared>>;
 #[derive(Default)]
 struct Options {
     folder: Option<PathBuf>,
     headless: bool,
+    background: bool,
     active: bool,
     observe: bool,
     discover: bool,
@@ -54,6 +65,7 @@ fn options() -> Result<Options> {
                 options.folder = Some(args.next().context("--data-dir needs a path")?.into())
             }
             "--headless" => options.headless = true,
+            "--background" => options.background = true,
             "--active" => options.active = true,
             "--observe" => options.observe = true,
             "--discover" => options.discover = true,
@@ -83,13 +95,27 @@ pub fn main(console: bool) -> Result<()> {
     }
     if args.help {
         println!(
-            "GamePause for LM Studio\n--headless --active --observe --duration SECONDS\n--doctor --discover --restore --data-dir PATH\nDefault: observation mode with Windows tray. Configuration takes effect on restart."
+            "GamePause for LM Studio\n--headless --active --observe --duration SECONDS\n--doctor --discover --restore --data-dir PATH\nDefault: automatic pausing with a native dashboard. --background starts in the tray. --observe is a diagnostic override."
         );
         return Ok(());
     }
     let folder = args.folder.unwrap_or_else(config::data_directory);
     fs::create_dir_all(&folder)?;
     let folder = fs::canonicalize(folder)?;
+    let _lock = match config::lock(&folder) {
+        Ok(lock) => lock,
+        Err(e) => {
+            if !args.headless
+                && !args.doctor
+                && !args.discover
+                && !args.restore
+                && tray::show_existing(&folder)
+            {
+                return Ok(());
+            }
+            return Err(e);
+        }
+    };
     let mut config = Config::load(&folder.join("config.json"))?;
     if args.active {
         config.mode = "active".into();
@@ -105,7 +131,6 @@ pub fn main(console: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
-    let _lock = config::lock(&folder)?;
     let mut backend = LMStudio::new(config.clone());
     // Observe mode must work even when LM Studio is absent.
     if args.doctor {
@@ -116,16 +141,11 @@ pub fn main(console: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
-    let backend = if config.mode == "active" || args.restore {
-        Some(backend?)
-    } else {
-        None
+    let backend = OptionalBackend {
+        backend: backend.ok(),
+        config: config.clone(),
     };
-    let mut engine = Engine::new(
-        config.clone(),
-        OptionalBackend(backend),
-        folder.join("state.json"),
-    )?;
+    let mut engine = Engine::new(config.clone(), backend, folder.join("state.json"))?;
     if args.restore {
         let mut discovery = Discovery::default();
         let games = discovery.refresh(&config, 0., true, false);
@@ -148,6 +168,14 @@ pub fn main(console: bool) -> Result<()> {
         manual_pause: false,
         pending: engine.state.is_some(),
         active_mode: config.mode == "active",
+        config: config.clone(),
+        games: vec![],
+        active_games: vec![],
+        running_apps: vec![],
+        discovery_errors: Default::default(),
+        settings_error: String::new(),
+        revision: 0,
+        discovery_ready: false,
     }));
     let (tx, rx) = mpsc::channel();
     if args.headless {
@@ -173,19 +201,23 @@ pub fn main(console: bool) -> Result<()> {
             tray::request_exit();
             result
         });
-        tray::run(state, tx, folder)?;
+        tray::run(state, tx, folder, !args.background)?;
         handle
             .join()
             .map_err(|_| anyhow::anyhow!("Monitoring thread panicked"))??;
     }
     Ok(())
 }
-struct OptionalBackend(Option<LMStudio>);
+struct OptionalBackend {
+    backend: Option<LMStudio>,
+    config: Config,
+}
 impl OptionalBackend {
     fn get(&mut self) -> Result<&mut LMStudio> {
-        self.0
-            .as_mut()
-            .context("LM Studio control is unavailable in observe mode")
+        if self.backend.is_none() {
+            self.backend = Some(LMStudio::new(self.config.clone())?);
+        }
+        Ok(self.backend.as_mut().unwrap())
     }
 }
 impl Backend for OptionalBackend {
@@ -208,6 +240,90 @@ impl Backend for OptionalBackend {
         self.get()?.restore(m)
     }
 }
+fn apply_action(
+    action: Action,
+    engine: &mut Engine<OptionalBackend>,
+    folder: &std::path::Path,
+    scanner: &mut Scanner,
+    games: &[Game],
+    now: f64,
+    state: &SharedState,
+) -> Result<bool> {
+    match action {
+        Action::Settings(updated) => {
+            let result = (|| -> Result<()> {
+                updated.validate()?;
+                let replacement = Scanner::new((*updated).clone())?;
+                write_json(&folder.join("config.json"), updated.as_ref())?;
+                engine.backend.config = (*updated).clone();
+                engine.backend.backend = None;
+                engine.config = *updated;
+                engine.settings_changed();
+                *scanner = replacement;
+                Ok(())
+            })();
+            if let Ok(mut shared) = state.lock() {
+                shared.settings_error = result
+                    .as_ref()
+                    .err()
+                    .map(|e| format!("Could not save settings: {e:#}"))
+                    .unwrap_or_default();
+                shared.config = engine.config.clone();
+                shared.revision += 1;
+            }
+            return Ok(result.is_ok());
+        }
+        Action::Disable => {
+            let mut updated = engine.config.clone();
+            updated.automation_enabled = !updated.automation_enabled;
+            return apply_action(
+                Action::Settings(Box::new(updated)),
+                engine,
+                folder,
+                scanner,
+                games,
+                now,
+                state,
+            );
+        }
+        Action::Pause => {
+            if engine.config.mode == "active" {
+                engine.manual_pause = !engine.manual_pause;
+            }
+        }
+        Action::Restore => {
+            if engine.config.mode == "observe" {
+                return Ok(false);
+            }
+            if !state.lock().map(|s| s.discovery_ready).unwrap_or(false) {
+                return Ok(false);
+            }
+            engine.manual_pause = false;
+            let mut guard_config = engine.config.clone();
+            guard_config.excluded_paths.clear();
+            guard_config.excluded_executables.clear();
+            let mut guard = Scanner::new(guard_config)?;
+            let guard_games = recovery_games(engine, games);
+            let result =
+                engine.restore(&mut || guard.scan(&guard_games).map_or(true, |a| !a.is_empty()));
+            engine.attempt(result, now);
+        }
+        Action::Refresh => return Ok(true),
+        Action::Quit => (),
+    }
+    Ok(false)
+}
+fn recovery_games(engine: &Engine<OptionalBackend>, games: &[Game]) -> Vec<Game> {
+    let mut known = games.to_vec();
+    for game in &engine.remembered_games {
+        if !known.iter().any(|g| {
+            crate::discovery::canonical(&g.path) == crate::discovery::canonical(&game.path)
+        }) {
+            known.push(game.clone());
+        }
+    }
+    known
+}
 fn run(
     mut engine: Engine<OptionalBackend>,
     folder: PathBuf,
@@ -216,23 +332,25 @@ fn run(
     duration: f64,
     console: bool,
 ) -> Result<()> {
-    let config = engine.config.clone();
-    let mut scanner = Scanner::new(config.clone())?;
+    let mut scanner = Scanner::new(engine.config.clone())?;
+    let mut guard_config = engine.config.clone();
+    guard_config.excluded_paths.clear();
+    guard_config.excluded_executables.clear();
+    let mut recovery_scanner = Scanner::new(guard_config)?;
     let mut games = vec![];
     let mut errors = std::collections::BTreeMap::<String, String>::new();
-    let (request_tx, request_rx) = mpsc::channel::<(f64, bool, bool)>();
+    let (request_tx, request_rx) = mpsc::channel::<(Config, f64, bool, bool)>();
     let (result_tx, result_rx) = mpsc::channel();
-    let discovery_config = config.clone();
     let inventory_worker = std::thread::spawn(move || {
         let mut discovery = Discovery::default();
-        while let Ok((now, force, defer)) = request_rx.recv() {
-            let mut games = discovery.refresh(&discovery_config, now, force, defer);
-            let installed = games.len();
-            for root in &discovery.steam_libraries {
-                games.push(Game::new("Steam", root, "Steam game", root));
-            }
+        while let Ok((config, now, force, defer)) = request_rx.recv() {
+            let games = discovery.refresh(&config, now, force, defer);
             if result_tx
-                .send((games, installed, discovery.errors.clone()))
+                .send((
+                    games,
+                    discovery.errors.clone(),
+                    discovery.steam_libraries.clone(),
+                ))
                 .is_err()
             {
                 break;
@@ -240,64 +358,116 @@ fn run(
         }
     });
     let start = Instant::now();
-    let (mut next_inventory, mut installed, mut last_status, mut inventory_pending) =
-        (0., 0, Value::Null, false);
-    let mut gaming = false;
+    let mut next_inventory = 0.;
+    let mut last_status = Value::Null;
+    let mut inventory_pending = false;
     let mut force_requested = false;
-    let result = (|| {
+    let mut queued = None;
+    let mut inventory_ready = false;
+    let mut steam_roots = vec![];
+    let result = (|| -> Result<()> {
         loop {
             let now = start.elapsed().as_secs_f64();
             if duration > 0. && now >= duration {
                 break;
             }
-            let mut force = std::mem::take(&mut force_requested);
+            let actions = queued.take().into_iter().chain(commands.try_iter());
             let mut quit = false;
-            for action in commands.try_iter() {
-                match action {
-                    Action::Quit => quit = true,
-                    Action::Refresh => force = true,
-                    Action::Disable => engine.disabled = !engine.disabled,
-                    Action::Pause => {
-                        if config.mode == "active" {
-                            engine.manual_pause = !engine.manual_pause;
-                        }
-                    }
-                    Action::Restore => {
-                        engine.manual_pause = false;
-                        if !gaming && config.mode == "active" {
-                            let result = engine.restore(&mut || {
-                                scanner.scan(&games).map_or(true, |a| !a.is_empty())
-                            });
-                            engine.attempt(result, now);
-                        }
-                    }
+            for action in actions {
+                if matches!(action, Action::Quit) {
+                    quit = true;
+                    break;
+                }
+                if apply_action(
+                    action,
+                    &mut engine,
+                    &folder,
+                    &mut scanner,
+                    &games,
+                    now,
+                    &state,
+                )? {
+                    force_requested = true;
                 }
             }
             if quit {
                 break;
             }
-            if let Ok((updated, count, updated_errors)) = result_rx.try_recv() {
+            if let Ok((updated, updated_errors, roots)) = result_rx.try_recv() {
+                inventory_ready = true;
+                steam_roots = roots;
                 games = updated;
-                installed = count;
                 errors = updated_errors;
                 inventory_pending = false;
-                write_json(&folder.join("inventory.json"), &games[..installed])?;
+                write_json(&folder.join("inventory.json"), &games)?;
                 log(
                     &folder,
-                    &format!("Inventory refreshed: {installed} installed locations"),
+                    &format!("Inventory refreshed: {} installed locations", games.len()),
                 );
+                if let Ok(mut shared) = state.lock() {
+                    shared.revision += 1;
+                    shared.discovery_ready = true;
+                }
             }
-            if !inventory_pending && (force || now >= next_inventory) {
-                request_tx.send((now, force, gaming))?;
+            let scanned = scanner.scan(&games)?;
+            let new_candidate = scanner.new_game_candidate(&games, &steam_roots);
+            force_requested |= new_candidate;
+            let guard_games = recovery_games(&engine, &games);
+            let all_active = if engine.state.is_some() {
+                recovery_scanner.scan(&guard_games)?
+            } else {
+                scanned.clone()
+            };
+            let active = scanned
+                .into_iter()
+                .filter(|game| {
+                    !engine.config.ignored_games.iter().any(|path| {
+                        crate::discovery::canonical(path) == crate::discovery::canonical(&game.path)
+                    })
+                })
+                .collect::<Vec<_>>();
+            let gaming = !active.is_empty() || (engine.state.is_some() && !all_active.is_empty());
+            if !inventory_pending && (force_requested || now >= next_inventory) {
+                request_tx.send((
+                    engine.config.clone(),
+                    now,
+                    force_requested,
+                    gaming || new_candidate,
+                ))?;
                 inventory_pending = true;
-                next_inventory = now + config.discovery_seconds;
+                force_requested = false;
+                next_inventory = now + engine.config.discovery_seconds;
             }
-            let active = scanner.scan(&games)?;
-            gaming = !active.is_empty();
-            engine.step(gaming, now, &mut || {
-                scanner.scan(&games).map_or(true, |a| !a.is_empty())
-            });
-            let status = json!({"version":env!("CARGO_PKG_VERSION"),"implementation":"Rust","mode":config.mode,"message":engine.message,"active_games":active,"installed_locations":installed,"detection_disabled":engine.disabled,"manual_pause":engine.manual_pause,"last_error":engine.last_error,"discovery_errors":errors,"inaccessible_processes":scanner.inaccessible,"recovery_pending":engine.state.is_some()});
+            let records = games
+                .iter()
+                .filter(|g| {
+                    all_active.iter().any(|a| {
+                        crate::discovery::canonical(&a.path) == crate::discovery::canonical(&g.path)
+                    })
+                })
+                .cloned()
+                .collect();
+            engine.remember_games(records)?;
+            if inventory_ready {
+                engine.step(gaming, now, &mut || {
+                    recovery_scanner
+                        .scan(&guard_games)
+                        .map_or(true, |a| !a.is_empty())
+                });
+            } else {
+                engine.message = "Discovering installed games — existing recovery is held until discovery finishes".into();
+            }
+            if inventory_ready
+                && engine.state.is_none()
+                && !gaming
+                && engine.config.automation_enabled
+                && engine.config.mode != "observe"
+                && !scanner.lmstudio_running()
+            {
+                engine.message =
+                    "Waiting for LM Studio — open it; automatic pausing will resume".into();
+            }
+            let status = json!({"version":env!("CARGO_PKG_VERSION"),"implementation":"Rust","mode":engine.config.mode,"automation_enabled":engine.config.automation_enabled,"message":engine.message,"active_games":active,"installed_locations":games.len(),"detection_disabled":engine.disabled,"manual_pause":engine.manual_pause,"last_error":engine.last_error,"discovery_errors":errors,"inaccessible_processes":scanner.inaccessible,"recovery_pending":engine.state.is_some()});
             if status != last_status {
                 write_json(&folder.join("status.json"), &status)?;
                 log(&folder, &engine.message);
@@ -311,33 +481,22 @@ fn run(
                 shared.disabled = engine.disabled;
                 shared.manual_pause = engine.manual_pause;
                 shared.pending = engine.state.is_some();
+                shared.active_mode = engine.config.mode == "active";
+                shared.config = engine.config.clone();
+                shared.games = games.clone();
+                shared.active_games = all_active;
+                // Only copy the running-app list while the dashboard asks for it.
+                shared.running_apps = if crate::dashboard::needs_running_apps() {
+                    scanner.running_apps()
+                } else {
+                    vec![]
+                };
+                shared.discovery_errors = errors.clone();
             }
-            // Timed receive keeps Quit responsive without a polling wakeup loop.
-            match commands.recv_timeout(Duration::from_secs_f64(config.poll_seconds)) {
+            match commands.recv_timeout(Duration::from_secs_f64(engine.config.poll_seconds)) {
                 Ok(Action::Quit) => break,
-                Ok(action) => match action {
-                    Action::Refresh => {
-                        next_inventory = 0.;
-                        force_requested = true;
-                    }
-                    Action::Pause => {
-                        if config.mode == "active" {
-                            engine.manual_pause = !engine.manual_pause;
-                        }
-                    }
-                    Action::Disable => engine.disabled = !engine.disabled,
-                    Action::Restore => {
-                        engine.manual_pause = false;
-                        if !gaming && config.mode == "active" {
-                            let r = engine.restore(&mut || {
-                                scanner.scan(&games).map_or(true, |a| !a.is_empty())
-                            });
-                            engine.attempt(r, start.elapsed().as_secs_f64());
-                        }
-                    }
-                    Action::Quit => break,
-                },
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Ok(action) => queued = Some(action),
+                Err(mpsc::RecvTimeoutError::Timeout) => (),
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     if duration == 0. {
                         break;
@@ -368,5 +527,100 @@ pub fn log(folder: &std::path::Path, message: &str) {
             .unwrap_or_default()
             .as_secs();
         let _ = writeln!(file, "{timestamp} {message}");
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn manual_restore_waits_for_first_discovery_and_retains_journal() {
+        let folder =
+            std::env::temp_dir().join(format!("gamepause-startup-recovery-{}", std::process::id()));
+        let path = folder.join("state.json");
+        write_json(&path,&json!({"schema":2,"server":{"running":false,"port":1234},"server_stopped":false,"models":[],"pause_complete":true})).unwrap();
+        let before = fs::read(&path).unwrap();
+        let config = Config::default();
+        let mut engine = Engine::new(
+            config.clone(),
+            OptionalBackend {
+                backend: None,
+                config: config.clone(),
+            },
+            path.clone(),
+        )
+        .unwrap();
+        let mut scanner = Scanner::new(config).unwrap();
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        apply_action(
+            Action::Restore,
+            &mut engine,
+            &folder,
+            &mut scanner,
+            &[],
+            0.,
+            &shared,
+        )
+        .unwrap();
+        assert!(engine.state.is_some());
+        assert_eq!(before, fs::read(&path).unwrap());
+        fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn settings_apply_live_persist_and_invalid_updates_leave_previous_settings() {
+        let folder =
+            std::env::temp_dir().join(format!("gamepause-live-settings-{}", std::process::id()));
+        let config = Config::default();
+        let backend = OptionalBackend {
+            backend: None,
+            config: config.clone(),
+        };
+        let mut engine = Engine::new(config.clone(), backend, folder.join("state.json")).unwrap();
+        let mut scanner = Scanner::new(config.clone()).unwrap();
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let mut updated = config;
+        updated.automation_enabled = false;
+        updated.restore_delay_seconds = 17.;
+        updated.excluded_paths.push(r"D:\Ignored".into());
+        assert!(
+            apply_action(
+                Action::Settings(Box::new(updated)),
+                &mut engine,
+                &folder,
+                &mut scanner,
+                &[],
+                0.,
+                &shared
+            )
+            .unwrap()
+        );
+        assert!(!engine.config.automation_enabled);
+        assert!(scanner.excluded("game.exe", r"D:\Ignored\game.exe"));
+        let loaded = Config::load(&folder.join("config.json")).unwrap();
+        assert!(!loaded.automation_enabled);
+        assert_eq!(loaded.restore_delay_seconds, 17.);
+        let bytes = fs::read(folder.join("config.json")).unwrap();
+        let mut invalid = loaded;
+        invalid.api_host = "example.com:1234".into();
+        assert!(
+            !apply_action(
+                Action::Settings(Box::new(invalid)),
+                &mut engine,
+                &folder,
+                &mut scanner,
+                &[],
+                0.,
+                &shared
+            )
+            .unwrap()
+        );
+        assert_eq!(bytes, fs::read(folder.join("config.json")).unwrap());
+        assert!(
+            shared
+                .lock()
+                .unwrap()
+                .settings_error
+                .contains("Could not save")
+        );
+        fs::remove_file(folder.join("config.json")).unwrap();
     }
 }

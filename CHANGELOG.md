@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.0 — 2026-10-03 (preview)
+
+- Enable automatic pausing by default and migrate the old observation/active setup.
+- Add an on-demand native dashboard with searchable games, running-app registration, executable browsing, ignore/enable controls, and live settings.
+- Open the existing dashboard when launched again; keep sign-in startup quiet in the tray.
+- Discover new games automatically, request early Steam metadata refresh for unfamiliar processes, and remove broad library-folder classification.
+- Exclude known background utilities from the game inventory.
+- Stay running when the LM Studio CLI is unavailable and retry control automatically.
+- Handle an initially stopped HTTP server during capture and preserve its original state through recovery.
+- Preserve pending recovery when automatic pausing is switched off.
+- Remember session game paths through exclusions/removal and wait for initial discovery before recovering after a restart.
+- Exclude REDlauncher prelaunch helpers and clear abandoned capture errors when a session ends without unloading.
+- Expand regression tests and document the normal installed workflow.
+
 ## 0.1.1 — 2026-10-03 (preview)
 
 - Fix a crash when the tray menu remains open through a status timer tick. Windows dispatches timer messages inside the popup menu; the UI now releases state borrows before native calls.
@@ -17,4 +31,4 @@
 - Native tray controls, console diagnostics, startup at Windows sign-in, per-user installer, portable ZIP, checksums, and dependency licenses.
 - Live Steam / Witcher 3 validation and documented resource measurements.
 
-This preview uses LM Studio's internal control protocol. See the validation and troubleshooting guides before enabling active mode on a new setup.
+This preview uses LM Studio's internal control protocol. See the validation and troubleshooting guides for compatibility and recovery limits.
