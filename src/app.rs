@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use std::{
     fs::{self, OpenOptions},
     io::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc},
     time::{Duration, Instant, SystemTime},
 };
@@ -57,6 +57,8 @@ struct Options {
     doctor: bool,
     restore: bool,
     verify: bool,
+    status: bool,
+    games: bool,
     duration: f64,
     version: bool,
     help: bool,
@@ -77,6 +79,8 @@ fn options() -> Result<Options> {
             "--doctor" => options.doctor = true,
             "--restore" => options.restore = true,
             "--verify" => options.verify = true,
+            "--status" => options.status = true,
+            "--games" => options.games = true,
             "--duration" => {
                 options.duration = args.next().context("--duration needs seconds")?.parse()?
             }
@@ -93,6 +97,88 @@ fn options() -> Result<Options> {
     }
     Ok(options)
 }
+
+// ── P2-3: stable, parseable CLI output formatters (pure, mock-free) ──────────
+// The acceptance test asserts EXACT stdout shape, so these take a fixed Value
+// and return the exact lines. Kept pure so they are unit-testable with a mock
+// status/inventory — no backend, no data dir required to exercise the shape.
+/// One `key=value` line per status field, in a fixed order. A missing or null
+/// field renders as `-` so the output stays parseable regardless of whether the
+/// app has been running long enough to fill it in. Booleans render as yes/no.
+fn format_status(status: &Value) -> String {
+    let field = |key: &str| match status.get(key) {
+        Some(Value::Null) | None => "-".to_string(),
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Bool(b)) => bool_word(*b),
+        Some(other) => other.to_string(),
+    };
+    let lines = [
+        ("version", field("version")),
+        ("mode", field("mode")),
+        ("automation_enabled", field("automation_enabled")),
+        ("message", field("message")),
+        ("active_games", field("active_games")),
+        ("installed_locations", field("installed_locations")),
+        ("detection_disabled", field("detection_disabled")),
+        ("manual_pause", field("manual_pause")),
+        ("last_error", field("last_error")),
+        ("recovery_pending", field("recovery_pending")),
+    ];
+    lines.map(|(k, v)| format!("{k}={v}")).join("\n")
+}
+/// `name<TAB>launcher<TAB>path` per installed location, in inventory order.
+/// Empty inventory renders as `none` so the command never prints an empty
+/// body (stable, non-ambiguous for scripting).
+fn format_games(inventory: &Value) -> String {
+    let Some(items) = inventory.as_array() else {
+        return "none".into();
+    };
+    if items.is_empty() {
+        return "none".into();
+    }
+    items
+        .iter()
+        .map(|g| {
+            format!(
+                "{}\t{}\t{}",
+                g["name"].as_str().unwrap_or(""),
+                g["launcher"].as_str().unwrap_or(""),
+                g["path"].as_str().unwrap_or("")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+fn bool_word(b: bool) -> String {
+    if b { "yes".into() } else { "no".into() }
+}
+/// Read `status.json` and format it for stdout. A missing file (no running
+/// instance) yields the stable `status=absent` line rather than an error, so a
+/// script can distinguish "not running" from a real failure. A corrupt file is
+/// surfaced as an error — that is a real problem, not an empty state.
+fn status_output(folder: &Path) -> Result<String> {
+    match fs::read(folder.join("status.json")) {
+        Ok(bytes) => {
+            let status: Value =
+                serde_json::from_slice(&bytes).context("status.json is not valid JSON")?;
+            Ok(format_status(&status))
+        }
+        Err(_) => Ok("status=absent".into()),
+    }
+}
+/// Read `inventory.json` and format it for stdout. A missing file (discovery
+/// has not completed) yields the stable `games=absent` line. A corrupt file is
+/// surfaced as an error.
+fn games_output(folder: &Path) -> Result<String> {
+    match fs::read(folder.join("inventory.json")) {
+        Ok(bytes) => {
+            let inventory: Value =
+                serde_json::from_slice(&bytes).context("inventory.json is not valid JSON")?;
+            Ok(format_games(&inventory))
+        }
+        Err(_) => Ok("games=absent".into()),
+    }
+}
 pub fn main(console: bool) -> Result<()> {
     let args = options()?;
     if args.version {
@@ -101,7 +187,7 @@ pub fn main(console: bool) -> Result<()> {
     }
     if args.help {
         println!(
-            "GamePause for LM Studio\n--headless --active --observe --duration SECONDS\n--doctor --discover --restore --verify --data-dir PATH\nDefault: automatic pausing with a native dashboard. --background starts in the tray. --observe is a diagnostic override. --verify round-trips the loaded model and checks its fields."
+            "GamePause for LM Studio\n--headless --active --observe --duration SECONDS\n--doctor --discover --restore --verify --status --games --data-dir PATH\nDefault: automatic pausing with a native dashboard. --background starts in the tray. --observe is a diagnostic override. --verify round-trips the loaded model and checks its fields. --status/--games print stable, parseable one-line-per-item output for scripting."
         );
         return Ok(());
     }
@@ -109,6 +195,19 @@ pub fn main(console: bool) -> Result<()> {
     fs::create_dir_all(&folder)?;
     let folder = fs::canonicalize(folder)?;
     install_panic_hook(&folder);
+    // P2-3: read-only, scriptable output. These read the JSON a running
+    // instance has already written — no backend, no lock, no LM Studio
+    // required. They run BEFORE the lock guard precisely so they work while a
+    // GUI instance holds it (the main use case: `gamepause --status` from a
+    // script next to a live app). Output is one line per field/item.
+    if args.status {
+        println!("{}", status_output(&folder)?);
+        return Ok(());
+    }
+    if args.games {
+        println!("{}", games_output(&folder)?);
+        return Ok(());
+    }
     let _lock = match config::lock(&folder) {
         Ok(lock) => lock,
         Err(e) => {
@@ -877,5 +976,107 @@ mod tests {
         );
         std::panic::set_hook(previous);
         let _ = fs::remove_file(folder.join("gamepause.log"));
+    }
+
+    // ── P2-3 acceptance: --status / --games print stable, parseable output ──
+    // The test writes a *mock* status/inventory into a temp data dir and asserts
+    // the EXACT stdout shape (status_output / games_output are the same helpers
+    // main() prints), so the shape a script sees is the shape asserted here.
+    #[test]
+    fn status_output_is_exact_and_parseable() {
+        let folder =
+            std::env::temp_dir().join(format!("gamepause-cli-status-{}", std::process::id()));
+        let _ = fs::create_dir_all(&folder);
+        // A realistic status.json: booleans, numbers, a missing field (we do
+        // not write "last_error") to prove the absent-field contract.
+        write_json(
+            &folder.join("status.json"),
+            &json!({
+                "version": "0.3.0",
+                "mode": "active",
+                "automation_enabled": true,
+                "message": "Waiting for a game to launch",
+                "active_games": 1,
+                "installed_locations": 3,
+                "detection_disabled": false,
+                "manual_pause": false,
+                "recovery_pending": false
+            }),
+        )
+        .unwrap();
+
+        let out = status_output(&folder).unwrap();
+        let expected = [
+            "version=0.3.0",
+            "mode=active",
+            "automation_enabled=yes",
+            "message=Waiting for a game to launch",
+            "active_games=1",
+            "installed_locations=3",
+            "detection_disabled=no",
+            "manual_pause=no",
+            "last_error=-",
+            "recovery_pending=no",
+        ]
+        .join("\n");
+        assert_eq!(
+            out, expected,
+            "exact --status shape must be stable and parseable"
+        );
+
+        // Absent file (no running instance) is a stable single line, not an error.
+        let empty = std::env::temp_dir().join(format!("gamepause-cli-none-{}", std::process::id()));
+        let _ = fs::create_dir_all(&empty);
+        assert_eq!(status_output(&empty).unwrap(), "status=absent");
+
+        // A corrupt file is a real failure, not silently empty.
+        let corrupt =
+            std::env::temp_dir().join(format!("gamepause-cli-bad-{}", std::process::id()));
+        let _ = fs::create_dir_all(&corrupt);
+        fs::write(corrupt.join("status.json"), b"{not json").unwrap();
+        assert!(
+            status_output(&corrupt).is_err(),
+            "corrupt status.json must be an error"
+        );
+        let _ = fs::remove_dir_all(&corrupt);
+
+        let _ = fs::remove_dir_all(&folder);
+        let _ = fs::remove_dir_all(&empty);
+    }
+
+    #[test]
+    fn games_output_is_exact_and_parseable() {
+        let folder =
+            std::env::temp_dir().join(format!("gamepause-cli-games-{}", std::process::id()));
+        let _ = fs::create_dir_all(&folder);
+        write_json(
+            &folder.join("inventory.json"),
+            &json!([
+                {"launcher":"steam","identity":"1234","name":"Elden Ring","path":"C:\\Program Files (x86)\\Steam\\steamapps\\common\\Elden Ring"},
+                {"launcher":"gog","identity":"gog-xyz","name":"Baldur's Gate 3","path":"C:\\Games\\BG3"}
+            ]),
+        )
+        .unwrap();
+
+        let out = games_output(&folder).unwrap();
+        let expected = [
+            "Elden Ring\tsteam\tC:\\Program Files (x86)\\Steam\\steamapps\\common\\Elden Ring",
+            "Baldur's Gate 3\tgog\tC:\\Games\\BG3",
+        ]
+        .join("\n");
+        assert_eq!(
+            out, expected,
+            "exact --games shape: name<TAB>launcher<TAB>path per line, inventory order"
+        );
+
+        // Empty inventory (discovery ran, found nothing) is a stable single line.
+        let none =
+            std::env::temp_dir().join(format!("gamepause-cli-gamenes-{}", std::process::id()));
+        let _ = fs::create_dir_all(&none);
+        write_json(&none.join("inventory.json"), &json!([])).unwrap();
+        assert_eq!(games_output(&none).unwrap(), "none");
+        let _ = fs::remove_dir_all(&none);
+
+        let _ = fs::remove_dir_all(&folder);
     }
 }

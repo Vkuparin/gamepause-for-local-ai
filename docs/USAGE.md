@@ -30,6 +30,23 @@ Selected rows show their path and why they are recognized. Discovery and save er
 
 **Pause / resume AI manually** holds the session open without a game. Release it to allow restoration after the delay. **Restore AI now** removes the delay; recognized games still prevent restoring. **Test round-trip** (dashboard and tray) runs the whole capture → unload → restore cycle on purpose and reports each step; it is a test, not a session, and needs no game running. The tray menu exposes the same actions.
 
+## CLI scripting
+
+`GamePauseCLI.exe` exposes the diagnostics and read-only state as stable, one-line-per-item output for scripts and monitoring. These read the files a running instance already writes, so they work even while a GUI instance is active and never touch the models or server.
+
+```powershell
+# Current state as key=value lines (booleans as yes/no, missing fields as -)
+.\GamePauseCLI.exe --status
+# Installed games as name<TAB>launcher<TAB>path, one per line
+.\GamePauseCLI.exe --games
+# Full doctor report (LM Studio version, server state, models, data dir)
+.\GamePauseCLI.exe --doctor
+# Round-trip test: capture, unload, confirm empty, restore, compare fields
+.\GamePauseCLI.exe --verify
+```
+
+If the app is not running, `--status` prints `status=absent` and `--games` prints `games=absent`; a corrupt state file is an explicit error, not silence. `--verify` needs a live LM Studio server and exits non-zero if any step fails.
+
 ## Background AI applications
 
 Clients using LM Studio's HTTP server are unavailable during gaming. Pause agents that independently restart the server or explicitly load models. With `stop_server_during_gaming: false`, a client using JIT loading can reload models immediately. GamePause does not prevent every later model load.
