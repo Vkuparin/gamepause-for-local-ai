@@ -420,6 +420,7 @@ unsafe fn menu(hwnd: HWND, ui: &UI) {
                 },
             ),
             (4, "Refresh installed games".into(), 0),
+            (10, "Test round-trip (verify AI)".into(), 0),
             (5, "Settings and games".into(), 0),
             (6, "Open logs and status folder".into(), 0),
             (
@@ -466,6 +467,7 @@ unsafe fn menu(hwnd: HWND, ui: &UI) {
             }
             3 => Some(Action::Disable),
             4 => Some(Action::Refresh),
+            10 => Some(Action::Verify),
             8 => Some(Action::Quit),
             5 | 9 => {
                 dashboard::show(ui.shared.clone(), ui.tx.clone(), ui.folder.clone());
@@ -792,6 +794,7 @@ mod tests {
             settings_error: String::new(),
             revision: 0,
             discovery_ready: false,
+            verify_report: None,
         }));
         UI_STATE.with(|state| {
             *state.borrow_mut() = Some(UI {
@@ -855,6 +858,7 @@ mod tests {
             settings_error: String::new(),
             revision: 0,
             discovery_ready: false,
+            verify_report: None,
         }));
         let (tx, _rx) = mpsc::channel();
         let driver = std::thread::spawn(|| {

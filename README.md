@@ -16,6 +16,7 @@ GamePause is a small native Rust app for Windows. It notices when a game starts,
 - Stops LM Studio's HTTP server during gaming by default to prevent HTTP clients from immediately loading models again.
 - Waits 30 seconds after the last game exits. Starting another game cancels the delay; alt-tabbing keeps AI paused.
 - Keeps a durable recovery journal through partial failures and restarts.
+- Verifies the full pause/restore round-trip on demand: capture, unload, confirm the server emptied, restore, and field-compare the read-back settings — from the dashboard, tray, or `GamePauseCLI.exe --verify`.
 - Includes a native dashboard, searchable games, live settings, tray controls, automatic startup at Windows sign-in, a per-user installer, and a portable ZIP.
 
 No Python runtime, administrator service, telemetry, recursive game scans, or permanent model-name configuration. Model control uses localhost.

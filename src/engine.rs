@@ -1,9 +1,27 @@
 use crate::{
     config::{Config, write_json},
-    lmstudio::{Backend, Snapshot},
+    lmstudio::{Backend, Snapshot, compare_fields},
 };
 use anyhow::{Result, bail};
 use std::{fs, path::PathBuf};
+
+/// Per-step outcome of the P2-1 round-trip verify, so the dashboard and the
+/// `gamepause verify` CLI can render exactly what happened at each stage
+/// (capture / unload / verify-unloaded / restore / field-compare).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct VerifyStep {
+    pub name: String,
+    pub ok: bool,
+    pub detail: String,
+}
+
+/// The result of one round-trip verify run.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct VerifyReport {
+    pub steps: Vec<VerifyStep>,
+    pub ok: bool,
+    pub summary: String,
+}
 
 pub struct Engine<B: Backend> {
     pub backend: B,
@@ -17,9 +35,13 @@ pub struct Engine<B: Backend> {
     pub remembered_games: Vec<crate::discovery::Game>,
     /// Set by the two restore call sites just before `attempt`; consumed by
     /// `attempt` to emit the explicit "Restore failed" message (P0-4). Kept
-    /// separate from `last_error` so a *pause* failure is never mislabelled as
+    /// Separate from `last_error` so a *pause* failure is never mislabelled as
     /// a restore failure.
     pub restore_failed: bool,
+    /// Populated by `verify_round_trip` (P2-1) with the per-step outcome, so
+    /// the dashboard and CLI can render the round-trip result without a live
+    /// side effect.
+    pub verify_report: Option<crate::engine::VerifyReport>,
     quiet_since: Option<f64>,
     retry_at: f64,
 }
@@ -70,6 +92,7 @@ impl<B: Backend> Engine<B> {
             disabled: false,
             manual_pause: false,
             restore_failed: false,
+            verify_report: None,
             quiet_since: None,
             retry_at: 0.,
         })
@@ -249,6 +272,172 @@ impl<B: Backend> Engine<B> {
         self.message = "AI restored".into();
         Ok(())
     }
+    /// P2-1: run the full capture → unload → verify-stopped → restore →
+    /// field-compare pipeline against the current LM Studio state and record
+    /// the per-step report on the engine. The pipeline itself lives in the
+    /// module-level [`verify_backend`] so the CLI can drive it directly against
+    /// a backend (no persistent state.json, no recovery journal).
+    pub fn verify_round_trip(&mut self) -> VerifyReport {
+        let report = verify_backend(&mut self.backend);
+        self.verify_report = Some(report.clone());
+        report
+    }
+}
+/// Drive the P2-1 round-trip verification pipeline against a backend, with no
+/// game involved and no recovery journal written. Self-contained: it runs
+/// against whatever `Backend` it is given (the `Fake` mock in tests, the real
+/// LM Studio only when the user explicitly invokes it) and never touches the
+/// persistent state.json.
+///
+/// Returns a report with one entry per logical step (capture, unload,
+/// verify-stopped, restore, verify-fields). On any failure it stops there,
+/// records the exact failing field/detail, and still returns a report
+/// (ok = false) so the caller can render it rather than surface an opaque
+/// error.
+pub fn verify_backend<B: Backend>(backend: &mut B) -> VerifyReport {
+    let mut report_steps: Vec<VerifyStep> = Vec::new();
+    macro_rules! step {
+        ($name:expr, $ok:expr, $detail:expr) => {{
+            report_steps.push(VerifyStep {
+                name: $name.into(),
+                ok: $ok,
+                detail: $detail,
+            });
+        }};
+    }
+    let finish = |steps: &[VerifyStep]| -> VerifyReport {
+        let ok = !steps.is_empty() && steps.iter().all(|s| s.ok);
+        let summary = if ok {
+            "Round-trip verify passed: capture, unload, restore, and field-compare all succeeded"
+                .to_string()
+        } else {
+            let first_failure = steps
+                .iter()
+                .find(|s| !s.ok)
+                .map(|s| s.name.clone())
+                .unwrap_or_default();
+            format!("Round-trip verify failed at: {first_failure}")
+        };
+        VerifyReport {
+            steps: steps.to_vec(),
+            ok,
+            summary,
+        }
+    };
+
+    // 1. Capture the live state (snapshot). A failure here means we cannot
+    // round-trip at all.
+    let snapshot = match backend.snapshot() {
+        Ok(s) => s,
+        Err(e) => {
+            step!("capture", false, format!("{e:#}"));
+            return finish(&report_steps);
+        }
+    };
+    let models = snapshot.models.clone();
+    let server_was_running = snapshot.server["running"] == true;
+    step!(
+        "capture",
+        true,
+        format!("{} model(s) captured", models.len())
+    );
+
+    // 2. Unload each captured model (only if it is currently loaded — the
+    // snapshot said it was).
+    {
+        let mut detail = String::new();
+        let mut ok = true;
+        for model in &models {
+            let still_loaded = match backend.loaded() {
+                Ok(loaded) => loaded.iter().any(|m| m["identifier"] == model.identifier),
+                Err(e) => {
+                    ok = false;
+                    detail = format!("{e:#}");
+                    break;
+                }
+            };
+            if still_loaded && let Err(e) = backend.unload(&model.identifier) {
+                ok = false;
+                detail = format!("{}: {e:#}", model.identifier);
+                break;
+            }
+        }
+        if ok && detail.is_empty() {
+            detail = format!("{} model(s) unloaded", models.len());
+        }
+        step!("unload", ok, detail);
+        if !ok {
+            return finish(&report_steps);
+        }
+    }
+
+    // 3. Verify the server actually stopped (only meaningful when it was up).
+    if server_was_running {
+        match backend.loaded() {
+            Ok(loaded) if !loaded.is_empty() => {
+                step!(
+                    "verify-stopped",
+                    false,
+                    "models still loaded after unload".into()
+                );
+                return finish(&report_steps);
+            }
+            Ok(_) => step!("verify-stopped", true, "server empty".into()),
+            Err(e) => {
+                step!("verify-stopped", false, format!("{e:#}"));
+                return finish(&report_steps);
+            }
+        }
+    }
+
+    // 4. Restore each model.
+    {
+        let mut detail = String::new();
+        let mut ok = true;
+        for model in &models {
+            if let Err(e) = backend.restore(model) {
+                ok = false;
+                detail = format!("{}: {e:#}", model.identifier);
+                break;
+            }
+        }
+        if ok && detail.is_empty() {
+            detail = format!("{} model(s) restored", models.len());
+        }
+        step!("restore", ok, detail);
+        if !ok {
+            return finish(&report_steps);
+        }
+    }
+
+    // 5. Field-compare the read-back config against what we captured.
+    {
+        let mut detail = String::new();
+        let mut ok = true;
+        for model in &models {
+            match backend.read_config(model) {
+                Ok(actual) => match compare_fields(&model.load_config, &actual) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        ok = false;
+                        detail = format!("{}: {e:#}", model.identifier);
+                        break;
+                    }
+                },
+                Err(e) => {
+                    ok = false;
+                    detail = format!("{}: {e:#}", model.identifier);
+                    break;
+                }
+            }
+        }
+        if ok && detail.is_empty() {
+            detail = format!("{} config(s) match", models.len());
+        }
+        step!("verify-fields", ok, detail);
+    }
+
+    finish(&report_steps)
 }
 
 #[cfg(test)]
@@ -270,6 +459,10 @@ mod tests {
         fail_restore: Option<String>,
         fail_stop: bool,
         journal: PathBuf,
+        /// When set, `read_config` returns a value that differs from the
+        /// captured `load_config` (temperature 0.999 vs 0.7), so the P2-1
+        /// round-trip verify reports the exact failing field.
+        mutate_read: bool,
     }
     impl Fake {
         fn new() -> Self {
@@ -281,6 +474,7 @@ mod tests {
                 fail_restore: None,
                 fail_stop: false,
                 journal: PathBuf::new(),
+                mutate_read: false,
             }
         }
     }
@@ -302,12 +496,19 @@ mod tests {
                         model_key: id.clone(),
                         namespace: "llm".into(),
                         ttl_ms: None,
-                        load_config: json!({"fields":[]}),
+                        load_config: json!({"fields":[{"key":"temperature","value":0.7}]}),
                         native_config: json!({}),
                         stage: "planned".into(),
                     })
                     .collect(),
             })
+        }
+        fn read_config(&mut self, _: &Model) -> Result<Value> {
+            // Round-trip read-back: normally identical to the captured
+            // load_config; with `mutate_read` the temperature drifts so the
+            // verify field-compare reports exactly that field.
+            let value = if self.mutate_read { 0.999 } else { 0.7 };
+            Ok(json!({"fields":[{"key":"temperature","value":value}]}))
         }
         fn loaded(&mut self) -> Result<Vec<Value>> {
             Ok(self
@@ -330,14 +531,19 @@ mod tests {
             Ok(())
         }
         fn unload(&mut self, id: &str) -> Result<()> {
-            let disk: Option<Snapshot> =
-                serde_json::from_str(&fs::read_to_string(&self.journal)?).unwrap();
-            assert!(
-                disk.unwrap()
-                    .models
-                    .iter()
-                    .any(|m| m.identifier == id && m.stage == "unloading")
-            );
+            // The "unloading" journal-entry assertion documents the pause-flow
+            // invariant. It only applies when a recovery journal actually
+            // exists; a self-contained verify (P2-1) unloads without one.
+            if self.journal.as_os_str().is_empty() || self.journal.exists() {
+                let disk: Option<Snapshot> =
+                    serde_json::from_str(&fs::read_to_string(&self.journal)?).unwrap();
+                assert!(
+                    disk.unwrap()
+                        .models
+                        .iter()
+                        .any(|m| m.identifier == id && m.stage == "unloading")
+                );
+            }
             self.events.push(format!("unload:{id}"));
             if self.fail_unload.as_deref() == Some(id) {
                 bail!("unload failed");
@@ -641,5 +847,61 @@ mod tests {
         let original = fs::read(&e.path).unwrap();
         assert!(Engine::new(e.config, e.backend, e.path.clone()).is_err());
         assert_eq!(fs::read(e.path).unwrap(), original);
+    }
+    // P2-1 acceptance: with the mock round-tripping cleanly, verify reports
+    // success and exercises every logical step.
+    #[test]
+    fn verify_reports_success_when_mock_round_trips() {
+        let mut e = engine(Fake::new());
+        let report = e.verify_round_trip();
+        assert!(
+            report.ok,
+            "expected a successful round-trip, got: {}",
+            report.summary
+        );
+        let names: Vec<&str> = report.steps.iter().map(|s| s.name.as_str()).collect();
+        // Capture, unload and verify-fields are always present; the server was
+        // running in the Fake, so verify-stopped is exercised too.
+        for expected in [
+            "capture",
+            "unload",
+            "verify-stopped",
+            "restore",
+            "verify-fields",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "missing step {expected}; got {names:?}"
+            );
+        }
+        // The engine also records the report for the dashboard/CLI to render.
+        assert_eq!(e.verify_report.as_ref().map(|r| r.ok), Some(true));
+    }
+    // P2-1 acceptance: when the mock returns a mutated config on restore,
+    // verify reports the EXACT failing field, not an opaque error.
+    #[test]
+    fn verify_reports_exact_failing_field_when_config_mutated() {
+        let mut e = engine(Fake::new());
+        e.backend.mutate_read = true;
+        let report = e.verify_round_trip();
+        assert!(
+            !report.ok,
+            "expected a failing round-trip, got: {}",
+            report.summary
+        );
+        // The field-compare step is the one that fails…
+        let failing = report.steps.iter().find(|s| !s.ok).expect("a failing step");
+        assert_eq!(failing.name, "verify-fields");
+        // …and it names the exact field that drifted (temperature).
+        assert!(
+            failing.detail.contains("temperature"),
+            "detail must name the failing field, got: {:?}",
+            failing.detail
+        );
+        assert!(
+            failing.detail.contains("differs"),
+            "detail should carry compare_fields' message, got: {:?}",
+            failing.detail
+        );
     }
 }

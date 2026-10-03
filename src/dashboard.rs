@@ -48,6 +48,7 @@ const CLI: i32 = 118;
 const FEEDBACK: i32 = 119;
 const SETTINGS: i32 = 120;
 const RENAME: i32 = 121;
+const VERIFY: i32 = 127;
 const DELAY_LABEL: i32 = 122;
 const ADDRESS_LABEL: i32 = 123;
 const TITLE: i32 = 130;
@@ -140,7 +141,7 @@ const GROUPBOXES: [GroupBox; 4] = [
     },
     GroupBox {
         id: ACTIONS_BOX,
-        members: &[TOGGLE, REMOVE, PAUSE, RESTORE, RENAME],
+        members: &[TOGGLE, REMOVE, PAUSE, RESTORE, VERIFY, RENAME],
     },
     GroupBox {
         id: SETTINGS_BOX,
@@ -161,7 +162,7 @@ fn by_id(id: i32) -> Layout {
 /// Every dashboard control, in 96-DPI design units. Order: section boxes first,
 /// then header, then top-to-bottom. Coordinates are the single source of truth
 /// shared by creation, DPI relayout, and the group-box bounds test (P1-3).
-const LAYOUT: [Layout; 30] = [
+const LAYOUT: [Layout; 31] = [
     Layout {
         id: OPTIONS_BOX,
         class: "BUTTON",
@@ -387,13 +388,23 @@ const LAYOUT: [Layout; 30] = [
         h: 32,
     },
     Layout {
+        id: VERIFY,
+        class: "BUTTON",
+        label: "Test round-trip",
+        style: WS_TABSTOP,
+        x: 608,
+        y: 594,
+        w: 140,
+        h: 32,
+    },
+    Layout {
         id: RENAME,
         class: "BUTTON",
         label: "Rename",
         style: WS_TABSTOP,
-        x: 608,
+        x: 754,
         y: 594,
-        w: 252,
+        w: 106,
         h: 32,
     },
     Layout {
@@ -772,6 +783,28 @@ unsafe extern "system" fn name_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
     }
 }
 
+/// Pure: render a round-trip verify report (P2-1) for the FEEDBACK line:
+/// one `name: detail` per step, marked ok/FAIL, with the summary last.
+#[must_use]
+pub fn render_verify_report(report: &crate::engine::VerifyReport) -> String {
+    let mut lines = report
+        .steps
+        .iter()
+        .map(|s| {
+            format!(
+                "{}: {} ({})",
+                s.name,
+                s.detail,
+                if s.ok { "ok" } else { "FAIL" }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("  |  ");
+    lines.push_str("  —  ");
+    lines.push_str(&report.summary);
+    lines
+}
+
 /// Pure: the Pause/Resume button label for a given mode state.
 /// When auto-mode is off there is nothing to pause, so the button stays neutral.
 #[must_use]
@@ -1031,8 +1064,13 @@ pub fn refresh() {
         .map(|(launcher, error)| format!("{launcher}: {error}"))
         .collect::<Vec<_>>()
         .join("; ");
+    // P2-1: a round-trip verify result (per-step, with the failing field on
+    // failure) takes the FEEDBACK line; settings errors still win, then
+    // discovery errors, then the default hint.
     let feedback = if !shared.settings_error.is_empty() {
         shared.settings_error.clone()
+    } else if let Some(report) = &shared.verify_report {
+        render_verify_report(report)
     } else if !errors.is_empty() {
         format!("Some discovery needs attention: {errors}")
     } else {
@@ -1176,6 +1214,11 @@ fn command(id: i32, notification: u32) {
         }
         REFRESH => {
             let _ = state.tx.send(Action::Refresh);
+        }
+        VERIFY => {
+            // P2-1: round-trip test against the live backend. Runs in the
+            // worker thread; the per-step result lands in the FEEDBACK line.
+            let _ = state.tx.send(Action::Verify);
         }
         ADD => {
             if let Some(path) = browse(state.hwnd) {
@@ -1530,7 +1573,7 @@ mod tests {
     #[test]
     fn every_control_id_appears_in_exactly_one_layout_entry() {
         // A duplicate id would make GetDlgItem ambiguous; a missing one would break
-        // relayout silently. LAYOUT must be a partition of the 29 control ids.
+        // relayout silently. LAYOUT must be a partition of the 30 control ids.
         let mut ids: Vec<i32> = LAYOUT.iter().map(|e| e.id).collect();
         ids.sort_unstable();
         let mut unique = ids.clone();
@@ -1598,6 +1641,61 @@ mod tests {
         let (enabled, reason) = super::restore_gate(true, true, true);
         assert!(enabled, "restore should be enabled when discovery is ready");
         assert_eq!(reason, "", "no feedback needed when restore is allowed");
+    }
+
+    // ── P2-1 acceptance: the FEEDBACK rendering of a round-trip report ──────
+    #[test]
+    fn render_verify_report_shows_every_step_and_the_failing_one() {
+        // A failed report must name each step, mark the failing one FAIL, and
+        // carry the summary so the FEEDBACK line explains the outcome inline.
+        let report = crate::engine::VerifyReport {
+            steps: vec![
+                crate::engine::VerifyStep {
+                    name: "capture".into(),
+                    ok: true,
+                    detail: "1 model(s) captured".into(),
+                },
+                crate::engine::VerifyStep {
+                    name: "unload".into(),
+                    ok: true,
+                    detail: "1 model(s) unloaded".into(),
+                },
+                crate::engine::VerifyStep {
+                    name: "verify-stopped".into(),
+                    ok: false,
+                    detail: "models still loaded after unload".into(),
+                },
+            ],
+            ok: false,
+            summary: "Round-trip verify failed at: verify-stopped".into(),
+        };
+        let rendered = super::render_verify_report(&report);
+        for needle in [
+            "capture: 1 model(s) captured (ok)",
+            "unload: 1 model(s) unloaded (ok)",
+            "verify-stopped: models still loaded after unload (FAIL)",
+            "Round-trip verify failed at: verify-stopped",
+        ] {
+            assert!(rendered.contains(needle), "missing {needle} in: {rendered}");
+        }
+
+        // The success path renders every step as ok and the passing summary.
+        let pass = crate::engine::VerifyReport {
+            steps: vec![crate::engine::VerifyStep {
+                name: "capture".into(),
+                ok: true,
+                detail: "0 model(s) captured".into(),
+            }],
+            ok: true,
+            summary: "Round-trip verify passed: capture, unload, restore, and field-compare all succeeded".into(),
+        };
+        let rendered = super::render_verify_report(&pass);
+        assert!(rendered.contains("capture: 0 model(s) captured (ok)"));
+        assert!(rendered.contains("Round-trip verify passed"));
+        assert!(
+            !rendered.contains("FAIL"),
+            "a passing report must not say FAIL"
+        );
     }
 
     #[test]

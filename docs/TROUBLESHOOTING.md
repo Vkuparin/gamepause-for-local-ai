@@ -8,9 +8,10 @@ Quit the watcher first; it holds a lock on its data directory. From the installe
 .\GamePauseCLI.exe --doctor
 .\GamePauseCLI.exe --discover
 .\GamePauseCLI.exe --observe --headless --duration 30
+.\GamePauseCLI.exe --verify
 ```
 
-Reports, `status.json`, `inventory.json`, and rotated `gamepause.log` files are in `%LOCALAPPDATA%\GamePause`. Use `--data-dir DIRECTORY` consistently for a custom installation. Doctor checks snapshot capture without unloading (and can temporarily start/stop the server); it is not a full restore test. Review and redact reports before posting them.
+Reports, `status.json`, `inventory.json`, and rotated `gamepause.log` files are in `%LOCALAPPDATA%\GamePause`. Use `--data-dir DIRECTORY` consistently for a custom installation. Doctor checks snapshot capture without unloading (and can temporarily start/stop the server); it is not a full restore test. `--verify` is the full round-trip: it unloads the loaded models, confirms the server emptied, restores them, and field-compares the read-back settings, printing `verify-report.json` and each step (`capture`, `unload`, `verify-stopped`, `restore`, `verify-fields`) with the failing field named on failure. Review and redact reports before posting them.
 
 ## A game is missed
 

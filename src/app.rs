@@ -22,6 +22,7 @@ pub enum Action {
     Restore,
     Disable,
     Refresh,
+    Verify,
     Quit,
     Settings(Box<Config>),
 }
@@ -40,6 +41,9 @@ pub struct Shared {
     pub settings_error: String,
     pub revision: u64,
     pub discovery_ready: bool,
+    /// P2-1: the latest round-trip verify report, for the dashboard/CLI to
+    /// render. `None` until a verify has been run.
+    pub verify_report: Option<crate::engine::VerifyReport>,
 }
 pub type SharedState = Arc<Mutex<Shared>>;
 #[derive(Default)]
@@ -52,6 +56,7 @@ struct Options {
     discover: bool,
     doctor: bool,
     restore: bool,
+    verify: bool,
     duration: f64,
     version: bool,
     help: bool,
@@ -71,6 +76,7 @@ fn options() -> Result<Options> {
             "--discover" => options.discover = true,
             "--doctor" => options.doctor = true,
             "--restore" => options.restore = true,
+            "--verify" => options.verify = true,
             "--duration" => {
                 options.duration = args.next().context("--duration needs seconds")?.parse()?
             }
@@ -95,7 +101,7 @@ pub fn main(console: bool) -> Result<()> {
     }
     if args.help {
         println!(
-            "GamePause for LM Studio\n--headless --active --observe --duration SECONDS\n--doctor --discover --restore --data-dir PATH\nDefault: automatic pausing with a native dashboard. --background starts in the tray. --observe is a diagnostic override."
+            "GamePause for LM Studio\n--headless --active --observe --duration SECONDS\n--doctor --discover --restore --verify --data-dir PATH\nDefault: automatic pausing with a native dashboard. --background starts in the tray. --observe is a diagnostic override. --verify round-trips the loaded model and checks its fields."
         );
         return Ok(());
     }
@@ -133,6 +139,23 @@ pub fn main(console: bool) -> Result<()> {
         return Ok(());
     }
     let mut backend = LMStudio::new(config.clone());
+    if args.verify {
+        // P2-1: round-trip verify against the live backend. Intentionally
+        // driven directly on the backend — a diagnostic must not be blocked by
+        // a corrupt state.json — and it never touches the recovery journal.
+        let backend = backend
+            .as_mut()
+            .map_err(|e| anyhow::anyhow!("{e:#}"))
+            .context("LM Studio server is not available")?;
+        let report = crate::engine::verify_backend(backend);
+        let pretty = serde_json::to_string_pretty(&report)?;
+        write_json(&folder.join("verify-report.json"), &report)?;
+        println!("{pretty}");
+        if !report.ok {
+            bail!("{}", report.summary);
+        }
+        return Ok(());
+    }
     // Observe mode must work even when LM Studio is absent.
     if args.doctor {
         let backend = backend.as_mut().map_err(|e| anyhow::anyhow!("{e:#}"))?;
@@ -177,6 +200,7 @@ pub fn main(console: bool) -> Result<()> {
         settings_error: String::new(),
         revision: 0,
         discovery_ready: false,
+        verify_report: None,
     }));
     let (tx, rx) = mpsc::channel();
     if args.headless {
@@ -239,6 +263,9 @@ impl Backend for OptionalBackend {
     }
     fn restore(&mut self, m: &crate::lmstudio::Model) -> Result<()> {
         self.get()?.restore(m)
+    }
+    fn read_config(&mut self, m: &crate::lmstudio::Model) -> Result<Value> {
+        self.get()?.read_config(m)
     }
 }
 fn apply_action(
@@ -309,6 +336,15 @@ fn apply_action(
                 engine.restore(&mut || guard.scan(&guard_games).map_or(true, |a| !a.is_empty()));
             engine.restore_failed = true;
             engine.attempt(result, now);
+        }
+        Action::Verify => {
+            let report = engine.verify_round_trip();
+            if let Ok(mut shared) = state.lock() {
+                shared.verify_report = Some(report.clone());
+                shared.message = report.summary.clone();
+                shared.revision += 1;
+            }
+            return Ok(true);
         }
         Action::Refresh => return Ok(true),
         Action::Quit => (),

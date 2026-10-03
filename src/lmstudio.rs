@@ -40,6 +40,11 @@ pub trait Backend {
     fn start_server(&mut self, port: u16) -> Result<()>;
     fn unload(&mut self, id: &str) -> Result<()>;
     fn restore(&mut self, model: &Model) -> Result<()>;
+    /// Re-read the live load config for a model after it has been restored,
+    /// so the round-trip verify (P2-1) can field-compare it against the
+    /// captured snapshot. Backends that cannot read config back report a
+    /// "read-back unavailable" error for that model instead of panicking.
+    fn read_config(&mut self, model: &Model) -> Result<Value>;
 }
 fn capture_with_server<B: Backend, T>(
     backend: &mut B,
@@ -427,6 +432,9 @@ impl Backend for LMStudio {
             .context("Restored model missing")?;
         self.verify(model, info)
     }
+    fn read_config(&mut self, model: &Model) -> Result<Value> {
+        self.raw_config(&model.namespace, &model.identifier)
+    }
 }
 pub fn run_command(program: &str, args: &[&str], timeout: Duration) -> Result<Vec<u8>> {
     let mut child = Command::new(program)
@@ -505,6 +513,9 @@ mod tests {
             unreachable!()
         }
         fn restore(&mut self, _: &Model) -> Result<()> {
+            unreachable!()
+        }
+        fn read_config(&mut self, _: &Model) -> Result<Value> {
             unreachable!()
         }
     }

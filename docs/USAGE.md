@@ -22,12 +22,13 @@ Left-click the tray icon or open GamePause from Start. Closing the window leaves
 - **Automatically pause AI while gaming:** takes effect without restarting and is remembered. Turning it off does not discard captured models: an existing session waits for recognized games to exit, then restores normally.
 - **Start when I sign in to Windows:** controls per-user startup. Sign-in starts quietly in the tray.
 - **Settings:** reveal optional **Restore after (seconds)** and **Local API** fields, saved with **Save settings**. **Locate lms…** handles unusual CLI installations. Normal launcher/LM Studio setups need no edits.
+- **Test round-trip:** exercises the full pause/restore cycle without a game — captures loaded models, unloads them, confirms the server is empty, restores them, and compares the read-back settings field by field. The result appears in the feedback line, naming the failing step and field when something does not round-trip. Use it after upgrading LM Studio or after an odd restore.
 
 Selected rows show their path and why they are recognized. Discovery and save errors appear in the window. A missing LM Studio connection retains models/recovery and is retried automatically.
 
 ## Manual actions
 
-**Pause / resume AI manually** holds the session open without a game. Release it to allow restoration after the delay. **Restore AI now** removes the delay; recognized games still prevent restoring. The tray menu exposes the same actions.
+**Pause / resume AI manually** holds the session open without a game. Release it to allow restoration after the delay. **Restore AI now** removes the delay; recognized games still prevent restoring. **Test round-trip** (dashboard and tray) runs the whole capture → unload → restore cycle on purpose and reports each step; it is a test, not a session, and needs no game running. The tray menu exposes the same actions.
 
 ## Background AI applications
 
