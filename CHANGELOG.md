@@ -10,6 +10,7 @@
 ### UX and native polish
 - Per-Monitor v2 DPI with `WM_DPICHANGED` relayout, so the dashboard stays crisp and unstretched across mixed-DPI multi-monitor setups.
 - Follow the Windows theme: DWM dark caption for the window and tray-anchored panel, and control colors taken from system brushes so light and dark both look native.
+- **Status dots in the games list** — a colored dot per row: green = running, amber = automatic pausing off, gray = idle — so the per-game state reads at a glance as well as in the row text.
 - Group-box sectioning (Games / Settings / Actions) and a tighter, single-source-of-truth layout grid.
 - State toasts plus an optional system sound on pause, restore, and failure.
 - Tray icon now reflects state — idle, paused, and attention.

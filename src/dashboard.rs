@@ -19,7 +19,13 @@ use windows_sys::Win32::{
     Foundation::*,
     Graphics::Gdi::*,
     System::LibraryLoader::GetModuleHandleW,
-    UI::{Controls::Dialogs::*, HiDpi::*, Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
+    UI::{
+        Controls::Dialogs::*,
+        Controls::{DRAWITEMSTRUCT, MEASUREITEMSTRUCT, ODS_SELECTED},
+        HiDpi::*,
+        Input::KeyboardAndMouse::*,
+        WindowsAndMessaging::*,
+    },
 };
 
 const STATUS: i32 = 100;
@@ -327,11 +333,10 @@ const LAYOUT: [Layout; 31] = [
         id: LIST,
         class: "LISTBOX",
         label: "",
-        style: WS_TABSTOP
-            | WS_VSCROLL
-            | WS_HSCROLL
-            | LBS_NOTIFY as u32
-            | LBS_NOINTEGRALHEIGHT as u32,
+        // P1-4: owner-drawn rows so each game gets a state dot. `LBS_NOINTEGRALHEIGHT`
+        // is dropped (owner-draw items have a fixed height we set in WM_MEASUREITEM,
+        // so the listbox no longer rounds the last partial row).
+        style: WS_TABSTOP | WS_VSCROLL | WS_HSCROLL | LBS_NOTIFY as u32 | LBS_OWNERDRAWFIXED as u32,
         x: 24,
         y: 270,
         w: 836,
@@ -577,6 +582,7 @@ struct Row {
     name: String,
     custom: bool,
     ignored: bool,
+    running: bool,
 }
 #[derive(Clone)]
 struct WindowState {
@@ -935,6 +941,7 @@ fn rows(shared: &Shared, page: Page, query: &str) -> Vec<Row> {
                     name: g.name.clone(),
                     custom: g.launcher == "Custom",
                     ignored: off,
+                    running,
                 }
             })
             .collect::<Vec<_>>(),
@@ -947,6 +954,7 @@ fn rows(shared: &Shared, page: Page, query: &str) -> Vec<Row> {
                 name: a.name.trim_end_matches(".exe").into(),
                 custom: false,
                 ignored: ignored(&a.path),
+                running: true,
             })
             .collect(),
         Page::Ignored => shared
@@ -965,6 +973,7 @@ fn rows(shared: &Shared, page: Page, query: &str) -> Vec<Row> {
                 name: String::new(),
                 custom: false,
                 ignored: true,
+                running: false,
             })
             .collect(),
     };
@@ -977,6 +986,109 @@ fn rows(shared: &Shared, page: Page, query: &str) -> Vec<Row> {
     // sort), so the same executable listed under two names collapses to one row.
     dedupe_by_canonical(&rows)
 }
+// ── P1-4: owner-drawn listbox rows with a per-game state dot ─────────────────
+/// Fixed semantic dot colors, as COLORREF (`0x00BBGGRR`). Deliberately *not*
+/// theme-derived: a status dot means the same thing in light and dark mode, so
+/// it is a constant — unlike the row background/text, which follow the theme.
+/// Green = running, amber = automatic pausing off (needs attention), gray = idle.
+fn dot_color(ignored: bool, running: bool) -> u32 {
+    if running {
+        0x0088_4422
+    } else if ignored {
+        0x00D6A42C
+    } else {
+        0x009E9E9E
+    }
+}
+
+/// Height of one owner-drawn listbox item in design units at the given DPI.
+/// ~1.5× the 16px text gives room for the dot and single-line text.
+fn row_height(dpi: i32) -> i32 {
+    scale(24, dpi)
+}
+
+/// `WM_MEASUREITEM` for the games listbox. `LBS_OWNERDRAWFIXED` asks the owner
+/// for each item's size before it draws; not answering leaves rows at zero height.
+unsafe fn measure_list_item(lparam: LPARAM, dpi: i32) {
+    unsafe {
+        let item = &mut *(lparam as *mut MEASUREITEMSTRUCT);
+        if item.CtlID == LIST as u32 {
+            item.itemHeight = row_height(dpi) as u32;
+        }
+    }
+}
+/// `WM_DRAWITEM` for the games listbox: fill the row, draw the state dot, then
+/// the item text. Background/text/selection come from system colors (correct in
+/// light and dark); the dot color is the pure `dot_color` mapping. If the index
+/// has no row (shouldn't happen) the row is just filled — never a crash.
+unsafe fn draw_list_item(lparam: LPARAM, index: usize, font: HFONT, rows: &[Row]) {
+    let (hdc, rc, selected);
+    unsafe {
+        let item = *(lparam as *const DRAWITEMSTRUCT);
+        hdc = item.hDC;
+        rc = item.rcItem;
+        selected = item.itemState & ODS_SELECTED != 0;
+    }
+    let bg = if selected {
+        unsafe { GetSysColor(COLOR_HIGHLIGHT) }
+    } else {
+        unsafe { GetSysColor(COLOR_WINDOW) }
+    };
+    let bg_brush = unsafe { CreateSolidBrush(bg) };
+    unsafe {
+        FillRect(hdc, &rc, bg_brush);
+        DeleteObject(bg_brush);
+    }
+
+    if let Some(row) = rows.get(index) {
+        unsafe {
+            SetTextColor(
+                hdc,
+                if selected {
+                    GetSysColor(COLOR_HIGHLIGHTTEXT)
+                } else {
+                    GetSysColor(COLOR_WINDOWTEXT)
+                },
+            );
+        }
+
+        // State dot: small filled circle near the left edge, vertically centered.
+        let mid_y = (rc.top + rc.bottom) / 2;
+        let r = 4i32;
+        let cx = rc.left + 12;
+        let dot_brush = unsafe { CreateSolidBrush(dot_color(row.ignored, row.running)) };
+        unsafe {
+            let old_brush = SelectObject(hdc, dot_brush);
+            SelectObject(hdc, GetStockObject(BLACK_PEN)); // thin outline so it reads on any bg
+            Ellipse(hdc, cx - r, mid_y - r, cx + r, mid_y + r);
+            SelectObject(hdc, old_brush);
+        }
+        unsafe {
+            DeleteObject(dot_brush);
+        }
+
+        // Item text, after the dot.
+        let mut text_rect = RECT {
+            left: cx + r + 8,
+            top: rc.top,
+            right: rc.right - 4,
+            bottom: rc.bottom,
+        };
+        let label = wide(&row.label);
+        unsafe {
+            let old_font = SelectObject(hdc, font);
+            DrawTextW(
+                hdc,
+                label.as_ptr(),
+                label.len() as i32,
+                &mut text_rect,
+                DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+            );
+            SelectObject(hdc, old_font);
+        }
+    }
+}
+
 pub fn refresh() {
     let Some(state) = snapshot() else { return };
     let Ok(shared) = state.shared.lock().map(|s| s.clone()) else {
@@ -1337,6 +1449,24 @@ unsafe extern "system" fn procedure(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
             SetTextColor(w as HDC, GetSysColor(text));
             GetSysColorBrush(idx) as LRESULT
         },
+        // P1-4: owner-drawn games listbox — supply the row height, then paint it.
+        WM_MEASUREITEM => unsafe {
+            let dpi = GetDpiForWindow(hwnd) as i32;
+            measure_list_item(l, dpi);
+            1 // TRUE: handled
+        },
+        WM_DRAWITEM => unsafe {
+            let item = *(l as *const DRAWITEMSTRUCT);
+            if item.CtlID == LIST as u32 {
+                let state = snapshot();
+                if let Some(st) = state {
+                    draw_list_item(l, item.itemID as usize, st.font, &st.rows);
+                }
+                1 // TRUE: handled
+            } else {
+                0
+            }
+        },
         WM_CLOSE => {
             unsafe {
                 DestroyWindow(hwnd);
@@ -1611,6 +1741,92 @@ mod tests {
         );
     }
 
+    // ── P1-4 acceptance tests ─────────────────────────────────────────────────
+    #[test]
+    fn dot_color_is_green_when_running() {
+        assert_eq!(super::dot_color(false, true), 0x0088_4422);
+        // running wins even if pausing is also off
+        assert_eq!(super::dot_color(true, true), 0x0088_4422);
+    }
+    #[test]
+    fn dot_color_is_amber_when_pausing_off_and_not_running() {
+        assert_eq!(super::dot_color(true, false), 0x00D6A42C);
+    }
+    #[test]
+    fn dot_color_is_gray_when_idle() {
+        assert_eq!(super::dot_color(false, false), 0x009E9E9E);
+    }
+    #[test]
+    fn dot_color_states_are_distinct_and_readable() {
+        let green = super::dot_color(false, true);
+        let amber = super::dot_color(true, false);
+        let gray = super::dot_color(false, false);
+        assert_ne!(green, amber);
+        assert_ne!(amber, gray);
+        assert_ne!(green, gray);
+        // Each is a solid, non-white, non-black COLORREF (0x00BBGGRR): white would
+        // vanish on light rows, black on dark rows.
+        for c in [green, amber, gray] {
+            assert_ne!(c & 0x00FF_FFFF, 0x00FFFFFF, "dot must not be white");
+            assert_ne!(c & 0x00FF_FFFF, 0x00000000, "dot must not be black");
+        }
+    }
+    #[test]
+    fn row_height_scales_with_dpi() {
+        assert_eq!(super::row_height(96), 24);
+        assert_eq!(super::row_height(144), 36);
+        assert_eq!(super::row_height(192), 48);
+    }
+    #[test]
+    fn draw_list_item_on_empty_rows_is_guarded_not_crashing() {
+        let mut item: super::DRAWITEMSTRUCT = unsafe { std::mem::zeroed() };
+        item.CtlID = super::LIST as u32;
+        item.itemID = 0;
+        // Null device context: the fill is a harmless no-op. The behavior under
+        // test is that an out-of-range item index is guarded by `rows.get(..)`
+        // rather than dereferenced — an empty/short list must not panic.
+        let lp = &mut item as *mut _ as isize;
+        unsafe {
+            super::draw_list_item(lp, 0, std::ptr::null_mut(), &[]);
+        }
+        assert_eq!(
+            item.CtlID,
+            super::LIST as u32,
+            "struct still well-formed after the call"
+        );
+    }
+    #[test]
+    fn game_rows_carry_the_running_flag_the_dot_is_drawn_from() {
+        let mut shared = Shared::default();
+        shared.games.push(crate::discovery::Game::new(
+            "Steam",
+            "1",
+            "Alpha",
+            r"D:\G\alpha",
+        ));
+        shared.games.push(crate::discovery::Game::new(
+            "Epic",
+            "2",
+            "Beta",
+            r"D:\G\beta",
+        ));
+        shared.active_games.push(crate::processes::ActiveGame {
+            pid: 7,
+            game: "Alpha".into(),
+            launcher: "Steam".into(),
+            path: r"D:\G\alpha".into(),
+        });
+        shared.config.ignored_games.push(r"d:\g\beta".into());
+        let rows = super::rows(&shared, super::Page::Games, "");
+        let alpha = rows.iter().find(|r| r.name == "Alpha").unwrap();
+        let beta = rows.iter().find(|r| r.name == "Beta").unwrap();
+        assert!(alpha.running, "a running game drives the green dot");
+        assert!(
+            beta.ignored && !beta.running,
+            "a pausing-off, idle game drives the amber dot"
+        );
+    }
+
     // ── P1-7 acceptance tests ─────────────────────────────────────────────────
     fn row(label: &str, path: &str, name: &str, custom: bool) -> super::Row {
         super::Row {
@@ -1619,6 +1835,7 @@ mod tests {
             name: name.into(),
             custom,
             ignored: false,
+            running: false,
         }
     }
 
