@@ -45,7 +45,7 @@ Quit retains pending recovery for the next active run. Finish restoration before
 
 On one Windows 11 / RTX 5090 PC with 16 logical CPUs, the native watcher used **15.7 MiB RAM** and **0.076% of total CPU capacity** during a 45-second Witcher 3 menu sample, including an inventory refresh. This measures the watcher, not FPS or all machines. See [Validation](docs/VALIDATION.md).
 
-This is a **0.1.0 preview**. Discovery is best effort. Protected processes, unconventional installations, and unusual helpers may require configuration. Only the Steam / Witcher 3 lifecycle has been tested live. Other adapters have been checked against local installed metadata, not complete gameplay sessions.
+This is a **0.1.1 preview**. Discovery is best effort. Protected processes, unconventional installations, and unusual helpers may require configuration. Only the Steam / Witcher 3 lifecycle has been tested live. Other adapters have been checked against local installed metadata, not complete gameplay sessions.
 
 Complete settings preservation currently requires LM Studio's internal WebSocket protocol alongside its CLI and native REST API. Protocol changes can require a GamePause update. Run `GamePauseCLI.exe --doctor` after upgrading LM Studio. If a recoverable snapshot cannot be captured, GamePause refuses to unload. It does not launch LM Studio or supervise clients that independently restart its server.
 

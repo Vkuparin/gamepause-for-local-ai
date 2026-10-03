@@ -59,3 +59,15 @@ Install Inno Setup 6 (tested with 6.7.3). Run:
 This builds both native executables, copies docs and dependency licenses, packages a portable ZIP, compiles the per-user installer, and writes `dist\SHA256SUMS.txt`. Release optimizations use size optimization, LTO, stripping, and one codegen unit. The Windows target config statically links the C runtime, avoiding a separate Visual C++ redistributable. Destination PCs need no language runtime. See the [Rust linkage reference](https://doc.rust-lang.org/reference/linkage.html#static-and-dynamic-c-runtimes).
 
 CI runs Windows tests, formatting, and Clippy. The tag-triggered release workflow builds distribution artifacts; publication is a separate action. Before publishing, inspect tracked files for private data, perform the live validation checklist, test install/uninstall/startup registration, verify checksums, and publish release notes with compatibility limits.
+
+## Interactive tray regression
+
+The default unit suite covers timer reentry while a menu session is alive. On an interactive Windows desktop, also run:
+
+```powershell
+cargo test --locked native_popup_survives_repeated_timer_reentry -- --ignored --test-threads=1 --nocapture
+```
+
+This test opens and dismisses three native menus belonging to its own observation-only test process. Each must survive at least two actual status timer callbacks. It does not load or unload models, change startup settings, or send actions to the running watcher. Keep the desktop unlocked and avoid interacting with the test menus while it runs. It is excluded from unattended CI because popup tracking requires an interactive desktop.
+
+Win32 popup tracking runs a nested message loop. Never hold a UI-state RefCell borrow or shared-state mutex across native calls that may dispatch messages synchronously.

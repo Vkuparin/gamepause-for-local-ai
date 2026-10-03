@@ -4,11 +4,17 @@ Results below describe the native Rust preview tested on Windows with LM Studio 
 
 ## Automated checks
 
-27 tests pass. Cargo formatting and Clippy checks pass with warnings treated as errors. Coverage includes validated configuration, atomic replacement, KeyValues/protobuf parser boundaries, executable path boundaries, nested installations, helper exclusions, startup command quoting, equivalent model identity representations, exact settings comparisons, and recovery behavior.
+28 tests pass (plus one interactive desktop test excluded from the default suite). Cargo formatting and Clippy checks pass with warnings treated as errors. Coverage includes validated configuration, atomic replacement, KeyValues/protobuf parser boundaries, executable path boundaries, nested installations, helper exclusions, startup command quoting, equivalent model identity representations, exact settings comparisons, and recovery behavior.
 
 Recovery tests cover multiple models, empty snapshots, observation, grace periods, switching games, disabled detection, manual holds, journal-before-unload ordering, partial unload, partial restore after restart, failed server shutdown, game restart before/between restoration, and unknown/corrupt journal stages.
 
 These tests do not prove compatibility with every launcher version or future LM Studio protocol.
+
+## Tray crash regression (0.1.1)
+
+The original 0.1.0 tray callback was reproduced in a private diagnostic build: leaving the popup open until the next timer tick caused a RefCell borrow panic and Windows exit code 0xc0000409, matching the reported crash. The fixed callback releases the UI-state borrow before entering Windows menu tracking and other native calls.
+
+The regular unit suite holds a menu session open while invoking the actual timer callback, verifies error-state updates, rejects nested menu openings, and verifies reopening after dismissal. A separate interactive Windows test opens three distinct native popup menus and leaves each open across at least two timer callbacks before dismissal. It uses observation-only test state and does not contact LM Studio. The earlier Steam acceptance test below covers the original model lifecycle; this patch targets tray reentrancy.
 
 ## Local discovery compatibility
 

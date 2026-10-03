@@ -24,6 +24,11 @@ const CALLBACK: u32 = WM_APP + 1;
 const STARTUP_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 static WINDOW: AtomicIsize = AtomicIsize::new(0);
 static FINISHED: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static MENU_TIMER_TICKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static MENU_OPENINGS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[derive(Clone)]
 struct UI {
     shared: SharedState,
     tx: Sender<Action>,
@@ -31,8 +36,40 @@ struct UI {
     icon: HICON,
     taskbar_message: u32,
     last_error: String,
+    menu_open: bool,
 }
 thread_local! {static UI_STATE:RefCell<Option<UI>>=const{RefCell::new(None)};}
+
+// Win32 menu tracking and shell calls can dispatch messages synchronously.
+// Never retain a RefCell borrow across those calls: nested timers need this state.
+fn ui_snapshot() -> Option<UI> {
+    UI_STATE.with(|state| state.borrow().clone())
+}
+struct MenuSession {
+    ui: UI,
+}
+impl Drop for MenuSession {
+    fn drop(&mut self) {
+        UI_STATE.with(|state| {
+            if let Some(ui) = state.borrow_mut().as_mut() {
+                ui.menu_open = false;
+            }
+        });
+    }
+}
+fn begin_menu() -> Option<MenuSession> {
+    UI_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let ui = state.as_mut()?;
+        if ui.menu_open {
+            return None;
+        }
+        ui.menu_open = true;
+        #[cfg(test)]
+        MENU_OPENINGS.fetch_add(1, Ordering::Relaxed);
+        Some(MenuSession { ui: ui.clone() })
+    })
+}
 pub fn request_exit() {
     FINISHED.store(true, Ordering::Relaxed);
     let window = WINDOW.load(Ordering::Relaxed);
@@ -245,50 +282,60 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, w: WPARAM, l: LP
                 }
                 return 0;
             }
-            UI_STATE.with(|state| {
-                if let Some(ui) = state.borrow_mut().as_mut() {
-                    unsafe {
-                        notification(hwnd, NIM_MODIFY, ui);
-                    }
-                    let text = ui
-                        .shared
-                        .lock()
-                        .map(|s| s.message.clone())
-                        .unwrap_or_default();
-                    if text.starts_with("Needs attention:") && text != ui.last_error {
-                        unsafe {
-                            let mut data: NOTIFYICONDATAW = std::mem::zeroed();
-                            data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-                            data.hWnd = hwnd;
-                            data.uID = 1;
-                            data.uFlags = NIF_INFO;
-                            data.dwInfoFlags = NIIF_WARNING;
-                            let title: Vec<_> =
-                                "GamePause needs attention".encode_utf16().collect();
-                            data.szInfoTitle[..title.len()].copy_from_slice(&title);
-                            let info: Vec<_> = text.encode_utf16().take(255).collect();
-                            data.szInfo[..info.len()].copy_from_slice(&info);
-                            Shell_NotifyIconW(NIM_MODIFY, &data);
+            if let Some(ui) = ui_snapshot() {
+                #[cfg(test)]
+                if ui.menu_open {
+                    MENU_TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
+                }
+                unsafe {
+                    notification(hwnd, NIM_MODIFY, &ui);
+                }
+                let text = ui
+                    .shared
+                    .lock()
+                    .map(|s| s.message.clone())
+                    .unwrap_or_default();
+                let pending = ui.shared.lock().map(|s| s.pending).unwrap_or(true);
+                let show_error = UI_STATE.with(|state| {
+                    let mut state = state.borrow_mut();
+                    let Some(current) = state.as_mut() else {
+                        return false;
+                    };
+                    if text.starts_with("Needs attention:") && text != current.last_error {
+                        current.last_error = text.clone();
+                        true
+                    } else {
+                        if !text.starts_with("Needs attention:") && !pending {
+                            current.last_error.clear();
                         }
-                        ui.last_error = text;
-                    } else if !text.starts_with("Needs attention:")
-                        && !ui.shared.lock().map(|s| s.pending).unwrap_or(true)
-                    {
-                        ui.last_error.clear();
+                        false
+                    }
+                });
+                if show_error {
+                    unsafe {
+                        let mut data: NOTIFYICONDATAW = std::mem::zeroed();
+                        data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+                        data.hWnd = hwnd;
+                        data.uID = 1;
+                        data.uFlags = NIF_INFO;
+                        data.dwInfoFlags = NIIF_WARNING;
+                        let title: Vec<_> = "GamePause needs attention".encode_utf16().collect();
+                        data.szInfoTitle[..title.len()].copy_from_slice(&title);
+                        let info: Vec<_> = text.encode_utf16().take(255).collect();
+                        data.szInfo[..info.len()].copy_from_slice(&info);
+                        Shell_NotifyIconW(NIM_MODIFY, &data);
                     }
                 }
-            });
+            }
             0
         }
         CALLBACK => {
-            if l as u32 == WM_RBUTTONUP || l as u32 == WM_LBUTTONUP {
-                UI_STATE.with(|state| {
-                    if let Some(ui) = state.borrow().as_ref() {
-                        unsafe {
-                            menu(hwnd, ui);
-                        }
-                    }
-                });
+            if (l as u32 == WM_RBUTTONUP || l as u32 == WM_LBUTTONUP)
+                && let Some(session) = begin_menu()
+            {
+                unsafe {
+                    menu(hwnd, &session.ui);
+                }
             }
             0
         }
@@ -304,14 +351,12 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, w: WPARAM, l: LP
             0
         }
         WM_DESTROY => {
-            UI_STATE.with(|state| {
-                if let Some(ui) = state.borrow().as_ref() {
-                    unsafe {
-                        notification(hwnd, NIM_DELETE, ui);
-                        DestroyIcon(ui.icon);
-                    }
+            if let Some(ui) = ui_snapshot() {
+                unsafe {
+                    notification(hwnd, NIM_DELETE, &ui);
+                    DestroyIcon(ui.icon);
                 }
-            });
+            }
             WINDOW.store(0, Ordering::Relaxed);
             unsafe {
                 PostQuitMessage(0);
@@ -326,13 +371,11 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, w: WPARAM, l: LP
                     .is_some_and(|ui| message == ui.taskbar_message)
             });
             if explorer {
-                UI_STATE.with(|state| {
-                    if let Some(ui) = state.borrow().as_ref() {
-                        unsafe {
-                            notification(hwnd, NIM_ADD, ui);
-                        }
+                if let Some(ui) = ui_snapshot() {
+                    unsafe {
+                        notification(hwnd, NIM_ADD, &ui);
                     }
-                });
+                }
                 0
             } else {
                 unsafe { DefWindowProcW(hwnd, message, w, l) }
@@ -352,6 +395,7 @@ pub fn run(shared: SharedState, tx: Sender<Action>, folder: PathBuf) -> Result<(
             icon: icon(),
             taskbar_message: RegisterWindowMessageW(taskbar.as_ptr()),
             last_error: String::new(),
+            menu_open: false,
         };
         UI_STATE.with(|state| *state.borrow_mut() = Some(ui));
         let wc = WNDCLASSW {
@@ -381,7 +425,9 @@ pub fn run(shared: SharedState, tx: Sender<Action>, folder: PathBuf) -> Result<(
             return Err(std::io::Error::last_os_error().into());
         }
         WINDOW.store(window as isize, Ordering::Relaxed);
-        UI_STATE.with(|state| notification(window, NIM_ADD, state.borrow().as_ref().unwrap()));
+        if let Some(ui) = ui_snapshot() {
+            notification(window, NIM_ADD, &ui);
+        }
         SetTimer(window, 1, 2000, None);
         let mut msg: MSG = std::mem::zeroed();
         loop {
@@ -405,6 +451,110 @@ fn bail_message() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn timer_can_reenter_while_menu_context_is_alive() {
+        use crate::app::Shared;
+        use std::sync::{Arc, Mutex, mpsc};
+        let (tx, _) = mpsc::channel();
+        let shared = Arc::new(Mutex::new(Shared {
+            message: "Needs attention: simulated failure".into(),
+            disabled: false,
+            manual_pause: false,
+            pending: true,
+            active_mode: false,
+        }));
+        UI_STATE.with(|state| {
+            *state.borrow_mut() = Some(UI {
+                shared: shared.clone(),
+                tx,
+                folder: PathBuf::new(),
+                icon: null_mut(),
+                taskbar_message: WM_APP + 9,
+                last_error: String::new(),
+                menu_open: false,
+            })
+        });
+        let session = begin_menu().expect("first menu opens");
+        assert!(
+            begin_menu().is_none(),
+            "nested clicks cannot start another menu"
+        );
+        // TrackPopupMenu invokes this callback while its caller is still active.
+        unsafe {
+            window_proc(null_mut(), WM_TIMER, 1, 0);
+        }
+        assert_eq!(
+            ui_snapshot().unwrap().last_error,
+            "Needs attention: simulated failure"
+        );
+        shared.lock().unwrap().message = "AI available".into();
+        shared.lock().unwrap().pending = false;
+        unsafe {
+            window_proc(null_mut(), WM_TIMER, 1, 0);
+        }
+        assert!(ui_snapshot().unwrap().last_error.is_empty());
+        drop(session);
+        assert!(begin_menu().is_some(), "menu opens again after dismissal");
+        UI_STATE.with(|state| state.borrow_mut().take());
+    }
+    #[test]
+    #[ignore = "requires an interactive Windows desktop; opens only the test application's menus"]
+    fn native_popup_survives_repeated_timer_reentry() {
+        use crate::app::Shared;
+        use std::sync::{Arc, Mutex, mpsc};
+        use std::time::{Duration, Instant};
+        FINISHED.store(false, Ordering::Relaxed);
+        MENU_TIMER_TICKS.store(0, Ordering::Relaxed);
+        MENU_OPENINGS.store(0, Ordering::Relaxed);
+        let shared = Arc::new(Mutex::new(Shared {
+            message: "Tray regression test (observation only)".into(),
+            disabled: false,
+            manual_pause: false,
+            pending: false,
+            active_mode: false,
+        }));
+        let (tx, _rx) = mpsc::channel();
+        let driver = std::thread::spawn(|| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while WINDOW.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let hwnd = WINDOW.load(Ordering::Relaxed) as HWND;
+            assert!(!hwnd.is_null(), "test window did not initialize");
+            let mut counts = Vec::new();
+            for _ in 0..3 {
+                let before = MENU_TIMER_TICKS.load(Ordering::Relaxed);
+                unsafe {
+                    PostMessageW(hwnd, CALLBACK, 0, WM_LBUTTONUP as LPARAM);
+                }
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while MENU_TIMER_TICKS.load(Ordering::Relaxed) < before + 2
+                    && Instant::now() < deadline
+                {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                counts.push(MENU_TIMER_TICKS.load(Ordering::Relaxed) - before);
+                unsafe {
+                    PostMessageW(hwnd, WM_CANCELMODE, 0, 0);
+                }
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            request_exit();
+            counts
+        });
+        run(shared, tx, PathBuf::from(".")).unwrap();
+        let counts = driver.join().unwrap();
+        assert_eq!(
+            MENU_OPENINGS.load(Ordering::Relaxed),
+            3,
+            "three distinct menus must open"
+        );
+        assert!(
+            counts.iter().all(|ticks| *ticks >= 2),
+            "each real popup must survive at least two timer callbacks: {counts:?}"
+        );
+        FINISHED.store(false, Ordering::Relaxed);
+    }
     #[test]
     fn startup_keeps_custom_folder() {
         let command = startup_command(
