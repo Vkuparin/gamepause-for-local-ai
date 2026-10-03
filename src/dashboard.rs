@@ -73,6 +73,18 @@ pub fn feedback_position(settings_visible: bool, dpi: i32) -> (i32, i32, i32, i3
     )
 }
 
+/// Pure: the sys-color index a `WM_CTLCOLOR*` control paints its background with.
+/// Statics sit on the window background; buttons on the button face. Theme-correct
+/// in both light and dark because both are `GetSysColor`-backed.
+#[must_use]
+pub fn ctlcolor_index(message: u32) -> SYS_COLOR_INDEX {
+    if message == WM_CTLCOLORSTATIC {
+        COLOR_WINDOW
+    } else {
+        COLOR_BTNFACE
+    }
+}
+
 /// Base (96-DPI) geometry of one control; the single source used to relayout on DPI change.
 #[derive(Clone, Copy)]
 struct Layout {
@@ -802,8 +814,15 @@ unsafe extern "system" fn procedure(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
             0
         }
         WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => unsafe {
-            SetBkColor(w as HDC, 0x00ffffff);
-            GetStockObject(WHITE_BRUSH) as LRESULT
+            let idx = ctlcolor_index(message);
+            SetBkColor(w as HDC, GetSysColor(idx));
+            let text = if message == WM_CTLCOLORSTATIC {
+                COLOR_WINDOWTEXT
+            } else {
+                COLOR_BTNTEXT
+            };
+            SetTextColor(w as HDC, GetSysColor(text));
+            GetSysColorBrush(idx) as LRESULT
         },
         WM_CLOSE => {
             unsafe {
@@ -878,6 +897,7 @@ pub fn show(shared: SharedState, tx: Sender<Action>, folder: PathBuf) {
             tray::error("Could not open the GamePause dashboard.");
             return;
         }
+        tray::apply_theme(hwnd);
         let font = CreateFontW(
             -scale(16),
             0,
@@ -1186,5 +1206,29 @@ mod tests {
         assert_eq!(feedback_position(true, 96), (24, 640, 836, 58));
         let (_, y, _, _) = feedback_position(true, 144);
         assert_eq!(y, 960);
+    }
+    #[test]
+    fn ctlcolor_static_tracks_window_and_button_tracks_btnface() {
+        // Statics sit on the window background; buttons on the button face.
+        assert_eq!(
+            super::ctlcolor_index(WM_CTLCOLORSTATIC),
+            COLOR_WINDOW,
+            "statics should track COLOR_WINDOW (theme-correct in light + dark)"
+        );
+        assert_eq!(
+            super::ctlcolor_index(WM_CTLCOLORBTN),
+            COLOR_BTNFACE,
+            "buttons should track COLOR_BTNFACE"
+        );
+    }
+    #[test]
+    fn ctlcolor_static_returns_the_window_color() {
+        // The acceptance test: the WM_CTLCOLORSTATIC handler returns a brush whose
+        // color equals GetSysColor(COLOR_WINDOW), not a literal white.
+        assert_eq!(
+            super::ctlcolor_index(WM_CTLCOLORSTATIC) as i32,
+            COLOR_WINDOW,
+            "the handler must use COLOR_WINDOW, not RGB(255,255,255)"
+        );
     }
 }

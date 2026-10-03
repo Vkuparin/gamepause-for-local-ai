@@ -14,7 +14,10 @@ use std::{
 };
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
-    Graphics::Gdi::{CreateBitmap, DeleteObject},
+    Graphics::{
+        Dwm::*,
+        Gdi::{CreateBitmap, DeleteObject},
+    },
     System::Diagnostics::Debug::MessageBeep,
     System::LibraryLoader::GetModuleHandleW,
     UI::{Shell::*, WindowsAndMessaging::*},
@@ -192,6 +195,37 @@ pub fn icon_tint(kind: StateKind) -> [u8; 3] {
         StateKind::Idle => [117, 94, 21],
         StateKind::Paused => [56, 132, 255],
         StateKind::Attention => [230, 62, 62],
+    }
+}
+/// Read the OS app-color preference. `true` = dark mode. The key/value is the
+/// documented `HKCU\...\Themes\Personalize\ColorsUseLightTheme` DWORD; a missing
+/// value or read error is treated as "light" (the Windows default) so the app
+/// never mis-colors a window it can't read.
+pub fn system_is_dark() -> bool {
+    RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+        .and_then(|k| k.get_value::<u32, _>("ColorsUseLightTheme"))
+        .map(|v| v == 0)
+        .unwrap_or(false)
+}
+/// Apply the OS theme to `hwnd`: a dark caption bar when the system is in dark
+/// mode, a light one otherwise. The DWM attribute is set per-window and is the
+/// only way to theme a non-DWM window's caption without a full visual-styles
+/// revamp. No-op when DWM is unavailable (older OS / accessibility).
+///
+/// # Safety
+/// `hwnd` must be a valid `HWND` obtained from a successful window-creation
+/// call. Passing `null()` is a documented no-op (DWM ignores it) but the
+/// caller is responsible for not leaking an unowned handle.
+pub unsafe fn apply_theme(hwnd: HWND) {
+    unsafe {
+        let use_dark: u32 = if system_is_dark() { 1 } else { 0 };
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
+            &use_dark as *const u32 as *const core::ffi::c_void,
+            size_of::<u32>() as u32,
+        );
     }
 }
 /// Draw the pause-bar glyph in `color` and return an HICON. The bars stay
@@ -600,6 +634,8 @@ pub fn run(shared: SharedState, tx: Sender<Action>, folder: PathBuf, show: bool)
         if window.is_null() {
             return Err(std::io::Error::last_os_error().into());
         }
+        // DWM attribute is per-window; safe to set immediately after creation.
+        apply_theme(window);
         WINDOW.store(window as isize, Ordering::Relaxed);
         if let Some(ui) = ui_snapshot() {
             notification(window, NIM_ADD, &ui);
@@ -677,6 +713,19 @@ mod tests {
         assert_eq!(beep_code(StateKind::Idle), MB_OK);
         assert_eq!(beep_code(StateKind::Paused), MB_OK);
         assert_eq!(beep_code(StateKind::Attention), MB_ICONASTERISK);
+    }
+    #[test]
+    fn system_is_dark_reads_a_consistent_binary_preference() {
+        // The registry is the single source of truth; two reads agree.
+        let a = super::system_is_dark();
+        let b = super::system_is_dark();
+        assert_eq!(a, b, "two consecutive reads of the OS theme must agree");
+    }
+    #[test]
+    fn apply_theme_does_not_panic_on_null_hwnd() {
+        // DwmSetWindowAttribute on a null HWND is a documented no-op; the
+        // production call site is the same code path, so it must not panic.
+        unsafe { super::apply_theme(std::ptr::null_mut()) };
     }
     #[test]
     fn icon_tint_maps_state_to_distinct_colors() {
