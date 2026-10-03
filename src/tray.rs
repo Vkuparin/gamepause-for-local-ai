@@ -172,18 +172,34 @@ pub fn set_startup(enabled: bool, folder: &Path) -> Result<()> {
     }
     Ok(())
 }
+/// Pure: classify a `ShellExecuteW` return value (an `HINSTANCE`,
+/// `*mut c_void`). Per the Win32 docs a successful call returns a handle whose
+/// value is greater than 32; `0` and the range `1..=32` are documented failure
+/// codes (S_OK, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ...). This is the
+/// testable core of "open_path surfaces a visible error on failure" (P1-7).
+#[must_use]
+pub fn shell_execute_failed(return_value: *mut core::ffi::c_void) -> bool {
+    return_value as isize <= 32
+}
+
+/// Open a folder in the default file manager. A `ShellExecuteW` failure is
+/// surfaced as a visible error instead of being silently swallowed (P1-7).
 pub fn open_path(path: &Path) {
     let operation = wide("open");
-    let path = wide(&path.to_string_lossy());
-    unsafe {
+    let display = path.to_string_lossy();
+    let path_w = wide(&display);
+    let result = unsafe {
         ShellExecuteW(
             null_mut(),
             operation.as_ptr(),
-            path.as_ptr(),
+            path_w.as_ptr(),
             null(),
             null(),
             SW_SHOWNORMAL,
-        );
+        )
+    };
+    if shell_execute_failed(result) {
+        error(&format!("Could not open this folder: {display}"));
     }
 }
 /// The tray glyph's solid fill color per state. Pure + unit-testable: this is
@@ -431,9 +447,23 @@ unsafe fn menu(hwnd: HWND, ui: &UI) {
             null(),
         );
         DestroyMenu(menu);
+        // P1-7: gate "Restore AI now" on discovery readiness (mirror the
+        // dashboard) and surface feedback instead of the worker no-opping
+        // silently. The worker keeps its own gate as the safety net.
         let action = match id {
             1 => Some(Action::Pause),
-            2 => Some(Action::Restore),
+            2 => {
+                let (enabled, reason) = {
+                    let s = ui.shared.lock().unwrap();
+                    crate::dashboard::restore_gate(s.discovery_ready, s.active_mode, s.pending)
+                };
+                if enabled {
+                    Some(Action::Restore)
+                } else {
+                    error(reason);
+                    None
+                }
+            }
             3 => Some(Action::Disable),
             4 => Some(Action::Refresh),
             8 => Some(Action::Quit),
@@ -877,6 +907,38 @@ mod tests {
         assert_eq!(
             command,
             r#""C:\Program Files\GamePause\GamePause.exe" --background --data-dir "D:\AI Data\GamePause""#
+        );
+    }
+
+    #[test]
+    fn open_path_failure_is_classified_as_a_visible_error() {
+        // ShellExecuteW returns an HINSTANCE > 32 on success; 0 and 1..=32 are
+        // documented failure codes. The classifier is the testable core of
+        // "open_path surfaces a visible error on failure" (P1-7).
+        let v = |n: isize| n as *mut core::ffi::c_void;
+        assert!(
+            super::shell_execute_failed(v(0)),
+            "0 is the generic failure code"
+        );
+        assert!(
+            super::shell_execute_failed(v(2)),
+            "ERROR_FILE_NOT_FOUND (2)"
+        );
+        assert!(
+            super::shell_execute_failed(v(3)),
+            "ERROR_PATH_NOT_FOUND (3)"
+        );
+        assert!(
+            super::shell_execute_failed(v(32)),
+            "32 is still in the failure range"
+        );
+        assert!(
+            !super::shell_execute_failed(v(33)),
+            "33 is the first success value"
+        );
+        assert!(
+            !super::shell_execute_failed(v(0x0040_0000)),
+            "a real HINSTANCE (a pointer-sized handle) is a success"
         );
     }
 }

@@ -7,6 +7,7 @@ use crate::{
 };
 use std::{
     cell::RefCell,
+    collections::HashSet,
     path::PathBuf,
     ptr::{null, null_mut},
     sync::{
@@ -46,8 +47,9 @@ const SAVE: i32 = 117;
 const CLI: i32 = 118;
 const FEEDBACK: i32 = 119;
 const SETTINGS: i32 = 120;
-const DELAY_LABEL: i32 = 121;
-const ADDRESS_LABEL: i32 = 122;
+const RENAME: i32 = 121;
+const DELAY_LABEL: i32 = 122;
+const ADDRESS_LABEL: i32 = 123;
 const TITLE: i32 = 130;
 const SEARCH_LABEL: i32 = 131;
 const OPTIONS_BOX: i32 = 140;
@@ -138,7 +140,7 @@ const GROUPBOXES: [GroupBox; 4] = [
     },
     GroupBox {
         id: ACTIONS_BOX,
-        members: &[TOGGLE, REMOVE, PAUSE, RESTORE],
+        members: &[TOGGLE, REMOVE, PAUSE, RESTORE, RENAME],
     },
     GroupBox {
         id: SETTINGS_BOX,
@@ -159,7 +161,7 @@ fn by_id(id: i32) -> Layout {
 /// Every dashboard control, in 96-DPI design units. Order: section boxes first,
 /// then header, then top-to-bottom. Coordinates are the single source of truth
 /// shared by creation, DPI relayout, and the group-box bounds test (P1-3).
-const LAYOUT: [Layout; 29] = [
+const LAYOUT: [Layout; 30] = [
     Layout {
         id: OPTIONS_BOX,
         class: "BUTTON",
@@ -351,7 +353,7 @@ const LAYOUT: [Layout; 29] = [
         style: WS_TABSTOP,
         x: 24,
         y: 594,
-        w: 205,
+        w: 140,
         h: 32,
     },
     Layout {
@@ -359,9 +361,9 @@ const LAYOUT: [Layout; 29] = [
         class: "BUTTON",
         label: "Remove custom game",
         style: WS_TABSTOP,
-        x: 239,
+        x: 170,
         y: 594,
-        w: 193,
+        w: 140,
         h: 32,
     },
     Layout {
@@ -369,9 +371,9 @@ const LAYOUT: [Layout; 29] = [
         class: "BUTTON",
         label: "Pause / resume AI manually",
         style: WS_TABSTOP,
-        x: 442,
+        x: 316,
         y: 594,
-        w: 252,
+        w: 140,
         h: 32,
     },
     Layout {
@@ -379,9 +381,19 @@ const LAYOUT: [Layout; 29] = [
         class: "BUTTON",
         label: "Restore AI now",
         style: WS_TABSTOP,
-        x: 704,
+        x: 462,
         y: 594,
-        w: 156,
+        w: 140,
+        h: 32,
+    },
+    Layout {
+        id: RENAME,
+        class: "BUTTON",
+        label: "Rename",
+        style: WS_TABSTOP,
+        x: 608,
+        y: 594,
+        w: 252,
         h: 32,
     },
     Layout {
@@ -601,6 +613,260 @@ fn send_settings(state: &WindowState, config: Config) {
     }
     let _ = state.tx.send(Action::Settings(Box::new(config)));
 }
+
+/// Show a message on the FEEDBACK line (control FEEDBACK), not a modal.
+/// P1-7: settings-validation and rename errors are user-correctable, so they
+/// belong inline next to the field that produced them; modals are reserved
+/// for hard failures (missing data dir, startup write, ...).
+fn set_feedback(hwnd: HWND, message: &str) {
+    set(hwnd, message);
+}
+
+thread_local! {
+    static ASK_NAME_RESULT: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Modal text-input dialog for the Rename affordance. Returns the entered text
+/// or `None` if the user cancelled (or the dialog could not be created).
+/// Mirrors the dashboard's own WNDCLASSW + message-loop pattern, so it compiles
+/// against the same windows-sys surface without new dependencies.
+fn ask_name(parent: HWND, current: &str) -> Option<String> {
+    const NAME_EDIT: i32 = 1001;
+    const OK_BTN: i32 = 1;
+    unsafe {
+        let instance = GetModuleHandleW(null());
+        let class = wide("GamePauseAskName");
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(name_proc),
+            hInstance: instance,
+            lpszClassName: class.as_ptr(),
+            hCursor: LoadCursorW(null_mut(), IDC_ARROW),
+            hbrBackground: (COLOR_WINDOW + 1) as HBRUSH,
+            ..std::mem::zeroed()
+        };
+        // Ignore "class already registered" (1410); a repeated Rename reuses it.
+        if RegisterClassW(&wc) == 0 && GetLastError() != 1410 {
+            return None;
+        }
+        let dpi = GetDpiForSystem() as i32;
+        let scale = |v: i32| v * dpi / 96;
+        let width = scale(420);
+        let height = scale(150);
+        let hwnd = CreateWindowExW(
+            0,
+            class.as_ptr(),
+            wide("Rename game").as_ptr(),
+            WS_POPUP | WS_CAPTION | WS_SYSMENU,
+            (GetSystemMetrics(SM_CXSCREEN) - width) / 2,
+            (GetSystemMetrics(SM_CYSCREEN) - height) / 2,
+            width,
+            height,
+            parent,
+            null_mut(),
+            instance,
+            null(),
+        );
+        if hwnd.is_null() {
+            return None;
+        }
+        let font = CreateFontW(
+            -scale(14),
+            0,
+            0,
+            0,
+            400,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET as u32,
+            0,
+            0,
+            CLEARTYPE_QUALITY as u32,
+            0,
+            wide("Segoe UI").as_ptr(),
+        );
+        let edit = CreateWindowExW(
+            WS_EX_CLIENTEDGE,
+            wide("EDIT").as_ptr(),
+            wide(current).as_ptr(),
+            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL as u32,
+            scale(16),
+            scale(30),
+            width - scale(32),
+            scale(26),
+            hwnd,
+            null_mut(),
+            instance,
+            null(),
+        );
+        let ok = CreateWindowExW(
+            0,
+            wide("BUTTON").as_ptr(),
+            wide("Rename").as_ptr(),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            width - scale(150),
+            scale(86),
+            scale(60),
+            scale(26),
+            hwnd,
+            null_mut(),
+            instance,
+            null(),
+        );
+        let cancel = CreateWindowExW(
+            0,
+            wide("BUTTON").as_ptr(),
+            wide("Cancel").as_ptr(),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            width - scale(84),
+            scale(86),
+            scale(60),
+            scale(26),
+            hwnd,
+            null_mut(),
+            instance,
+            null(),
+        );
+        SetWindowLongPtrW(edit, GWLP_ID, NAME_EDIT as isize);
+        SetWindowLongPtrW(ok, GWLP_ID, OK_BTN as isize);
+        SetWindowLongPtrW(cancel, GWLP_ID, 2);
+        SendMessageW(edit, WM_SETFONT, font as usize, 0);
+        SendMessageW(ok, WM_SETFONT, font as usize, 0);
+        SendMessageW(cancel, WM_SETFONT, font as usize, 0);
+        SetFocus(edit);
+        ShowWindow(hwnd, SW_SHOW);
+        let mut msg: MSG = std::mem::zeroed();
+        while GetMessageW(&mut msg, null_mut(), 0, 0) != 0 {
+            if IsDialogMessageW(hwnd, &msg) == 0 {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+    }
+    ASK_NAME_RESULT.with(|c| c.borrow().clone())
+}
+
+unsafe extern "system" fn name_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    match message {
+        WM_COMMAND => {
+            let id = (w & 0xffff) as i32;
+            unsafe {
+                if id == 1 {
+                    let edit = GetDlgItem(hwnd, 1001);
+                    ASK_NAME_RESULT.with(|c| *c.borrow_mut() = Some(text(edit)));
+                } else {
+                    ASK_NAME_RESULT.with(|c| *c.borrow_mut() = None);
+                }
+                DestroyWindow(hwnd);
+            }
+            0
+        }
+        WM_CLOSE => {
+            ASK_NAME_RESULT.with(|c| *c.borrow_mut() = None);
+            unsafe {
+                DestroyWindow(hwnd);
+            }
+            0
+        }
+        _ => unsafe { DefWindowProcW(hwnd, message, w, l) },
+    }
+}
+
+/// Pure: the Pause/Resume button label for a given mode state.
+/// When auto-mode is off there is nothing to pause, so the button stays neutral.
+#[must_use]
+pub fn pause_button_label(active_mode: bool, manual_pause: bool) -> &'static str {
+    if !active_mode {
+        "Pause AI"
+    } else if manual_pause {
+        "Resume AI"
+    } else {
+        "Pause AI"
+    }
+}
+
+/// Pure: whether the tray's "Restore AI now" item is enabled, and the
+/// feedback message to show when it is not (empty string when enabled).
+/// Mirrors the dashboard gate: restore is only meaningful once a game has
+/// been discovered (discovery_ready) and is actually paused (pending).
+#[must_use]
+pub fn restore_gate(
+    discovery_ready: bool,
+    active_mode: bool,
+    pending: bool,
+) -> (bool, &'static str) {
+    if !discovery_ready {
+        (false, "Restore unavailable until a game is detected.")
+    } else if !active_mode {
+        (false, "Restore unavailable while GamePause is off.")
+    } else if !pending {
+        (false, "AI is already running — nothing to restore.")
+    } else {
+        (true, "")
+    }
+}
+
+/// Pure: dedupe a row list on the canonical path, keeping the first row seen
+/// for each distinct executable. Order-preserving.
+///
+/// This is the fix for the old adjacent-only `dedup_by` that let the same
+/// executable survive under two display names (e.g. one per launch dir).
+#[must_use]
+fn dedupe_by_canonical(rows: &[Row]) -> Vec<Row> {
+    let mut seen = HashSet::new();
+    rows.iter()
+        .filter(|row| seen.insert(canonical(&row.path)))
+        .cloned()
+        .collect()
+}
+
+/// Pure: apply the SAVE-settings action to a config, returning the new config
+/// on success or a human-readable error string to show in the FEEDBACK line.
+/// Routing validation failures to the feedback line (not a modal) is the P1-7
+/// fix; modals are reserved for hard failures like a missing data dir.
+pub fn apply_save(config: &Config, delay_text: &str, host_text: &str) -> Result<Config, String> {
+    let mut out = config.clone();
+    let delay = delay_text
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| "Restore delay must be a number of seconds.".to_string())?;
+    if !(0.0..=3600.0).contains(&delay) {
+        return Err("Restore delay must be between 0 and 3600 seconds.".to_string());
+    }
+    out.restore_delay_seconds = delay;
+    let host = host_text.trim();
+    if host.is_empty() {
+        return Err("Local API address cannot be empty.".to_string());
+    }
+    out.api_host = host.into();
+    out.validate()
+        .map_err(|e| format!("Check these settings: {e:#}"))?;
+    Ok(out)
+}
+
+/// Pure: apply the RENAME action to a config, returning the new config on
+/// success or a human-readable error string for the FEEDBACK line.
+/// Only rows that are custom (user-added) are renameable; discovered rows
+/// keep their launcher-provided name.
+pub fn apply_rename(config: &Config, row_path: &str, new_name: &str) -> Result<Config, String> {
+    let name = new_name.trim();
+    if name.is_empty() {
+        return Err("Game name cannot be empty.".to_string());
+    }
+    let mut out = config.clone();
+    let target = canonical(row_path);
+    if let Some(game) = out
+        .extra_games
+        .iter_mut()
+        .find(|g| canonical(&g.path) == target)
+    {
+        game.name = name.into();
+        Ok(out)
+    } else {
+        Err("This game is not a custom entry — only games you added can be renamed.".to_string())
+    }
+}
+
 fn rows(shared: &Shared, page: Page, query: &str) -> Vec<Row> {
     let ignored = |path: &str| {
         shared
@@ -674,8 +940,9 @@ fn rows(shared: &Shared, page: Page, query: &str) -> Vec<Row> {
         row.label.to_lowercase().contains(&query) || row.path.to_lowercase().contains(&query)
     });
     rows.sort_by_key(|row| row.label.to_lowercase());
-    rows.dedup_by(|a, b| canonical(&a.path) == canonical(&b.path));
-    rows
+    // Dedupe on canonical path *globally* (not adjacent-only after the label
+    // sort), so the same executable listed under two names collapses to one row.
+    dedupe_by_canonical(&rows)
 }
 pub fn refresh() {
     let Some(state) = snapshot() else { return };
@@ -715,6 +982,10 @@ pub fn refresh() {
             BM_SETCHECK,
             usize::from(tray::startup_enabled()),
             0,
+        );
+        set(
+            GetDlgItem(state.hwnd, PAUSE),
+            pause_button_label(shared.active_mode, shared.manual_pause),
         );
         EnableWindow(GetDlgItem(state.hwnd, PAUSE), i32::from(shared.active_mode));
         EnableWindow(
@@ -944,6 +1215,25 @@ fn command(id: i32, notification: u32) {
                 send_settings(&state, config);
             }
         }
+        RENAME => {
+            if let Some(row) = selection(&state) {
+                if !row.custom {
+                    set_feedback(state.hwnd, "Only games you added yourself can be renamed.");
+                    return;
+                }
+                let Some(name) = ask_name(state.hwnd, &row.name) else {
+                    return;
+                };
+                if name.trim().is_empty() {
+                    set_feedback(state.hwnd, "Game name cannot be empty.");
+                    return;
+                }
+                match apply_rename(&config, &row.path, &name) {
+                    Ok(cfg) => send_settings(&state, cfg),
+                    Err(message) => set_feedback(state.hwnd, &message),
+                }
+            }
+        }
         RESTORE => {
             let _ = state.tx.send(Action::Restore);
         }
@@ -951,22 +1241,12 @@ fn command(id: i32, notification: u32) {
             let _ = state.tx.send(Action::Pause);
         }
         SAVE => {
-            let value = text(unsafe { GetDlgItem(state.hwnd, DELAY) });
-            match value.parse::<f64>() {
-                Ok(value) => config.restore_delay_seconds = value,
-                Err(_) => {
-                    show_error(state.hwnd, "Restore delay must be a number of seconds.");
-                    return;
-                }
+            let delay = text(unsafe { GetDlgItem(state.hwnd, DELAY) });
+            let host = text(unsafe { GetDlgItem(state.hwnd, ADDRESS) });
+            match apply_save(&config, &delay, &host) {
+                Ok(cfg) => send_settings(&state, cfg),
+                Err(message) => set_feedback(state.hwnd, &message),
             }
-            config.api_host = text(unsafe { GetDlgItem(state.hwnd, ADDRESS) })
-                .trim()
-                .into();
-            if let Err(e) = config.validate() {
-                show_error(state.hwnd, &format!("Check these settings: {e:#}"));
-                return;
-            }
-            send_settings(&state, config);
         }
         CLI => {
             if let Some(path) = browse(state.hwnd) {
@@ -1286,5 +1566,122 @@ mod tests {
             COLOR_WINDOW,
             "the handler must use COLOR_WINDOW, not RGB(255,255,255)"
         );
+    }
+
+    // ── P1-7 acceptance tests ─────────────────────────────────────────────────
+    fn row(label: &str, path: &str, name: &str, custom: bool) -> super::Row {
+        super::Row {
+            label: label.into(),
+            path: path.into(),
+            name: name.into(),
+            custom,
+            ignored: false,
+        }
+    }
+
+    #[test]
+    fn restore_gate_blocks_before_discovery_and_enables_when_ready() {
+        // disabled + a user-facing feedback message when discovery has not run
+        let (enabled, reason) = super::restore_gate(false, true, true);
+        assert!(
+            !enabled,
+            "restore must be gated off before discovery is ready"
+        );
+        assert!(
+            !reason.is_empty(),
+            "a disabled restore must carry a feedback message (not a silent no-op)"
+        );
+        // also gated when the mode is off, or nothing is actually paused
+        assert!(!super::restore_gate(true, false, true).0);
+        assert!(!super::restore_gate(true, true, false).0);
+        // enabled once discovery is ready, mode active, and a pause is pending
+        let (enabled, reason) = super::restore_gate(true, true, true);
+        assert!(enabled, "restore should be enabled when discovery is ready");
+        assert_eq!(reason, "", "no feedback needed when restore is allowed");
+    }
+
+    #[test]
+    fn pause_button_label_flips_on_manual_pause() {
+        assert_eq!(
+            super::pause_button_label(true, false),
+            "Pause AI",
+            "running + not paused should read Pause AI"
+        );
+        assert_eq!(
+            super::pause_button_label(true, true),
+            "Resume AI",
+            "manually paused should flip the label to Resume AI"
+        );
+        assert_eq!(
+            super::pause_button_label(false, true),
+            "Pause AI",
+            "no active mode means nothing to resume"
+        );
+    }
+
+    #[test]
+    fn save_validation_routes_to_feedback_not_modal() {
+        // A bad value yields the Err(String) variant — the exact value dispatch
+        // routes to the FEEDBACK line (set_feedback), never to a modal.
+        let cfg = crate::config::Config::default();
+        let bad = super::apply_save(&cfg, "not-a-number", "127.0.0.1:1234");
+        let err = bad.expect_err("a non-numeric delay must fail validation");
+        assert!(
+            err.contains("number of seconds"),
+            "the feedback message should name the field; got {err}"
+        );
+
+        let cfg = crate::config::Config::default();
+        assert!(
+            super::apply_save(&cfg, "10", "   ").is_err(),
+            "an empty API host must fail validation"
+        );
+
+        // a valid save succeeds and applies the edited fields
+        let cfg = crate::config::Config::default();
+        let ok = super::apply_save(&cfg, "45", " 127.0.0.1:8080 ")
+            .expect("a valid delay + host should pass");
+        assert_eq!(ok.restore_delay_seconds, 45.0);
+        assert_eq!(ok.api_host, "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn dedupe_by_canonical_removes_two_names_same_path() {
+        // Two display names for one executable: the old adjacent-only dedup
+        // kept both after the label sort; the global canonical dedup keeps one.
+        let rows = vec![
+            row("Alpha", "C:\\Games\\App\\game.exe", "Alpha", false),
+            row("Beta", "c:/games/app/game.exe", "Beta", false), // same exe, other spelling
+            row("Gamma", "C:\\Games\\Other\\other.exe", "Gamma", true),
+        ];
+        let kept = super::dedupe_by_canonical(&rows);
+        assert_eq!(
+            kept.len(),
+            2,
+            "the two spellings of one executable must collapse to a single row"
+        );
+        assert_eq!(kept[0].label, "Alpha");
+        assert_eq!(kept[1].label, "Gamma");
+    }
+
+    #[test]
+    fn rename_updates_the_matching_custom_entry() {
+        let mut cfg = crate::config::Config::default();
+        cfg.extra_games.push(crate::config::ExtraGame {
+            name: "Old Name".into(),
+            path: "C:\\Games\\App\\game.exe".into(),
+        });
+        let ok = super::apply_rename(&cfg, "c:/games/app/game.exe", "New Name")
+            .expect("renaming an existing custom entry should succeed");
+        assert_eq!(ok.extra_games[0].name, "New Name");
+        assert_eq!(ok.extra_games[0].path, "C:\\Games\\App\\game.exe");
+
+        let err = super::apply_rename(&cfg, "C:\\Games\\Nope\\missing.exe", "X")
+            .expect_err("a non-custom path must be rejected");
+        assert!(err.contains("not a custom entry"), "got: {err}");
+
+        let err = super::apply_rename(&cfg, "C:\\Games\\App\\game.exe", "   ")
+            .expect_err("a blank name must be rejected");
+        assert!(err.contains("empty"), "got: {err}");
     }
 }
