@@ -5,7 +5,7 @@ Push-Location $taskRoot
 try {
     cargo build --locked --release
     if ($LASTEXITCODE -ne 0) { throw 'Rust release build failed' }
-    $taskMetadata = cargo metadata --locked --offline --format-version 1 | ConvertFrom-Json
+    $taskMetadata = cargo metadata --locked --format-version 1 | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0) { throw 'Dependency metadata failed' }
     $taskVersion = ($taskMetadata.packages | Where-Object name -eq 'gamepause-lmstudio').version
     $taskBundle = Join-Path $taskRoot 'dist\GamePause'
