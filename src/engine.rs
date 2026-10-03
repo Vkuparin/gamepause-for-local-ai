@@ -15,6 +15,11 @@ pub struct Engine<B: Backend> {
     pub disabled: bool,
     pub manual_pause: bool,
     pub remembered_games: Vec<crate::discovery::Game>,
+    /// Set by the two restore call sites just before `attempt`; consumed by
+    /// `attempt` to emit the explicit "Restore failed" message (P0-4). Kept
+    /// separate from `last_error` so a *pause* failure is never mislabelled as
+    /// a restore failure.
+    pub restore_failed: bool,
     quiet_since: Option<f64>,
     retry_at: f64,
 }
@@ -64,6 +69,7 @@ impl<B: Backend> Engine<B> {
             last_error: String::new(),
             disabled: false,
             manual_pause: false,
+            restore_failed: false,
             quiet_since: None,
             retry_at: 0.,
         })
@@ -134,6 +140,7 @@ impl<B: Backend> Engine<B> {
                 self.message = format!("Restoring AI in {}s", remaining.ceil() as u64);
             } else if now >= self.retry_at {
                 let result = self.restore(cancelled);
+                self.restore_failed = true;
                 self.attempt(result, now);
             }
         } else {
@@ -143,6 +150,10 @@ impl<B: Backend> Engine<B> {
         }
     }
     pub fn attempt(&mut self, result: Result<()>, now: f64) {
+        // Consume the flag so it reflects "the last operation was a restore
+        // attempt" and never lingers into a later pause.
+        let was_restore = self.restore_failed;
+        self.restore_failed = false;
         match result {
             Ok(()) => {
                 self.last_error.clear();
@@ -150,7 +161,11 @@ impl<B: Backend> Engine<B> {
             }
             Err(e) => {
                 self.last_error = format!("{e:#}");
-                self.message = format!("Needs attention: {}", self.last_error);
+                self.message = if was_restore {
+                    format!("Restore failed — AI not restored: {}", self.last_error)
+                } else {
+                    format!("Needs attention: {}", self.last_error)
+                };
                 self.retry_at = now + self.config.retry_seconds;
             }
         }
@@ -555,6 +570,67 @@ mod tests {
         )
         .unwrap();
         assert!(Engine::new(e.config, e.backend, e.path).is_err());
+    }
+    #[test]
+    fn failed_restore_keeps_journal_and_surfaces_explicit_status() {
+        // P0-4: a failed Engine::restore must (a) leave the pending journal
+        // intact and resumable, and (b) surface the explicit
+        // "Restore failed — AI not restored" status rather than a generic
+        // error line. A *pause* failure must NOT be mislabelled as a restore
+        // failure.
+        let mut b = Fake::new();
+        b.fail_restore = Some("embed".into());
+        let mut e = engine(b);
+        e.pause().unwrap();
+        // First restore attempt fails on "embed"; the journal must survive.
+        let result = e.restore(&mut || false);
+        assert!(result.is_err());
+        e.restore_failed = true;
+        e.attempt(result, 100.);
+        // (b) explicit, non-surprising status.
+        assert!(
+            e.message.starts_with("Restore failed — AI not restored"),
+            "expected the explicit restore-failure status, got {:?}",
+            e.message
+        );
+        // (a) journal retained on disk and still a valid, resumable recovery.
+        let bytes = fs::read(&e.path).unwrap();
+        assert!(!bytes.is_empty());
+        assert!(
+            e.state.is_some(),
+            "state must be retained after a failed restore"
+        );
+        let mut resumed = Engine::new(e.config.clone(), e.backend.clone(), e.path.clone()).unwrap();
+        assert_eq!(resumed.state.as_ref().unwrap().models.len(), 2);
+        // Recovery resumes where it stopped and completes cleanly.
+        resumed.backend.fail_restore = None;
+        resumed.restore(&mut || false).unwrap();
+        assert_eq!(resumed.backend.current.len(), 2);
+        assert!(resumed.state.is_none());
+    }
+    #[test]
+    fn pause_failure_is_not_labeled_a_restore_failure() {
+        let mut b = Fake::new();
+        b.fail_unload = Some("embed".into());
+        let mut e = engine(b);
+        // step() internally drives pause(); the failure must be reported as
+        // "Needs attention", never "Restore failed".
+        e.step(true, 0., &mut || false);
+        assert!(
+            !e.message.starts_with("Restore failed"),
+            "a pause failure must not be mislabelled as a restore failure, got {:?}",
+            e.message
+        );
+        assert!(
+            e.message.starts_with("Needs attention"),
+            "got {:?}",
+            e.message
+        );
+        // A later successful operation must not leave the flag set either.
+        assert!(
+            !e.restore_failed,
+            "restore_failed must not linger after a pause failure"
+        );
     }
     #[test]
     fn invalid_stage_retains_journal_instead_of_clearing_recovery() {

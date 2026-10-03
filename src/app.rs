@@ -102,6 +102,7 @@ pub fn main(console: bool) -> Result<()> {
     let folder = args.folder.unwrap_or_else(config::data_directory);
     fs::create_dir_all(&folder)?;
     let folder = fs::canonicalize(folder)?;
+    install_panic_hook(&folder);
     let _lock = match config::lock(&folder) {
         Ok(lock) => lock,
         Err(e) => {
@@ -306,6 +307,7 @@ fn apply_action(
             let guard_games = recovery_games(engine, games);
             let result =
                 engine.restore(&mut || guard.scan(&guard_games).map_or(true, |a| !a.is_empty()));
+            engine.restore_failed = true;
             engine.attempt(result, now);
         }
         Action::Refresh => return Ok(true),
@@ -566,6 +568,30 @@ fn run(
     let _ = inventory_worker.join();
     Ok(())
 }
+/// Install a global panic hook (P0-3): any panic on any thread is appended to
+/// the app log with its message and location, then the previous hook is run so
+/// the default behavior (and any debugger output) is preserved. Best-effort:
+/// the log write itself can never panic.
+pub fn install_panic_hook(folder: &std::path::Path) {
+    // The hook is 'static, so it must own the path rather than borrow it.
+    let owned = folder.to_path_buf();
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown location>".into());
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown panic payload".into()
+        };
+        log(&owned, &format!("PANIC in {}: {payload}", location));
+        previous(info);
+    }));
+}
 pub fn log(folder: &std::path::Path, message: &str) {
     let file = folder.join("gamepause.log");
     if fs::metadata(&file).is_ok_and(|m| m.len() > 1_000_000) {
@@ -755,5 +781,34 @@ mod tests {
                 .contains("Could not save")
         );
         fs::remove_file(folder.join("config.json")).unwrap();
+    }
+    #[test]
+    fn panic_hook_logs_to_gamepause_log() {
+        // P0-3: a real panic must be routed to gamepause.log with its message
+        // and location. The hook is process-global, so we capture the current
+        // hook, install ours, trigger a contained panic, assert the log, and
+        // restore the original hook.
+        let folder = std::env::temp_dir().join(format!("gamepause-hook-{}", std::process::id()));
+        let _ = fs::create_dir_all(&folder);
+        let previous = std::panic::take_hook();
+        install_panic_hook(&folder);
+        let caught = std::panic::catch_unwind(|| panic!("hook-test panic"));
+        assert!(caught.is_err(), "the test panic should have been raised");
+        let log_bytes = fs::read(folder.join("gamepause.log")).unwrap();
+        let log_text = String::from_utf8_lossy(&log_bytes);
+        assert!(
+            log_text.contains("hook-test panic"),
+            "log should contain the panic message: {log_text:?}"
+        );
+        assert!(
+            log_text.contains("PANIC in"),
+            "log should be tagged PANIC: {log_text:?}"
+        );
+        assert!(
+            log_text.contains("app.rs"),
+            "log should contain the panic location (file): {log_text:?}"
+        );
+        std::panic::set_hook(previous);
+        let _ = fs::remove_file(folder.join("gamepause.log"));
     }
 }
