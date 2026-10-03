@@ -2,10 +2,11 @@ use crate::config::Config;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::io::Write;
 use std::os::windows::process::CommandExt;
 use std::{
     net::{TcpStream, ToSocketAddrs},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant, SystemTime},
 };
@@ -363,6 +364,78 @@ pub fn compare_fields(expected: &Value, actual: &Value) -> Result<()> {
     }
     Ok(())
 }
+
+// ── P2-2: diagnostics core (pure, mock-free) ─────────────────────────────────
+// The Doctor panel / `--doctor` assembles these from the live backend. The core
+// is pure and takes fixed inputs so it is unit-testable without a live LM
+// Studio (the `diagnostics()` and `data_dir_writable()` acceptance test).
+/// Whether a directory is actually writable. A missing directory is *not*
+/// writable (the caller must create it first); a directory that cannot be
+/// opened is treated as read-only rather than an error.
+pub fn data_dir_writable(path: &Path) -> bool {
+    let probe = path.join(format!(".gamepause-write-{}", std::process::id()));
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&probe)
+    {
+        Ok(mut f) => {
+            // Writing the actual byte is the real check: a directory can be
+            // openable but read-only for the write (rare, but possible on
+            // OneDrive-synced or networked paths).
+            let ok = f.write_all(b"gamepause").is_ok();
+            let _ = f.sync_all();
+            let _ = std::fs::remove_file(&probe);
+            ok
+        }
+        Err(_) => false,
+    }
+}
+/// Parse the `lms server status --json` payload into the two diagnostics a
+/// user actually cares about: is the server running, and on which port.
+pub fn server_state(server: &Value) -> (bool, Option<u16>) {
+    let running = server
+        .get("running")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let port = server.get("port").and_then(Value::as_u64).map(|p| p as u16);
+    (running, port)
+}
+/// Assemble the Doctor panel body from a fixed set of inputs. `lms_version` is
+/// the `lms version` output (or the error text when the CLI is unavailable),
+/// `server` the `server status --json` payload, `models` the loaded instances,
+/// `data_dir` the resolved data directory, and `data_dir_ok` whether it is
+/// writable. Keeping this pure is what lets the acceptance test assert the exact
+/// shape without touching a live LM Studio.
+#[must_use]
+pub fn diagnostics(
+    lms_version: &str,
+    server: &Value,
+    models: &[Value],
+    data_dir: &Path,
+    data_dir_ok: bool,
+) -> Value {
+    let (running, port) = server_state(server);
+    json!({
+        "lms_version": lms_version,
+        "server": {
+            "running": running,
+            "port": port,
+            "raw": server,
+        },
+        "loaded_models": models.iter().map(|m| json!({
+            "identifier": m["identifier"],
+            "model": m.get("modelKey").cloned().or_else(|| m.get("model").cloned()),
+            "status": m["status"],
+        })).collect::<Vec<_>>(),
+        "model_count": models.len(),
+        "data_dir": {
+            "path": data_dir.to_string_lossy().to_string(),
+            "writable": data_dir_ok,
+        }
+    })
+}
 impl Backend for LMStudio {
     fn loaded(&mut self) -> Result<Vec<Value>> {
         self.cli(&["ps", "--json"])?
@@ -600,5 +673,46 @@ mod tests {
             &json!({"modelKey":"publisher/model", "selectedVariant":"publisher/model@q8"})
         ));
         assert_eq!(resolved_key(&json!({"modelKey":"publisher/model@q4", "indexedModelIdentifier":"publisher/model@provider/file.gguf"})).unwrap(), "publisher/model@q4");
+    }
+
+    // ── P2-2 acceptance: diagnostics() assembles the expected fields ─────────
+    #[test]
+    fn diagnostics_assembles_expected_fields() {
+        // A running server, one loaded model, a writable data dir.
+        let server = json!({"running": true, "port": 1234});
+        let models =
+            vec![json!({"identifier":"pub/mo@q8","modelKey":"pub/mo@q8","status":"loaded"})];
+        let dir = std::env::temp_dir().join("gp_diag_ok");
+        let _ = std::fs::create_dir_all(&dir);
+        let ok = crate::lmstudio::data_dir_writable(&dir);
+        let report = crate::lmstudio::diagnostics("v1.5.1 (x86_64)", &server, &models, &dir, ok);
+
+        assert_eq!(report["lms_version"], "v1.5.1 (x86_64)");
+        assert_eq!(report["server"]["running"], true);
+        assert_eq!(report["server"]["port"], 1234);
+        assert_eq!(report["model_count"], 1);
+        assert_eq!(report["loaded_models"][0]["identifier"], "pub/mo@q8");
+        assert_eq!(report["loaded_models"][0]["status"], "loaded");
+        assert_eq!(report["data_dir"]["writable"], true);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    // The acceptance test names this explicitly: a path that is not a writable
+    // directory must report false. A *file* (not a dir) is the robust,
+    // OS-portable way to get that: you cannot create a probe file inside a file,
+    // so the open fails and writability is false. (A missing dir fails the same
+    // way.) This holds on Windows, unlike setting a read-only bit on a dir.
+    #[test]
+    fn data_dir_writable_is_false_for_a_non_writable_path() {
+        let as_file = std::env::temp_dir().join("gp_diag_afile");
+        std::fs::write(&as_file, b"not a dir").unwrap();
+        assert!(
+            !crate::lmstudio::data_dir_writable(&as_file),
+            "a file masquerading as a data dir must not be reported writable"
+        );
+        // A genuinely missing directory is also not writable.
+        let missing = std::env::temp_dir().join("gp_diag_definitely_missing_xyz");
+        assert!(!crate::lmstudio::data_dir_writable(&missing));
+        let _ = std::fs::remove_file(&as_file);
     }
 }

@@ -158,9 +158,40 @@ pub fn main(console: bool) -> Result<()> {
     }
     // Observe mode must work even when LM Studio is absent.
     if args.doctor {
+        // P2-2: route the live doctor report through the same diagnostics()
+        // core the unit test exercises, so the shape the user sees is the shape
+        // the test asserts. `lms version` is a local, read-only CLI call (it
+        // does not start the server); if the CLI is absent the core still
+        // assembles everything else and marks the version unknown.
+        let lms_path: String = match backend.as_ref() {
+            Ok(b) => b.lms.to_string_lossy().to_string(),
+            Err(_) => String::new(),
+        };
+        let version = crate::lmstudio::run_command(
+            &lms_path,
+            &["version"],
+            std::time::Duration::from_secs(5),
+        )
+        .map(|b| String::from_utf8_lossy(&b).trim().to_string())
+        .unwrap_or_else(|e| format!("unavailable: {e:#}"));
         let backend = backend.as_mut().map_err(|e| anyhow::anyhow!("{e:#}"))?;
         let snapshot = backend.snapshot()?;
-        let report = json!({"cli":backend.lms,"server":snapshot.server,"snapshot_ok":true,"models":snapshot.models.iter().map(|m|json!({"identifier":m.identifier,"model_key":m.model_key,"namespace":m.namespace,"ttl_ms":m.ttl_ms,"load_fields":m.load_config["fields"].as_array().map(Vec::len)})).collect::<Vec<_>>()});
+        let models: Vec<serde_json::Value> = snapshot
+            .models
+            .iter()
+            .map(|m| {
+                json!({
+                    "identifier": m.identifier,
+                    "modelKey": m.model_key,
+                    "namespace": m.namespace,
+                    "status": "loaded",
+                    "ttl_ms": m.ttl_ms,
+                })
+            })
+            .collect();
+        let data_dir_ok = crate::lmstudio::data_dir_writable(&folder);
+        let report =
+            crate::lmstudio::diagnostics(&version, &snapshot.server, &models, &folder, data_dir_ok);
         write_json(&folder.join("doctor-report.json"), &report)?;
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
