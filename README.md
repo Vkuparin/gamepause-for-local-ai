@@ -34,6 +34,10 @@ You do not need to start LM Studio's HTTP server manually. GamePause uses an alr
 
 Quit retains pending recovery for the next active run. Finish restoration before uninstalling. The installer and executables are currently unsigned; Windows may show a publisher warning. Download from this repository and compare the supplied SHA-256 checksums.
 
+## Recovery
+
+GamePause keeps a durable recovery journal for every model it unloads, and that journal survives a crash, a failed restore, and a restart. **If GamePause disappears while a pause is still pending — a crash, a power cut, or you closing the app mid-pause — just start it again.** On startup it reloads the journal, and as soon as the game is no longer running it resumes the restore: your models come back the same way they did before you played. You do not need to do anything else. If a restore does fail, GamePause never deletes the journal — it shows "Restore failed — AI not restored, click Restore" and lets you retry. See [Usage and recovery](docs/USAGE.md) for the full crash-recovery walkthrough.
+
 ## Documentation
 
 | Guide | Covers |
