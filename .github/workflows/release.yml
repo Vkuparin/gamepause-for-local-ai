@@ -12,9 +12,18 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
       - run: cargo test --locked
-      - run: choco install innosetup --version=6.7.3 -y --no-progress
+      - name: Install official Inno Setup compiler
+        shell: pwsh
+        run: |
+          $taskSetup = Join-Path $env:RUNNER_TEMP 'innosetup-6.7.3.exe'
+          Invoke-WebRequest 'https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe' -OutFile $taskSetup
+          $taskSignature = Get-AuthenticodeSignature -LiteralPath $taskSetup
+          if ($taskSignature.Status -ne 'Valid' -or $taskSignature.SignerCertificate.Subject -notmatch 'Pyrsys B.V.') { throw 'Unexpected Inno Setup publisher signature' }
+          $taskCompiler = Join-Path $env:RUNNER_TEMP 'GamePause-InnoSetup'
+          $taskInstall = Start-Process -FilePath $taskSetup -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/CURRENTUSER', ('/DIR="' + $taskCompiler + '"')) -WindowStyle Hidden -Wait -PassThru
+          if ($taskInstall.ExitCode -ne 0) { throw 'Inno Setup installation failed' }
       - shell: pwsh
-        run: ./scripts/build_release.ps1 -Iscc 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+        run: ./scripts/build_release.ps1 -Iscc (Join-Path $env:RUNNER_TEMP 'GamePause-InnoSetup\ISCC.exe')
       - uses: actions/upload-artifact@v4
         with:
           name: GamePause-windows-x64
