@@ -50,6 +50,10 @@ const DELAY_LABEL: i32 = 121;
 const ADDRESS_LABEL: i32 = 122;
 const TITLE: i32 = 130;
 const SEARCH_LABEL: i32 = 131;
+const OPTIONS_BOX: i32 = 140;
+const GAMES_BOX: i32 = 141;
+const ACTIONS_BOX: i32 = 142;
+const SETTINGS_BOX: i32 = 143;
 /// Scale a 96-DPI design coordinate to the target DPI.
 #[must_use]
 pub fn scale(value: i32, dpi: i32) -> i32 {
@@ -57,9 +61,10 @@ pub fn scale(value: i32, dpi: i32) -> i32 {
 }
 
 /// Dashboard height for the settings-panel visibility state, at the target DPI.
+/// Sections end at 716 (Settings box); feedback follows at 722/644.
 #[must_use]
 pub fn window_height(settings_visible: bool, dpi: i32) -> i32 {
-    scale(if settings_visible { 748 } else { 708 }, dpi)
+    scale(if settings_visible { 792 } else { 712 }, dpi)
 }
 
 /// Feedback-line geometry `(x, y, w, h)` for the settings-panel visibility state.
@@ -67,7 +72,7 @@ pub fn window_height(settings_visible: bool, dpi: i32) -> i32 {
 pub fn feedback_position(settings_visible: bool, dpi: i32) -> (i32, i32, i32, i32) {
     (
         scale(24, dpi),
-        scale(if settings_visible { 640 } else { 600 }, dpi),
+        scale(if settings_visible { 722 } else { 644 }, dpi),
         scale(836, dpi),
         scale(58, dpi),
     )
@@ -85,20 +90,121 @@ pub fn ctlcolor_index(message: u32) -> SYS_COLOR_INDEX {
     }
 }
 
-/// Base (96-DPI) geometry of one control; the single source used to relayout on DPI change.
+/// Base (96-DPI) geometry AND creation attributes of one control. The single
+/// source of truth: used to create the control, to relayout it on DPI change,
+/// and by the group-box bounds test (P1-3).
 #[derive(Clone, Copy)]
 struct Layout {
     id: i32,
+    class: &'static str,
+    label: &'static str,
+    style: u32,
     x: i32,
     y: i32,
     w: i32,
     h: i32,
 }
 
-/// Every dashboard control's base geometry, in 96-DPI design units.
-const LAYOUT: [Layout; 25] = [
+/// One section frame: its box id plus the ids of the controls it contains.
+#[derive(Clone, Copy)]
+#[cfg(test)]
+struct GroupBox {
+    id: i32,
+    members: &'static [i32],
+}
+
+/// The four section frames and their contents. Test-only bookkeeping: the
+/// runtime creates controls straight from `LAYOUT`.
+#[cfg(test)]
+const GROUPBOXES: [GroupBox; 4] = [
+    GroupBox {
+        id: OPTIONS_BOX,
+        members: &[AUTO, STARTUP],
+    },
+    GroupBox {
+        id: GAMES_BOX,
+        members: &[
+            GAMES,
+            RUNNING,
+            IGNORED,
+            SETTINGS,
+            REFRESH,
+            ADD,
+            SEARCH_LABEL,
+            SEARCH,
+            LIST,
+            DETAILS,
+        ],
+    },
+    GroupBox {
+        id: ACTIONS_BOX,
+        members: &[TOGGLE, REMOVE, PAUSE, RESTORE],
+    },
+    GroupBox {
+        id: SETTINGS_BOX,
+        members: &[DELAY_LABEL, DELAY, ADDRESS_LABEL, ADDRESS, SAVE, CLI],
+    },
+];
+
+/// A `LAYOUT` entry by control id (test helper; `Layout` is `Copy`).
+#[cfg(test)]
+fn by_id(id: i32) -> Layout {
+    LAYOUT
+        .iter()
+        .find(|e| e.id == id)
+        .copied()
+        .expect("control id missing from LAYOUT")
+}
+
+/// Every dashboard control, in 96-DPI design units. Order: section boxes first,
+/// then header, then top-to-bottom. Coordinates are the single source of truth
+/// shared by creation, DPI relayout, and the group-box bounds test (P1-3).
+const LAYOUT: [Layout; 29] = [
+    Layout {
+        id: OPTIONS_BOX,
+        class: "BUTTON",
+        label: "Options",
+        style: BS_GROUPBOX as u32,
+        x: 16,
+        y: 108,
+        w: 852,
+        h: 54,
+    },
+    Layout {
+        id: GAMES_BOX,
+        class: "BUTTON",
+        label: "Games",
+        style: BS_GROUPBOX as u32,
+        x: 16,
+        y: 170,
+        w: 852,
+        h: 396,
+    },
+    Layout {
+        id: ACTIONS_BOX,
+        class: "BUTTON",
+        label: "Actions",
+        style: BS_GROUPBOX as u32,
+        x: 16,
+        y: 574,
+        w: 852,
+        h: 62,
+    },
+    Layout {
+        id: SETTINGS_BOX,
+        class: "BUTTON",
+        label: "Settings",
+        style: BS_GROUPBOX as u32,
+        x: 16,
+        y: 644,
+        w: 852,
+        h: 72,
+    },
     Layout {
         id: TITLE,
+        class: "STATIC",
+        label: "GamePause",
+        style: 0,
         x: 24,
         y: 16,
         w: 600,
@@ -106,176 +212,260 @@ const LAYOUT: [Layout; 25] = [
     },
     Layout {
         id: STATUS,
+        class: "STATIC",
+        label: "Starting automatic discovery...",
+        style: 0,
         x: 24,
         y: 52,
         w: 836,
-        h: 54,
+        h: 50,
     },
     Layout {
         id: AUTO,
+        class: "BUTTON",
+        label: "Automatically pause AI while gaming",
+        style: BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
         x: 24,
-        y: 112,
+        y: 128,
         w: 430,
         h: 28,
     },
     Layout {
         id: STARTUP,
+        class: "BUTTON",
+        label: "Start when I sign in to Windows",
+        style: BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
         x: 478,
-        y: 112,
+        y: 128,
         w: 382,
         h: 28,
     },
     Layout {
         id: GAMES,
+        class: "BUTTON",
+        label: "Games",
+        style: WS_TABSTOP,
         x: 24,
-        y: 154,
+        y: 194,
         w: 105,
         h: 30,
     },
     Layout {
         id: RUNNING,
+        class: "BUTTON",
+        label: "Running apps",
+        style: WS_TABSTOP,
         x: 138,
-        y: 154,
+        y: 194,
         w: 135,
         h: 30,
     },
     Layout {
         id: IGNORED,
+        class: "BUTTON",
+        label: "Ignored",
+        style: WS_TABSTOP,
         x: 282,
-        y: 154,
+        y: 194,
         w: 110,
         h: 30,
     },
     Layout {
         id: SETTINGS,
+        class: "BUTTON",
+        label: "Settings",
+        style: WS_TABSTOP,
         x: 402,
-        y: 154,
+        y: 194,
         w: 130,
         h: 30,
     },
     Layout {
         id: REFRESH,
+        class: "BUTTON",
+        label: "Refresh now",
+        style: WS_TABSTOP,
         x: 614,
-        y: 154,
+        y: 194,
         w: 116,
         h: 30,
     },
     Layout {
         id: ADD,
+        class: "BUTTON",
+        label: "Add game...",
+        style: WS_TABSTOP,
         x: 740,
-        y: 154,
+        y: 194,
         w: 120,
         h: 30,
     },
     Layout {
         id: SEARCH_LABEL,
+        class: "STATIC",
+        label: "Search",
+        style: 0,
         x: 24,
-        y: 198,
+        y: 238,
         w: 62,
         h: 25,
     },
     Layout {
         id: SEARCH,
+        class: "EDIT",
+        label: "",
+        style: WS_TABSTOP | ES_AUTOHSCROLL as u32,
         x: 90,
-        y: 194,
+        y: 234,
         w: 770,
         h: 28,
     },
     Layout {
         id: LIST,
+        class: "LISTBOX",
+        label: "",
+        style: WS_TABSTOP
+            | WS_VSCROLL
+            | WS_HSCROLL
+            | LBS_NOTIFY as u32
+            | LBS_NOINTEGRALHEIGHT as u32,
         x: 24,
-        y: 234,
+        y: 270,
         w: 836,
-        h: 220,
+        h: 208,
     },
     Layout {
         id: DETAILS,
+        class: "EDIT",
+        label: "",
+        style: ES_MULTILINE as u32 | ES_READONLY as u32 | WS_VSCROLL,
         x: 24,
-        y: 466,
+        y: 490,
         w: 836,
-        h: 76,
+        h: 66,
     },
     Layout {
         id: TOGGLE,
+        class: "BUTTON",
+        label: "Ignore selected",
+        style: WS_TABSTOP,
         x: 24,
-        y: 554,
+        y: 594,
         w: 205,
         h: 32,
     },
     Layout {
         id: REMOVE,
+        class: "BUTTON",
+        label: "Remove custom game",
+        style: WS_TABSTOP,
         x: 239,
-        y: 554,
+        y: 594,
         w: 193,
         h: 32,
     },
     Layout {
         id: PAUSE,
+        class: "BUTTON",
+        label: "Pause / resume AI manually",
+        style: WS_TABSTOP,
         x: 442,
-        y: 554,
+        y: 594,
         w: 252,
         h: 32,
     },
     Layout {
         id: RESTORE,
+        class: "BUTTON",
+        label: "Restore AI now",
+        style: WS_TABSTOP,
         x: 704,
-        y: 554,
+        y: 594,
         w: 156,
         h: 32,
     },
     Layout {
         id: DELAY_LABEL,
+        class: "STATIC",
+        label: "Restore after (seconds)",
+        style: 0,
         x: 24,
-        y: 600,
+        y: 666,
         w: 180,
         h: 25,
     },
     Layout {
         id: DELAY,
+        class: "EDIT",
+        label: "30",
+        style: WS_TABSTOP | ES_AUTOHSCROLL as u32,
         x: 206,
-        y: 596,
+        y: 664,
         w: 65,
         h: 28,
     },
     Layout {
         id: ADDRESS_LABEL,
+        class: "STATIC",
+        label: "Local API",
+        style: 0,
         x: 292,
-        y: 600,
+        y: 666,
         w: 80,
         h: 25,
     },
     Layout {
         id: ADDRESS,
+        class: "EDIT",
+        label: "127.0.0.1:1234",
+        style: WS_TABSTOP | ES_AUTOHSCROLL as u32,
         x: 376,
-        y: 596,
+        y: 664,
         w: 218,
         h: 28,
     },
     Layout {
         id: SAVE,
+        class: "BUTTON",
+        label: "Save settings",
+        style: WS_TABSTOP,
         x: 604,
-        y: 596,
+        y: 664,
         w: 128,
         h: 28,
     },
     Layout {
         id: CLI,
+        class: "BUTTON",
+        label: "Locate lms...",
+        style: WS_TABSTOP,
         x: 742,
-        y: 596,
+        y: 664,
         w: 118,
         h: 28,
     },
     Layout {
         id: FEEDBACK,
+        class: "STATIC",
+        label: "",
+        style: 0,
         x: 24,
-        y: 600,
+        y: 644,
         w: 836,
         h: 58,
     },
 ];
 
 /// Settings-row control ids, toggled together and repositioned by `relayout`.
-const SETTINGS_ROW: [i32; 6] = [DELAY, ADDRESS, SAVE, CLI, DELAY_LABEL, ADDRESS_LABEL];
+const SETTINGS_ROW: [i32; 7] = [
+    DELAY,
+    ADDRESS,
+    SAVE,
+    CLI,
+    DELAY_LABEL,
+    ADDRESS_LABEL,
+    SETTINGS_BOX,
+];
 
 fn is_settings_row(id: i32) -> bool {
     SETTINGS_ROW.contains(&id)
@@ -875,10 +1065,10 @@ pub fn show(shared: SharedState, tx: Sender<Action>, folder: PathBuf) {
             ..std::mem::zeroed()
         };
         RegisterClassW(&wc);
-        let dpi = GetDpiForSystem();
-        let scale = |v: i32| v * dpi as i32 / 96;
+        let dpi = GetDpiForSystem() as i32;
+        let scale = |v: i32| v * dpi / 96;
         let width = scale(900);
-        let height = scale(708);
+        let height = window_height(false, dpi);
         let hwnd = CreateWindowExW(
             0,
             class.as_ptr(),
@@ -914,212 +1104,28 @@ pub fn show(shared: SharedState, tx: Sender<Action>, folder: PathBuf) {
             0,
             wide("Segoe UI").as_ptr(),
         );
-        let control =
-            |class: &str, label: &str, id: i32, x: i32, y: i32, w: i32, h: i32, style: u32| {
-                let child = CreateWindowExW(
-                    if class == "EDIT" || class == "LISTBOX" {
-                        WS_EX_CLIENTEDGE
-                    } else {
-                        0
-                    },
-                    wide(class).as_ptr(),
-                    wide(label).as_ptr(),
-                    WS_CHILD | WS_VISIBLE | style,
-                    scale(x),
-                    scale(y),
-                    scale(w),
-                    scale(h),
-                    hwnd,
-                    id as HMENU,
-                    instance,
-                    null(),
-                );
-                SendMessageW(child, WM_SETFONT, font as usize, 1);
-                child
-            };
-        control("STATIC", "GamePause", TITLE, 24, 16, 600, 26, 0);
-        control(
-            "STATIC",
-            "Starting automatic discovery...",
-            STATUS,
-            24,
-            52,
-            836,
-            54,
-            0,
-        );
-        control(
-            "BUTTON",
-            "Automatically pause AI while gaming",
-            AUTO,
-            24,
-            112,
-            430,
-            28,
-            BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
-        );
-        control(
-            "BUTTON",
-            "Start when I sign in to Windows",
-            STARTUP,
-            478,
-            112,
-            382,
-            28,
-            BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
-        );
-        control("BUTTON", "Games", GAMES, 24, 154, 105, 30, WS_TABSTOP);
-        control(
-            "BUTTON",
-            "Running apps",
-            RUNNING,
-            138,
-            154,
-            135,
-            30,
-            WS_TABSTOP,
-        );
-        control("BUTTON", "Ignored", IGNORED, 282, 154, 110, 30, WS_TABSTOP);
-        control(
-            "BUTTON", "Settings", SETTINGS, 402, 154, 130, 30, WS_TABSTOP,
-        );
-        control(
-            "BUTTON",
-            "Refresh now",
-            REFRESH,
-            614,
-            154,
-            116,
-            30,
-            WS_TABSTOP,
-        );
-        control("BUTTON", "Add game...", ADD, 740, 154, 120, 30, WS_TABSTOP);
-        control("STATIC", "Search", SEARCH_LABEL, 24, 198, 62, 25, 0);
-        control(
-            "EDIT",
-            "",
-            SEARCH,
-            90,
-            194,
-            770,
-            28,
-            WS_TABSTOP | ES_AUTOHSCROLL as u32,
-        );
-        control(
-            "LISTBOX",
-            "",
-            LIST,
-            24,
-            234,
-            836,
-            220,
-            WS_TABSTOP | WS_VSCROLL | WS_HSCROLL | LBS_NOTIFY as u32 | LBS_NOINTEGRALHEIGHT as u32,
-        );
-        control(
-            "EDIT",
-            "",
-            DETAILS,
-            24,
-            466,
-            836,
-            76,
-            ES_MULTILINE as u32 | ES_READONLY as u32 | WS_VSCROLL,
-        );
-        control(
-            "BUTTON",
-            "Ignore selected",
-            TOGGLE,
-            24,
-            554,
-            205,
-            32,
-            WS_TABSTOP,
-        );
-        control(
-            "BUTTON",
-            "Remove custom game",
-            REMOVE,
-            239,
-            554,
-            193,
-            32,
-            WS_TABSTOP,
-        );
-        control(
-            "BUTTON",
-            "Pause / resume AI manually",
-            PAUSE,
-            442,
-            554,
-            252,
-            32,
-            WS_TABSTOP,
-        );
-        control(
-            "BUTTON",
-            "Restore AI now",
-            RESTORE,
-            704,
-            554,
-            156,
-            32,
-            WS_TABSTOP,
-        );
-        control(
-            "STATIC",
-            "Restore after (seconds)",
-            DELAY_LABEL,
-            24,
-            600,
-            180,
-            25,
-            0,
-        );
-        control(
-            "EDIT",
-            "30",
-            DELAY,
-            206,
-            596,
-            65,
-            28,
-            WS_TABSTOP | ES_AUTOHSCROLL as u32,
-        );
-        control("STATIC", "Local API", ADDRESS_LABEL, 292, 600, 80, 25, 0);
-        control(
-            "EDIT",
-            "127.0.0.1:1234",
-            ADDRESS,
-            376,
-            596,
-            218,
-            28,
-            WS_TABSTOP | ES_AUTOHSCROLL as u32,
-        );
-        control(
-            "BUTTON",
-            "Save settings",
-            SAVE,
-            604,
-            596,
-            128,
-            28,
-            WS_TABSTOP,
-        );
-        control(
-            "BUTTON",
-            "Locate lms...",
-            CLI,
-            742,
-            596,
-            118,
-            28,
-            WS_TABSTOP,
-        );
-        control("STATIC", "", FEEDBACK, 24, 600, 836, 58, 0);
-        for id in [DELAY, ADDRESS, SAVE, CLI, DELAY_LABEL, ADDRESS_LABEL] {
-            ShowWindow(GetDlgItem(hwnd, id), SW_HIDE);
+        for e in LAYOUT {
+            let child = CreateWindowExW(
+                if e.class == "EDIT" || e.class == "LISTBOX" {
+                    WS_EX_CLIENTEDGE
+                } else {
+                    0
+                },
+                wide(e.class).as_ptr(),
+                wide(e.label).as_ptr(),
+                WS_CHILD | WS_VISIBLE | e.style,
+                scale(e.x),
+                scale(e.y),
+                scale(e.w),
+                scale(e.h),
+                hwnd,
+                e.id as HMENU,
+                instance,
+                null(),
+            );
+            SendMessageW(child, WM_SETFONT, font as usize, 1);
         }
+        apply_settings_visibility(hwnd, dpi, false);
         let revision = shared
             .lock()
             .map(|s| s.revision)
@@ -1195,17 +1201,67 @@ mod tests {
     }
     #[test]
     fn window_height_tracks_settings_visibility() {
-        assert_eq!(window_height(false, 96), 708);
-        assert_eq!(window_height(true, 96), 748);
-        assert_eq!(window_height(false, 144), 1062);
-        assert_eq!(window_height(true, 144), 1122);
+        assert_eq!(window_height(false, 96), 712);
+        assert_eq!(window_height(true, 96), 792);
+        assert_eq!(window_height(false, 144), 1068);
+        assert_eq!(window_height(true, 144), 1188);
     }
     #[test]
     fn feedback_line_sits_below_settings_row_when_expanded() {
-        assert_eq!(feedback_position(false, 96), (24, 600, 836, 58));
-        assert_eq!(feedback_position(true, 96), (24, 640, 836, 58));
+        assert_eq!(feedback_position(false, 96), (24, 644, 836, 58));
+        assert_eq!(feedback_position(true, 96), (24, 722, 836, 58));
         let (_, y, _, _) = feedback_position(true, 144);
-        assert_eq!(y, 960);
+        assert_eq!(y, 1083);
+    }
+    #[test]
+    fn group_boxes_present_and_contain_their_controls() {
+        // P1-3 acceptance: four section frames exist in LAYOUT, and every control
+        // assigned to a frame sits strictly inside that frame's bounds at 96 DPI.
+        for gb in GROUPBOXES {
+            let frame = by_id(gb.id);
+            assert_eq!(frame.class, "BUTTON");
+            assert_ne!(
+                frame.style & BS_GROUPBOX as u32,
+                0,
+                "box must be a group box"
+            );
+            for &member in gb.members {
+                let m = by_id(member);
+                assert!(
+                    m.x >= frame.x
+                        && m.y >= frame.y
+                        && m.x + m.w <= frame.x + frame.w
+                        && m.y + m.h <= frame.y + frame.h,
+                    "control {} ({}x{} at {},{}) must sit inside box {} ({}x{} at {},{})",
+                    member,
+                    m.w,
+                    m.h,
+                    m.x,
+                    m.y,
+                    gb.id,
+                    frame.w,
+                    frame.h,
+                    frame.x,
+                    frame.y
+                );
+            }
+        }
+    }
+    #[test]
+    fn every_control_id_appears_in_exactly_one_layout_entry() {
+        // A duplicate id would make GetDlgItem ambiguous; a missing one would break
+        // relayout silently. LAYOUT must be a partition of the 29 control ids.
+        let mut ids: Vec<i32> = LAYOUT.iter().map(|e| e.id).collect();
+        ids.sort_unstable();
+        let mut unique = ids.clone();
+        unique.dedup();
+        assert_eq!(ids, unique, "LAYOUT must not contain duplicate control ids");
+        for &box_id in &[OPTIONS_BOX, GAMES_BOX, ACTIONS_BOX, SETTINGS_BOX] {
+            assert!(
+                by_id(box_id).id == box_id,
+                "section box id must be in LAYOUT"
+            );
+        }
     }
     #[test]
     fn ctlcolor_static_tracks_window_and_button_tracks_btnface() {
