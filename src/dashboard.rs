@@ -48,6 +48,297 @@ const FEEDBACK: i32 = 119;
 const SETTINGS: i32 = 120;
 const DELAY_LABEL: i32 = 121;
 const ADDRESS_LABEL: i32 = 122;
+const TITLE: i32 = 130;
+const SEARCH_LABEL: i32 = 131;
+/// Scale a 96-DPI design coordinate to the target DPI.
+#[must_use]
+pub fn scale(value: i32, dpi: i32) -> i32 {
+    value * dpi / 96
+}
+
+/// Dashboard height for the settings-panel visibility state, at the target DPI.
+#[must_use]
+pub fn window_height(settings_visible: bool, dpi: i32) -> i32 {
+    scale(if settings_visible { 748 } else { 708 }, dpi)
+}
+
+/// Feedback-line geometry `(x, y, w, h)` for the settings-panel visibility state.
+#[must_use]
+pub fn feedback_position(settings_visible: bool, dpi: i32) -> (i32, i32, i32, i32) {
+    (
+        scale(24, dpi),
+        scale(if settings_visible { 640 } else { 600 }, dpi),
+        scale(836, dpi),
+        scale(58, dpi),
+    )
+}
+
+/// Base (96-DPI) geometry of one control; the single source used to relayout on DPI change.
+#[derive(Clone, Copy)]
+struct Layout {
+    id: i32,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+}
+
+/// Every dashboard control's base geometry, in 96-DPI design units.
+const LAYOUT: [Layout; 25] = [
+    Layout {
+        id: TITLE,
+        x: 24,
+        y: 16,
+        w: 600,
+        h: 26,
+    },
+    Layout {
+        id: STATUS,
+        x: 24,
+        y: 52,
+        w: 836,
+        h: 54,
+    },
+    Layout {
+        id: AUTO,
+        x: 24,
+        y: 112,
+        w: 430,
+        h: 28,
+    },
+    Layout {
+        id: STARTUP,
+        x: 478,
+        y: 112,
+        w: 382,
+        h: 28,
+    },
+    Layout {
+        id: GAMES,
+        x: 24,
+        y: 154,
+        w: 105,
+        h: 30,
+    },
+    Layout {
+        id: RUNNING,
+        x: 138,
+        y: 154,
+        w: 135,
+        h: 30,
+    },
+    Layout {
+        id: IGNORED,
+        x: 282,
+        y: 154,
+        w: 110,
+        h: 30,
+    },
+    Layout {
+        id: SETTINGS,
+        x: 402,
+        y: 154,
+        w: 130,
+        h: 30,
+    },
+    Layout {
+        id: REFRESH,
+        x: 614,
+        y: 154,
+        w: 116,
+        h: 30,
+    },
+    Layout {
+        id: ADD,
+        x: 740,
+        y: 154,
+        w: 120,
+        h: 30,
+    },
+    Layout {
+        id: SEARCH_LABEL,
+        x: 24,
+        y: 198,
+        w: 62,
+        h: 25,
+    },
+    Layout {
+        id: SEARCH,
+        x: 90,
+        y: 194,
+        w: 770,
+        h: 28,
+    },
+    Layout {
+        id: LIST,
+        x: 24,
+        y: 234,
+        w: 836,
+        h: 220,
+    },
+    Layout {
+        id: DETAILS,
+        x: 24,
+        y: 466,
+        w: 836,
+        h: 76,
+    },
+    Layout {
+        id: TOGGLE,
+        x: 24,
+        y: 554,
+        w: 205,
+        h: 32,
+    },
+    Layout {
+        id: REMOVE,
+        x: 239,
+        y: 554,
+        w: 193,
+        h: 32,
+    },
+    Layout {
+        id: PAUSE,
+        x: 442,
+        y: 554,
+        w: 252,
+        h: 32,
+    },
+    Layout {
+        id: RESTORE,
+        x: 704,
+        y: 554,
+        w: 156,
+        h: 32,
+    },
+    Layout {
+        id: DELAY_LABEL,
+        x: 24,
+        y: 600,
+        w: 180,
+        h: 25,
+    },
+    Layout {
+        id: DELAY,
+        x: 206,
+        y: 596,
+        w: 65,
+        h: 28,
+    },
+    Layout {
+        id: ADDRESS_LABEL,
+        x: 292,
+        y: 600,
+        w: 80,
+        h: 25,
+    },
+    Layout {
+        id: ADDRESS,
+        x: 376,
+        y: 596,
+        w: 218,
+        h: 28,
+    },
+    Layout {
+        id: SAVE,
+        x: 604,
+        y: 596,
+        w: 128,
+        h: 28,
+    },
+    Layout {
+        id: CLI,
+        x: 742,
+        y: 596,
+        w: 118,
+        h: 28,
+    },
+    Layout {
+        id: FEEDBACK,
+        x: 24,
+        y: 600,
+        w: 836,
+        h: 58,
+    },
+];
+
+/// Settings-row control ids, toggled together and repositioned by `relayout`.
+const SETTINGS_ROW: [i32; 6] = [DELAY, ADDRESS, SAVE, CLI, DELAY_LABEL, ADDRESS_LABEL];
+
+fn is_settings_row(id: i32) -> bool {
+    SETTINGS_ROW.contains(&id)
+}
+
+/// Show/hide the settings row and place the feedback line for the given visibility.
+/// Shared by the Settings toggle and DPI-change relayout so both use one code path.
+fn apply_settings_visibility(hwnd: HWND, dpi: i32, visible: bool) {
+    unsafe {
+        for id in SETTINGS_ROW {
+            let child = GetDlgItem(hwnd, id);
+            if !child.is_null() {
+                ShowWindow(child, if visible { SW_SHOW } else { SW_HIDE });
+            }
+        }
+        for e in LAYOUT {
+            if !is_settings_row(e.id) {
+                continue;
+            }
+            let child = GetDlgItem(hwnd, e.id);
+            if !child.is_null() {
+                MoveWindow(
+                    child,
+                    scale(e.x, dpi),
+                    scale(e.y, dpi),
+                    scale(e.w, dpi),
+                    scale(e.h, dpi),
+                    1,
+                );
+            }
+        }
+        let (fx, fy, fw, fh) = feedback_position(visible, dpi);
+        let child = GetDlgItem(hwnd, FEEDBACK);
+        if !child.is_null() {
+            MoveWindow(child, fx, fy, fw, fh, 1);
+        }
+    }
+}
+
+/// Relayout every control for the target DPI, preserving the top-left corner and the
+/// current settings-panel visibility. Driven by `WM_DPICHANGED` so moving the window
+/// between monitors re-scales the controls instead of bitmap-stretching them.
+fn relayout(hwnd: HWND, dpi: i32, settings_visible: bool) {
+    unsafe {
+        let mut rect: RECT = std::mem::zeroed();
+        GetWindowRect(hwnd, &mut rect);
+        MoveWindow(
+            hwnd,
+            rect.left,
+            rect.top,
+            scale(900, dpi),
+            window_height(settings_visible, dpi),
+            1,
+        );
+        for e in LAYOUT {
+            if e.id == FEEDBACK || is_settings_row(e.id) {
+                continue; // handled by apply_settings_visibility
+            }
+            let child = GetDlgItem(hwnd, e.id);
+            if child.is_null() {
+                continue;
+            }
+            MoveWindow(
+                child,
+                scale(e.x, dpi),
+                scale(e.y, dpi),
+                scale(e.w, dpi),
+                scale(e.h, dpi),
+                1,
+            );
+        }
+        apply_settings_visibility(hwnd, dpi, settings_visible);
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Page {
     Games,
@@ -395,21 +686,8 @@ fn command(id: i32, notification: u32) {
                 }
             });
             unsafe {
-                for id in [DELAY, ADDRESS, SAVE, CLI, DELAY_LABEL, ADDRESS_LABEL] {
-                    ShowWindow(
-                        GetDlgItem(state.hwnd, id),
-                        if visible { SW_SHOW } else { SW_HIDE },
-                    );
-                }
                 let dpi = GetDpiForWindow(state.hwnd) as i32;
-                MoveWindow(
-                    GetDlgItem(state.hwnd, FEEDBACK),
-                    24 * dpi / 96,
-                    (if visible { 640 } else { 600 }) * dpi / 96,
-                    836 * dpi / 96,
-                    58 * dpi / 96,
-                    1,
-                );
+                apply_settings_visibility(state.hwnd, dpi, visible);
                 let mut rect: RECT = std::mem::zeroed();
                 GetWindowRect(state.hwnd, &mut rect);
                 SetWindowPos(
@@ -418,7 +696,7 @@ fn command(id: i32, notification: u32) {
                     0,
                     0,
                     rect.right - rect.left,
-                    (if visible { 748 } else { 708 }) * dpi / 96,
+                    window_height(visible, dpi),
                     SWP_NOMOVE | SWP_NOZORDER,
                 );
             }
@@ -515,6 +793,12 @@ unsafe extern "system" fn procedure(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
         }
         WM_TIMER => {
             refresh();
+            0
+        }
+        WM_DPICHANGED => {
+            let dpi = (w >> 16) as i32;
+            let settings_visible = snapshot().map(|s| s.settings_visible).unwrap_or(false);
+            relayout(hwnd, dpi, settings_visible);
             0
         }
         WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => unsafe {
@@ -633,7 +917,7 @@ pub fn show(shared: SharedState, tx: Sender<Action>, folder: PathBuf) {
                 SendMessageW(child, WM_SETFONT, font as usize, 1);
                 child
             };
-        control("STATIC", "GamePause", 0, 24, 16, 600, 26, 0);
+        control("STATIC", "GamePause", TITLE, 24, 16, 600, 26, 0);
         control(
             "STATIC",
             "Starting automatic discovery...",
@@ -690,7 +974,7 @@ pub fn show(shared: SharedState, tx: Sender<Action>, folder: PathBuf) {
             WS_TABSTOP,
         );
         control("BUTTON", "Add game...", ADD, 740, 154, 120, 30, WS_TABSTOP);
-        control("STATIC", "Search", 0, 24, 198, 62, 25, 0);
+        control("STATIC", "Search", SEARCH_LABEL, 24, 198, 62, 25, 0);
         control(
             "EDIT",
             "",
@@ -879,5 +1163,28 @@ mod tests {
         add_game(&mut config, r"D:\Games\game.exe".into(), "Game".into());
         assert_eq!(config.extra_games.len(), 1);
         assert!(config.ignored_games.is_empty());
+    }
+    #[test]
+    fn scale_follows_dpi_at_100_150_200() {
+        assert_eq!(scale(100, 96), 100);
+        assert_eq!(scale(100, 144), 150);
+        assert_eq!(scale(100, 192), 200);
+        assert_eq!(scale(960, 96), 960);
+        assert_eq!(scale(960, 144), 1440);
+        assert_eq!(scale(960, 192), 1920);
+    }
+    #[test]
+    fn window_height_tracks_settings_visibility() {
+        assert_eq!(window_height(false, 96), 708);
+        assert_eq!(window_height(true, 96), 748);
+        assert_eq!(window_height(false, 144), 1062);
+        assert_eq!(window_height(true, 144), 1122);
+    }
+    #[test]
+    fn feedback_line_sits_below_settings_row_when_expanded() {
+        assert_eq!(feedback_position(false, 96), (24, 600, 836, 58));
+        assert_eq!(feedback_position(true, 96), (24, 640, 836, 58));
+        let (_, y, _, _) = feedback_position(true, 144);
+        assert_eq!(y, 960);
     }
 }
