@@ -370,10 +370,17 @@ fn run(
     let mut errors = std::collections::BTreeMap::<String, String>::new();
     let (request_tx, request_rx) = mpsc::channel::<(Config, f64, bool, bool)>();
     let (result_tx, result_rx) = mpsc::channel();
+    let worker_log = folder.clone();
     let inventory_worker = std::thread::spawn(move || {
         let mut discovery = Discovery::default();
         while let Ok((config, now, force, defer)) = request_rx.recv() {
-            let games = discovery.refresh(&config, now, force, defer);
+            let (games, panic_payload) = discovery.recover_refresh(&config, now, force, defer);
+            if !panic_payload.is_empty() {
+                crate::app::log(
+                    &worker_log,
+                    &format!("Inventory scan recovered from panic: {panic_payload}"),
+                );
+            }
             if result_tx
                 .send((
                     games,
