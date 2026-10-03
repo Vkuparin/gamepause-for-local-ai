@@ -30,12 +30,43 @@ static FINISHED: AtomicBool = AtomicBool::new(false);
 static MENU_TIMER_TICKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 #[cfg(test)]
 static MENU_OPENINGS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// The three state-colored tray icons, precomputed once so the timer path
+/// never calls GDI. `Idle` is the base glyph; `Paused` and `Attention` are
+/// tinted variants (P1-6).
+#[derive(Clone)]
+struct Icons {
+    idle: HICON,
+    paused: HICON,
+    attention: HICON,
+}
+impl Icons {
+    fn for_kind(&self, kind: StateKind) -> HICON {
+        match kind {
+            StateKind::Idle => self.idle,
+            StateKind::Paused => self.paused,
+            StateKind::Attention => self.attention,
+        }
+    }
+    unsafe fn destroy(&self) {
+        unsafe {
+            if !self.idle.is_null() {
+                DestroyIcon(self.idle);
+            }
+            if !self.paused.is_null() {
+                DestroyIcon(self.paused);
+            }
+            if !self.attention.is_null() {
+                DestroyIcon(self.attention);
+            }
+        }
+    }
+}
 #[derive(Clone)]
 struct UI {
     shared: SharedState,
     tx: Sender<Action>,
     folder: PathBuf,
-    icon: HICON,
+    icons: Icons,
     taskbar_message: u32,
     last_error: String,
     last_kind: StateKind,
@@ -152,14 +183,26 @@ pub fn open_path(path: &Path) {
         );
     }
 }
-unsafe fn icon() -> HICON {
+/// The tray glyph's solid fill color per state. Pure + unit-testable: this is
+/// the "state -> icon variant" mapping P1-6 wants asserted without Win32.
+/// `Idle` is the app's brand color; `Paused` reads "standby"; `Attention` is
+/// a warning red that pops against the dark tray.
+pub fn icon_tint(kind: StateKind) -> [u8; 3] {
+    match kind {
+        StateKind::Idle => [117, 94, 21],
+        StateKind::Paused => [56, 132, 255],
+        StateKind::Attention => [230, 62, 62],
+    }
+}
+/// Draw the pause-bar glyph in `color` and return an HICON. The bars stay
+/// white so the state is carried by the background tint alone.
+unsafe fn icon(color: [u8; 3]) -> HICON {
     let mut pixels = vec![0u8; 32 * 32 * 4];
     for y in 0..32 {
         for x in 0..32 {
             let offset = (y * 32 + x) * 4;
-            let cyan = (4..28).contains(&x) && (4..28).contains(&y);
-            if cyan {
-                pixels[offset..offset + 4].copy_from_slice(&[117, 94, 21, 255]);
+            if (4..28).contains(&x) && (4..28).contains(&y) {
+                pixels[offset..offset + 4].copy_from_slice(&[color[0], color[1], color[2], 255]);
             }
             if (9..23).contains(&y) && ((10..14).contains(&x) || (18..22).contains(&x)) {
                 pixels[offset..offset + 4].copy_from_slice(&[255, 255, 255, 255]);
@@ -184,18 +227,19 @@ unsafe fn icon() -> HICON {
 }
 unsafe fn notification(hwnd: HWND, operation: u32, ui: &UI) {
     unsafe {
+        let (message, manual_pause) = ui
+            .shared
+            .lock()
+            .map(|s| (s.message.clone(), s.manual_pause))
+            .unwrap_or_else(|_| ("GamePause".into(), false));
+        let kind = state_kind(&message, manual_pause);
         let mut data: NOTIFYICONDATAW = std::mem::zeroed();
         data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
         data.hWnd = hwnd;
         data.uID = 1;
         data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
         data.uCallbackMessage = CALLBACK;
-        data.hIcon = ui.icon;
-        let message = ui
-            .shared
-            .lock()
-            .map(|s| s.message.clone())
-            .unwrap_or_else(|_| "GamePause".into());
+        data.hIcon = ui.icons.for_kind(kind);
         let text: Vec<_> = format!("GamePause: {message}")
             .encode_utf16()
             .take(127)
@@ -481,7 +525,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, w: WPARAM, l: LP
             if let Some(ui) = ui_snapshot() {
                 unsafe {
                     notification(hwnd, NIM_DELETE, &ui);
-                    DestroyIcon(ui.icon);
+                    ui.icons.destroy();
                 }
             }
             WINDOW.store(0, Ordering::Relaxed);
@@ -519,7 +563,11 @@ pub fn run(shared: SharedState, tx: Sender<Action>, folder: PathBuf, show: bool)
             shared,
             tx,
             folder,
-            icon: icon(),
+            icons: Icons {
+                idle: icon(icon_tint(StateKind::Idle)),
+                paused: icon(icon_tint(StateKind::Paused)),
+                attention: icon(icon_tint(StateKind::Attention)),
+            },
             taskbar_message: RegisterWindowMessageW(taskbar.as_ptr()),
             last_error: String::new(),
             last_kind: StateKind::Idle,
@@ -631,6 +679,22 @@ mod tests {
         assert_eq!(beep_code(StateKind::Attention), MB_ICONASTERISK);
     }
     #[test]
+    fn icon_tint_maps_state_to_distinct_colors() {
+        // The three states must be visually distinct (P1-6 acceptance: the
+        // state→icon mapping is asserted without Win32).
+        let idle = icon_tint(StateKind::Idle);
+        let paused = icon_tint(StateKind::Paused);
+        let attention = icon_tint(StateKind::Attention);
+        assert_ne!(idle, paused, "idle and paused icons must differ");
+        assert_ne!(idle, attention, "idle and attention icons must differ");
+        assert_ne!(paused, attention, "paused and attention icons must differ");
+        // Each tint is a 3-byte RGB; the attention color is a warning red
+        // (high R, low G/B) so it pops against the dark tray.
+        assert!(attention[0] > 180 && attention[1] < 120 && attention[2] < 120);
+        // Paused reads as a calm blue (B dominant).
+        assert!(paused[2] > paused[0] && paused[2] > paused[1]);
+    }
+    #[test]
     fn timer_can_reenter_while_menu_context_is_alive() {
         use crate::app::Shared;
         use std::sync::{Arc, Mutex, mpsc};
@@ -655,7 +719,11 @@ mod tests {
                 shared: shared.clone(),
                 tx,
                 folder: PathBuf::new(),
-                icon: null_mut(),
+                icons: Icons {
+                    idle: null_mut(),
+                    paused: null_mut(),
+                    attention: null_mut(),
+                },
                 taskbar_message: WM_APP + 9,
                 last_error: String::new(),
                 last_kind: StateKind::Idle,
