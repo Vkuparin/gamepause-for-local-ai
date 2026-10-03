@@ -1,6 +1,6 @@
 # Validation
 
-Results below describe the native Rust preview tested on Windows on 2026-10-03. Automated tests, metadata compatibility, live behavior, and benchmarks are separate evidence.
+Results below describe the native Rust preview tested on Windows with LM Studio 0.4.25 on 2026-10-03. Automated tests, metadata compatibility, live behavior, and benchmarks are separate evidence.
 
 ## Automated checks
 
