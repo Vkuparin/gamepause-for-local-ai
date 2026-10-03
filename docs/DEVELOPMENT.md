@@ -56,6 +56,6 @@ Install Inno Setup 6 (tested with 6.7.3). Run:
 .\scripts\build_release.ps1 -Iscc 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
 ```
 
-This builds both native executables, copies docs and dependency licenses, packages a portable ZIP, compiles the per-user installer, and writes `dist\SHA256SUMS.txt`. Release optimizations use size optimization, LTO, stripping, and one codegen unit. Destination PCs need no language runtime.
+This builds both native executables, copies docs and dependency licenses, packages a portable ZIP, compiles the per-user installer, and writes `dist\SHA256SUMS.txt`. Release optimizations use size optimization, LTO, stripping, and one codegen unit. The Windows target config statically links the C runtime, avoiding a separate Visual C++ redistributable. Destination PCs need no language runtime. See the [Rust linkage reference](https://doc.rust-lang.org/reference/linkage.html#static-and-dynamic-c-runtimes).
 
 CI runs Windows tests, formatting, and Clippy. The tag-triggered release workflow builds distribution artifacts; publication is a separate action. Before publishing, inspect tracked files for private data, perform the live validation checklist, test install/uninstall/startup registration, verify checksums, and publish release notes with compatibility limits.

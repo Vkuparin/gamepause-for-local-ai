@@ -35,10 +35,10 @@ CPU share = process CPU seconds / wall seconds / logical CPU count × 100. Worki
 | Native Rust preview | 45.21 s | 0.5469 s | 16 | 0.0756% | 15.72 MiB |
 | Earlier private Python prototype | 45.28 s | 1.6094 s | 16 | 0.2221% | 47.42 MiB |
 
-Both samples came from the same Windows 11 / RTX 5090 PC in the Witcher 3 menu. They are short observations, not a controlled cross-machine benchmark. Runtime resources and error handling received small changes afterward; these figures describe the sampled native build. A paired gameplay frame-time benchmark remains separate work.
+Both samples came from the same Windows 11 / RTX 5090 PC in the Witcher 3 menu. They are short observations, not a controlled cross-machine benchmark. Runtime resources, C runtime linking, and error handling received small changes afterward; these figures describe the sampled native build. A paired gameplay frame-time benchmark remains separate work.
 
 ## Distribution validation
 
 The per-user installer, Start menu entry, executable version/icon metadata, sign-in Run entry, and uninstall cleanup are checked locally. Config/recovery retention is verified separately from removal of installed files. Startup registration is checked; this is not a reboot/sign-in acceptance test.
 
-Binary releases are unsigned previews. They include documentation, third-party licenses, and SHA-256 checksums. CI checks the tracked Rust source on Windows; the release workflow builds tagged distributions.
+The final portable executable was inspected to import only Windows system DLLs, without a separate Visual C++ runtime dependency. Binary releases are unsigned previews. They include documentation, third-party licenses, and SHA-256 checksums. CI checks the tracked Rust source on Windows; the release workflow builds tagged distributions.
