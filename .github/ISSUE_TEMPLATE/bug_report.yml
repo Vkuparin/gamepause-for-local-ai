@@ -1,0 +1,30 @@
+name: Bug report
+description: Report game detection, model restoration, or tray issues
+body:
+  - type: markdown
+    attributes:
+      value: Review and redact logs before sharing. Never include tokens or full launcher databases.
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: GamePause, Windows, LM Studio, and relevant launcher
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: textarea
+    id: behaviour
+    attributes:
+      label: Expected and actual behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized diagnostic excerpts
+      render: text

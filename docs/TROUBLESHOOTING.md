@@ -1,0 +1,49 @@
+# Troubleshooting
+
+## Gather diagnostics
+
+Quit the watcher first; it holds a lock on its data directory. From the installed/portable folder:
+
+```powershell
+.\GamePauseCLI.exe --doctor
+.\GamePauseCLI.exe --discover
+.\GamePauseCLI.exe --observe --headless --duration 30
+```
+
+Reports, `status.json`, `inventory.json`, and rotated `gamepause.log` files are in `%LOCALAPPDATA%\GamePause`. Use `--data-dir DIRECTORY` consistently for a custom installation. Doctor checks snapshot capture without unloading; it is not a full restore test. Review and redact reports before posting them.
+
+## A game is missed
+
+Check `inventory.json` after an inventory refresh. Newly installed launcher games normally appear within 30 seconds; Xbox package metadata can take five minutes when idle. Use **Refresh installed games** for a manual update. A game started before its installation metadata appears may be detected after the next refresh.
+
+Add its directory through `extra_games`, or add a parent directory through `game_roots`. Restart after editing configuration. Executables must run inside a recognized location. Protected processes cannot always be inspected without elevation; GamePause deliberately runs without administrator rights. The inaccessible-process count includes Windows services and does not mean all those processes are games.
+
+## A helper is treated as a game
+
+Add its executable name to `excluded_executables` (supports `*` and `?`) or its directory to `excluded_paths`. Keep custom roots narrow. Built-in exclusions cover common launcher, installer, crash reporting, and anti-cheat helpers; unusual helpers need explicit exclusions.
+
+## AI does not pause
+
+Verify `mode` is `active` and detection is enabled. LM Studio must be open with its local server on the configured port. `--doctor` should report `snapshot_ok`. Busy inference/queued requests defer capture; retry occurs after the backoff interval. A capture failure leaves models loaded and reports the error.
+
+If the CLI is missing, set `lms_path`. Native API or WebSocket failures can indicate a port, token, server, or LM Studio protocol compatibility problem. Upgrading LM Studio may require an updated GamePause version.
+
+## AI does not restore
+
+Wait until every recognized game process exits, then allow the configured 30-second delay and model load time. Manual pause can hold a session open. Check `last_error` in `status.json` and the log. Reopen LM Studio if you closed it.
+
+Recovery checks exact model selection, identifiers, TTL policy, raw load fields, and native configuration. A mismatch preserves `state.json`; it does not silently accept different settings. Missing model files, changed settings, or a conflicting instance with the same identifier need resolution. Restore manually in LM Studio if necessary, comparing the saved journal. Do not delete the journal just to dismiss an error.
+
+With GamePause quit and no game running, retry recovery using:
+
+```powershell
+.\GamePauseCLI.exe --restore
+```
+
+## Startup or multiple-instance problems
+
+Enable **Start with Windows** and check Windows Startup apps. The executable must still exist at the registered path. A second instance using the same data directory is refused. Quit the first instance before diagnostics/recovery or use a separate data directory for read-only experiments.
+
+## Models reload during gaming
+
+Keep `stop_server_during_gaming` enabled. Pause clients that independently restart the server, control models through other interfaces, or load models from LM Studio's UI. GamePause unloads captured instances; it is not a policy engine preventing every later model load.

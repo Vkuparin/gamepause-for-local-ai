@@ -1,0 +1,36 @@
+[package]
+name = "gamepause-lmstudio"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "A native Windows tray app that gives games room by pausing LM Studio models."
+repository = "https://github.com/Vkuparin/gamepause-lmstudio"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+regex = "1"
+roxmltree = "0.21"
+ureq = { version = "2.12", default-features = false, features = ["json"] }
+tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
+winreg = "0.55"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_Graphics_Gdi", "Win32_Security"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[[bin]]
+name = "GamePause"
+path = "src/main.rs"
+
+[[bin]]
+name = "GamePauseCLI"
+path = "src/cli.rs"
+
+[build-dependencies]
+winresource = "0.1.31"

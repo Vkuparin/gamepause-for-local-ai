@@ -1,0 +1,13 @@
+name: Feature or launcher support
+description: Suggest an improvement or report a launcher format variation
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: What problem would this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behaviour and alternatives

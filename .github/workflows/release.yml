@@ -1,0 +1,24 @@
+name: Build Windows release
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
+      - run: cargo test --locked
+      - run: choco install innosetup --version=6.7.3 -y --no-progress
+      - shell: pwsh
+        run: ./scripts/build_release.ps1 -Iscc 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GamePause-windows-x64
+          path: |
+            dist/*.zip
+            dist/*-Setup.exe
+            dist/SHA256SUMS.txt

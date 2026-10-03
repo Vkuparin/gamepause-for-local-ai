@@ -1,0 +1,11 @@
+/target/
+/dist/
+/build/
+config.json
+state.json
+status.json
+inventory.json
+*-report.json
+*.log*
+.env*
+!config.example.json

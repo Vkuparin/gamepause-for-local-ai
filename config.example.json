@@ -1,0 +1,16 @@
+{
+  "mode": "observe",
+  "poll_seconds": 2,
+  "discovery_seconds": 30,
+  "restore_delay_seconds": 30,
+  "retry_seconds": 30,
+  "stop_server_during_gaming": true,
+  "lms_path": "",
+  "api_host": "127.0.0.1:1234",
+  "steam_roots": [],
+  "epic_manifest_dirs": [],
+  "game_roots": [],
+  "extra_games": [],
+  "excluded_executables": [],
+  "excluded_paths": []
+}
