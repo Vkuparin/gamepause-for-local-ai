@@ -247,6 +247,22 @@ pub fn main(console: bool) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("{e:#}"))
             .context("LM Studio server is not available")?;
         let report = crate::engine::verify_backend(backend);
+        // P2-4: record the WS protocol outcome for each step, local-only.
+        // `lms version` is a read-only CLI call (no server action), so this is
+        // safe to run alongside the verify; if the CLI is absent we log
+        // "unavailable" rather than dropping the line. `backend` is already the
+        // unwrapped `&mut LMStudio` here (the `--verify` path unwrapped it).
+        let lms_path = backend.lms.to_string_lossy().to_string();
+        let version = crate::lmstudio::run_command(
+            &lms_path,
+            &["version"],
+            std::time::Duration::from_secs(5),
+        )
+        .map(|b| String::from_utf8_lossy(&b).trim().to_string())
+        .unwrap_or_else(|e| format!("unavailable: {e:#}"));
+        for step in &report.steps {
+            crate::lmstudio::ws_log(&folder, &version, &step.name, step.ok, &step.detail);
+        }
         let pretty = serde_json::to_string_pretty(&report)?;
         write_json(&folder.join("verify-report.json"), &report)?;
         println!("{pretty}");

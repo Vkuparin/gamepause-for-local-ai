@@ -436,6 +436,57 @@ pub fn diagnostics(
         }
     })
 }
+
+// ── P2-4: per-capture/restore WS protocol logging (local-only) ──────────────
+// On every WS operation (loadModel / channelCreate / getLoadConfig read-back)
+// GamePause records the LM Studio version and a `success` or `failed:<field>`
+// line, where <field> is the field that actually diverged. The line is pure
+// (testable without a live server) and the sink reuses the same local
+// gamepause.log format as the panic/doctor sink — never uploaded, never
+// sent to a remote service.
+/// The field that a step detail names as failing, if it names one. The field
+/// comparison and native-config checks phrase failures as "Restored load field
+/// <name> differs" / "Restored native <name> differs", so the field is the
+/// token after those markers. Returns `None` when the failure names no field
+/// (identity/TTL mismatch, a missing instance, …) or when the step succeeded.
+fn failing_field(detail: &str) -> Option<String> {
+    for marker in ["field ", "native "] {
+        if let Some(idx) = detail.find(marker) {
+            let token = detail[idx + marker.len()..]
+                .split(|c: char| c.is_whitespace() || c == ';')
+                .next()
+                .unwrap_or("");
+            if !token.is_empty() {
+                return Some(token.to_string());
+            }
+        }
+    }
+    None
+}
+/// Build one `gamepause.log` line for a WS protocol step. `ok` is the step's
+/// authoritative outcome (from `VerifyStep`), so success/failure is never
+/// guessed from free text; when a step failed and its detail names a field,
+/// that field is included (`failed:<field>`). The LM Studio version is always
+/// present so a line can be correlated with a specific protocol implementation.
+#[must_use]
+pub fn ws_log_line(version: &str, step: &str, ok: bool, detail: &str) -> String {
+    let outcome = if ok {
+        "success".to_string()
+    } else {
+        match failing_field(detail) {
+            Some(field) => format!("failed:{field}"),
+            None => "failed".to_string(),
+        }
+    };
+    format!("ws {step} lm={version} {outcome}")
+}
+/// Append a WS protocol line to the local `gamepause.log` under `folder`.
+/// Local-only: this never transmits data and is a no-op if the directory is
+/// not writable (the app is still usable; the log is best-effort).
+pub fn ws_log(folder: &Path, version: &str, step: &str, ok: bool, detail: &str) {
+    let line = ws_log_line(version, step, ok, detail);
+    crate::app::log(folder, &line);
+}
 impl Backend for LMStudio {
     fn loaded(&mut self) -> Result<Vec<Value>> {
         self.cli(&["ps", "--json"])?
@@ -713,6 +764,101 @@ mod tests {
         // A genuinely missing directory is also not writable.
         let missing = std::env::temp_dir().join("gp_diag_definitely_missing_xyz");
         assert!(!crate::lmstudio::data_dir_writable(&missing));
+        let _ = std::fs::remove_file(&as_file);
+    }
+
+    // ── P2-4: WS protocol logging — a failing field produces a line naming it ──
+    // The acceptance test. Drives the REAL field-compare path (`compare_fields`,
+    // the exact source of a verify-fields failure detail), extracts the failing
+    // field with the REAL `failing_field`, and asserts the REAL `ws_log_line`
+    // names it. So the field the user sees in the verify report is the field
+    // that lands in gamepause.log.
+    #[test]
+    fn failing_field_produces_a_log_line_naming_that_field() {
+        // A restored config that drifts on `temperature` — the same mismatch the
+        // P2-1 acceptance test exercises. compare_fields reports it.
+        let expected = json!({"fields":[{"key":"temperature","value":0.7}]});
+        let actual = json!({"fields":[{"key":"temperature","value":0.999}]});
+        // The real failure detail, exactly as verify_backend would carry it
+        // (with a model identifier prefix, as in `format!("{id}: {err}")`).
+        let err = crate::lmstudio::compare_fields(&expected, &actual).unwrap_err();
+        let detail = format!("chat: {err}");
+        assert!(
+            detail.contains("temperature"),
+            "the real detail must name the field, got: {detail:?}"
+        );
+
+        // failing_field must pull out exactly that field from the real detail.
+        let field = crate::lmstudio::failing_field(&detail)
+            .expect("the failing field must be extractable from the detail");
+        assert_eq!(field, "temperature");
+
+        // The log line for that step names the field and carries the LM
+        // Studio version, so it can be correlated with a protocol build.
+        let line = crate::lmstudio::ws_log_line("v1.5.1 (x86_64)", "verify-fields", false, &detail);
+        assert!(
+            line.contains("failed:temperature"),
+            "log line must name the failing field, got: {line:?}"
+        );
+        assert!(
+            line.contains("lm=v1.5.1 (x86_64)"),
+            "log line must carry the LM Studio version, got: {line:?}"
+        );
+        assert!(
+            line.starts_with("ws verify-fields "),
+            "log line must identify the step, got: {line:?}"
+        );
+    }
+    // A passing step reports `success` — the outcome comes from the step's
+    // authoritative `ok`, never guessed from its detail text.
+    #[test]
+    fn successful_step_reports_success_regardless_of_detail() {
+        let line = crate::lmstudio::ws_log_line("v1.5.1", "capture", true, "2 model(s) captured");
+        assert!(
+            line.ends_with("success"),
+            "a successful step must report success, got: {line:?}"
+        );
+        assert!(
+            !line.contains("failed"),
+            "a success line must not say failed, got: {line:?}"
+        );
+    }
+    // A failure that names no field (identity/TTL mismatch, missing instance)
+    // still records a failure, just without a `:field` suffix.
+    #[test]
+    fn failure_without_a_named_field_is_still_recorded() {
+        let line = crate::lmstudio::ws_log_line(
+            "v1.5.1",
+            "restore",
+            false,
+            "Model identity/quantization mismatch; recovery retained",
+        );
+        assert!(
+            line.contains("failed"),
+            "a failure must be recorded, got: {line:?}"
+        );
+        assert!(
+            !line.contains("failed:"),
+            "no field was named, so the line must not carry a fake field, got: {line:?}"
+        );
+    }
+    // The sink writes to the local gamepause.log (best-effort) and is a no-op
+    // on an unwritable directory — never an error, never a remote call.
+    #[test]
+    fn ws_log_is_local_only_and_best_effort() {
+        let dir = std::env::temp_dir().join(format!("gp_wslog_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        crate::lmstudio::ws_log(&dir, "v1.5.1", "capture", true, "1 model(s) captured");
+        let content = std::fs::read_to_string(dir.join("gamepause.log")).unwrap_or_default();
+        assert!(
+            content.contains("ws capture lm=v1.5.1 success"),
+            "the log file must contain the ws line, got: {content:?}"
+        );
+        // Unwritable target (a file masquerading as a dir) must not panic.
+        let as_file = std::env::temp_dir().join(format!("gp_wslog_afile_{}", std::process::id()));
+        std::fs::write(&as_file, b"x").unwrap();
+        crate::lmstudio::ws_log(&as_file, "v1.5.1", "restore", false, "boom");
+        let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_file(&as_file);
     }
 }
