@@ -324,6 +324,35 @@ fn recovery_games(engine: &Engine<OptionalBackend>, games: &[Game]) -> Vec<Game>
     }
     known
 }
+/// Counts consecutive hard failures in the worker loop and, once a threshold
+/// is exceeded, flips the shared status to a visible "needs attention" state.
+/// Transient failures are logged and the loop continues — the monitor must
+/// degrade, not die, so a pending restore is never orphaned.
+#[derive(Default)]
+struct Monitor {
+    failures: u32,
+    needs_attention: bool,
+}
+impl Monitor {
+    const NEEDS_ATTENTION_AFTER: u32 = 10;
+    fn handle(&mut self, err: &str, folder: &std::path::Path, state: &SharedState) {
+        self.failures += 1;
+        log(
+            folder,
+            &format!("Transient failure ({} consecutive): {err}", self.failures),
+        );
+        if !self.needs_attention && self.failures >= Self::NEEDS_ATTENTION_AFTER {
+            self.needs_attention = true;
+            if let Ok(mut shared) = state.lock() {
+                shared.message =
+                    "Needs attention — repeated data-directory failures; check the data dir".into();
+            }
+        }
+    }
+    fn reset(&mut self) {
+        self.failures = 0;
+    }
+}
 fn run(
     mut engine: Engine<OptionalBackend>,
     folder: PathBuf,
@@ -365,34 +394,35 @@ fn run(
     let mut queued = None;
     let mut inventory_ready = false;
     let mut steam_roots = vec![];
-    let result = (|| -> Result<()> {
-        loop {
-            let now = start.elapsed().as_secs_f64();
-            if duration > 0. && now >= duration {
+    let mut monitor = Monitor::default();
+    loop {
+        let now = start.elapsed().as_secs_f64();
+        if duration > 0. && now >= duration {
+            break;
+        }
+        let actions = queued.take().into_iter().chain(commands.try_iter());
+        let mut quit = false;
+        for action in actions {
+            if matches!(action, Action::Quit) {
+                quit = true;
                 break;
             }
-            let actions = queued.take().into_iter().chain(commands.try_iter());
-            let mut quit = false;
-            for action in actions {
-                if matches!(action, Action::Quit) {
-                    quit = true;
-                    break;
-                }
-                if apply_action(
-                    action,
-                    &mut engine,
-                    &folder,
-                    &mut scanner,
-                    &games,
-                    now,
-                    &state,
-                )? {
-                    force_requested = true;
-                }
+            if apply_action(
+                action,
+                &mut engine,
+                &folder,
+                &mut scanner,
+                &games,
+                now,
+                &state,
+            )? {
+                force_requested = true;
             }
-            if quit {
-                break;
-            }
+        }
+        if quit {
+            break;
+        }
+        let tick = (|| -> Result<()> {
             if let Ok((updated, updated_errors, roots)) = result_rx.try_recv() {
                 inventory_ready = true;
                 steam_roots = roots;
@@ -493,22 +523,41 @@ fn run(
                 };
                 shared.discovery_errors = errors.clone();
             }
-            match commands.recv_timeout(Duration::from_secs_f64(engine.config.poll_seconds)) {
-                Ok(Action::Quit) => break,
-                Ok(action) => queued = Some(action),
-                Err(mpsc::RecvTimeoutError::Timeout) => (),
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    if duration == 0. {
-                        break;
+            Ok(())
+        })();
+        match tick {
+            Ok(()) => {
+                monitor.reset();
+                if monitor.needs_attention {
+                    monitor.needs_attention = false;
+                    if let Ok(mut shared) = state.lock() {
+                        shared.message = "Recovered — monitoring resumed".into();
                     }
+                    log(
+                        &folder,
+                        "Recovered from transient failures — monitoring resumed",
+                    );
+                }
+            }
+            Err(err) => {
+                let msg = format!("{err:#}");
+                monitor.handle(&msg, &folder, &state);
+            }
+        }
+        match commands.recv_timeout(Duration::from_secs_f64(engine.config.poll_seconds)) {
+            Ok(Action::Quit) => break,
+            Ok(action) => queued = Some(action),
+            Err(mpsc::RecvTimeoutError::Timeout) => (),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if duration == 0. {
+                    break;
                 }
             }
         }
-        Ok(())
-    })();
+    }
     drop(request_tx);
     let _ = inventory_worker.join();
-    result
+    Ok(())
 }
 pub fn log(folder: &std::path::Path, message: &str) {
     let file = folder.join("gamepause.log");
@@ -564,6 +613,83 @@ mod tests {
         assert!(engine.state.is_some());
         assert_eq!(before, fs::read(&path).unwrap());
         fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn worker_survives_repeated_data_dir_failures_and_flags_attention() {
+        // The data dir is a *file*, so every write_json (status.json, and
+        // inventory.json once discovery replies) fails. Pre-P0-1 this was fatal:
+        // run() returned Err and the app died, orphaning any pending restore.
+        // Now each tick degrades, and after a bounded number of consecutive
+        // failures the shared status flips to a visible "needs attention" state.
+        let base =
+            std::env::temp_dir().join(format!("gamepause-resilience-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let folder = base.join("data"); // created as a FILE below
+        fs::write(&folder, "block").unwrap();
+
+        let config = Config::default();
+        let engine = Engine::new(
+            config.clone(),
+            OptionalBackend {
+                backend: None,
+                config: config.clone(),
+            },
+            folder.join("state.json"),
+        )
+        .unwrap();
+        let state = Arc::new(Mutex::new(Shared::default()));
+        let (tx, rx) = mpsc::channel();
+        drop(tx); // force recv_timeout to Disconnected immediately -> fast loop
+
+        let result = run(engine, folder.clone(), state.clone(), rx, 1.0, false);
+        assert!(result.is_ok(), "worker must degrade, not die: {result:?}");
+        let shared = state.lock().unwrap();
+        assert!(
+            shared.message.contains("Needs attention"),
+            "expected the needs-attention flip, got: {:#}",
+            shared.message
+        );
+        drop(shared);
+        fs::remove_file(&folder).unwrap();
+        fs::remove_dir_all(&base).unwrap();
+    }
+    #[test]
+    fn single_failure_does_not_flag_and_ten_consecutive_do() {
+        // P0-1 acceptance: one transient failure must NOT flip the visible status;
+        // only a bounded run of consecutive failures (N=10) does. The Monitor is
+        // the unit under test so the threshold is exact, not timing-dependent.
+        let base = std::env::temp_dir().join(format!("gamepause-monitor-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let state = Arc::new(Mutex::new(Shared::default()));
+        let mut monitor = Monitor::default();
+
+        monitor.handle("boom", &base, &state);
+        assert_eq!(monitor.failures, 1);
+        assert!(!monitor.needs_attention);
+        assert!(
+            !state.lock().unwrap().message.contains("Needs attention"),
+            "a single failure must not flip the status"
+        );
+
+        for _ in 0..9 {
+            monitor.handle("boom", &base, &state);
+        }
+        assert_eq!(monitor.failures, 10);
+        assert!(
+            monitor.needs_attention,
+            "10 consecutive failures must flip the status"
+        );
+        assert!(state.lock().unwrap().message.contains("Needs attention"));
+
+        // A recovery resets the counter; one more single failure must not re-flag.
+        monitor.reset();
+        assert_eq!(monitor.failures, 0);
+        monitor.handle("boom", &base, &state);
+        assert_eq!(monitor.failures, 1);
+
+        fs::remove_dir_all(&base).unwrap();
     }
     #[test]
     fn settings_apply_live_persist_and_invalid_updates_leave_previous_settings() {
