@@ -16,8 +16,8 @@ GamePause is a small native Rust app for Windows. It notices when a game starts,
 - Stops LM Studio's HTTP server during gaming by default to prevent HTTP clients from immediately loading models again.
 - Waits 30 seconds after the last game exits. Starting another game cancels the delay; alt-tabbing keeps AI paused.
 - Keeps a durable recovery journal through partial failures and restarts.
-- Verifies the full pause/restore round-trip on demand: capture, unload, confirm the server emptied, restore, and field-compare the read-back settings — from the dashboard, tray, or `GamePauseCLI.exe --verify`.
-- Stable one-line-per-item CLI output for scripting: `--status` (key=value state), `--games` (name/launcher/path), plus `--doctor` and `--verify`; works while a GUI instance is running.
+- Tests the full pause/restore round-trip on demand, with durable recovery on failure: capture, unload, confirm the server emptied, restore, and field-compare the read-back settings — from the dashboard, tray, or `GamePauseCLI.exe --verify`.
+- Escaped one-line-per-item CLI output for scripting: `--status` (key=value state), `--games` (name/launcher/path), plus read-only `--doctor` and disruptive `--verify`. Status, cached games, and doctor work alongside the GUI; verify requires it to be closed.
 - Includes a native dashboard, searchable games, live settings, tray controls, automatic startup at Windows sign-in, a per-user installer, and a portable ZIP.
 
 No Python runtime, administrator service, telemetry, recursive game scans, or permanent model-name configuration. Model control uses localhost.
@@ -31,6 +31,8 @@ No Python runtime, administrator service, telemetry, recursive game scans, or pe
 Left-click the tray icon or open GamePause from Start to see its dashboard. The **Games** list shows what was discovered and what is running. Newly installed games become available automatically; no observation-mode trial, tooltip inspection, JSON edit, restart, or fixed model list is needed. If a game is missed, use **Running apps → Add selected as game**, or **Add game…** to select its executable.
 
 You do not need to start LM Studio's HTTP server manually. GamePause uses an already-running server's port, or temporarily opens the local server to capture loaded model settings, then returns it to its original state. Automatic-pausing, startup, exclusions, and optional connection/delay settings are controlled in the app.
+
+Round-trip testing unloads/reloads your current models. Close games and finish inference first. It refuses observation mode or existing recovery, and retains unfinished restoration for retry.
 
 Quit retains pending recovery for the next active run. Finish restoration before uninstalling. The installer and executables are currently unsigned; Windows may show a publisher warning. Download from this repository and compare the supplied SHA-256 checksums.
 
@@ -53,7 +55,7 @@ GamePause keeps a durable recovery journal for every model it unloads, and that 
 
 On one Windows 11 / RTX 5090 PC with 16 logical CPUs, the installed v0.2.0 watcher used **14.1 MiB RAM** and **0.055% of total CPU capacity** during a 46-second Witcher 3 menu sample, including an inventory refresh. The dashboard was closed. This measures the watcher, not FPS or all machines. See [Validation](docs/VALIDATION.md).
 
-This is a **0.2.0 preview**. Discovery is best effort. Protected processes and unconventional installations can require registering a game through the dashboard. Only the Steam / Witcher 3 lifecycle has been tested live. Other adapters have been checked against local installed metadata, not complete gameplay sessions.
+This is a **0.3.5 stabilisation preview**. Discovery is best effort. Protected processes and unconventional installations can require registering a game through the dashboard. Only the Steam / Witcher 3 lifecycle has been tested live. Other adapters have been checked against local installed metadata, not complete gameplay sessions.
 
 Complete settings preservation currently requires LM Studio's internal WebSocket protocol alongside its CLI and native REST API. Protocol changes can require a GamePause update. Run `GamePauseCLI.exe --doctor` after upgrading LM Studio. If a recoverable snapshot cannot be captured, GamePause refuses to unload. It does not launch LM Studio or supervise clients that independently restart its server.
 

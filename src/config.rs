@@ -81,8 +81,8 @@ impl Config {
             ("restore_delay_seconds", self.restore_delay_seconds, 0.),
             ("retry_seconds", self.retry_seconds, 5.),
         ] {
-            if !value.is_finite() || value < min {
-                bail!("{name} must be finite and >= {min}");
+            if !value.is_finite() || value < min || value > 86400. {
+                bail!("{name} must be finite and between {min} and 86400 seconds");
             }
         }
         if !["active", "observe"].contains(&self.mode.as_str()) {

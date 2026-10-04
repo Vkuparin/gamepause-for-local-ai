@@ -13,7 +13,7 @@ Destination PCs do not need Python, Node.js, Rust, or administrator rights. The 
 Download the setup EXE and `SHA256SUMS.txt` from [the same release](https://github.com/Vkuparin/gamepause-lmstudio/releases). Compare the published hash with:
 
 ```powershell
-Get-FileHash .\GamePause-0.2.0-Setup.exe -Algorithm SHA256
+Get-FileHash .\GamePause-0.3.5-Setup.exe -Algorithm SHA256
 ```
 
 The default installation path is `%LOCALAPPDATA%\Programs\GamePause`. Setup creates Start menu shortcuts and a Windows Installed apps entry. **Start GamePause automatically when I sign in to Windows** is checked by default. The desktop shortcut is optional.

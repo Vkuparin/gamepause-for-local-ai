@@ -49,6 +49,9 @@ fn background_utility(game: &Game) -> bool {
     .contains(&game.name.to_lowercase().as_str())
 }
 pub fn parse_vdf(text: &str) -> Result<Value> {
+    if text.len() > 16 * 1024 * 1024 {
+        bail!("Launcher metadata exceeds 16 MiB");
+    }
     let token = regex::Regex::new(r#"//[^\n]*|"((?:\\.|[^"\\])*)"|([{}])"#)?;
     let tokens: Vec<String> = token
         .captures_iter(text)
@@ -63,7 +66,15 @@ pub fn parse_vdf(text: &str) -> Result<Value> {
                 .or_else(|| c.get(2).map(|m| m.as_str().into()))
         })
         .collect();
-    fn object(tokens: &[String], position: &mut usize, nested: bool) -> Result<Value> {
+    fn object(
+        tokens: &[String],
+        position: &mut usize,
+        nested: bool,
+        depth: usize,
+    ) -> Result<Value> {
+        if depth > 64 {
+            bail!("KeyValues nesting exceeds 64 levels");
+        }
         let mut map = Map::new();
         while *position < tokens.len() {
             let key = &tokens[*position];
@@ -81,7 +92,7 @@ pub fn parse_vdf(text: &str) -> Result<Value> {
             let token = tokens.get(*position).context("Incomplete KeyValues")?;
             *position += 1;
             let value = if token == "{" {
-                object(tokens, position, true)?
+                object(tokens, position, true, depth + 1)?
             } else {
                 Value::String(
                     token
@@ -97,7 +108,7 @@ pub fn parse_vdf(text: &str) -> Result<Value> {
         }
         Ok(Value::Object(map))
     }
-    object(&tokens, &mut 0, false)
+    object(&tokens, &mut 0, false, 0)
 }
 fn env_path(key: &str, fallback: &str) -> PathBuf {
     PathBuf::from(std::env::var_os(key).unwrap_or_else(|| fallback.into()))
@@ -109,9 +120,23 @@ fn entries(path: &Path) -> Vec<PathBuf> {
         .filter_map(|r| r.ok().map(|e| e.path()))
         .collect()
 }
+fn read_metadata(path: impl AsRef<Path>) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(16 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > 16 * 1024 * 1024 {
+        bail!("Launcher metadata exceeds 16 MiB");
+    }
+    Ok(bytes)
+}
+fn read_metadata_text(path: impl AsRef<Path>) -> Result<String> {
+    Ok(String::from_utf8(read_metadata(path)?)?)
+}
 fn read_json(path: &Path) -> Result<Value> {
     Ok(serde_json::from_str(
-        fs::read_to_string(path)?.trim_start_matches('\u{feff}'),
+        read_metadata_text(path)?.trim_start_matches('\u{feff}'),
     )?)
 }
 fn reg_values(hive: usize, path: &str) -> Vec<BTreeMap<String, String>> {
@@ -241,6 +266,21 @@ impl Discovery {
     ) -> (Vec<Game>, String) {
         self.run_catchable(move |d| d.refresh(c, now, force, defer_packages))
     }
+    /// Only compiled for the production-profile regression example, never in default artifacts.
+    #[cfg(feature = "resilience-test")]
+    pub fn resilience_probe(&mut self) -> Result<()> {
+        let good = Game::new("Probe", "probe", "Retained", std::env::temp_dir());
+        self.retained.insert("Probe".into(), vec![good]);
+        let (games, panic) = self.run_catchable(|_| panic!("injected discovery panic"));
+        if games.len() != 1 || panic.is_empty() {
+            bail!("Panic recovery failed");
+        }
+        let (games, panic) = self.run_catchable(|d| d.finalize());
+        if games.len() != 1 || !panic.is_empty() {
+            bail!("Refresh after panic failed");
+        }
+        Ok(())
+    }
     fn steam(&mut self, c: &Config) -> Result<Vec<Game>> {
         let mut roots: BTreeSet<PathBuf> = c.steam_roots.iter().map(PathBuf::from).collect();
         roots.insert(env_path("ProgramFiles(x86)", r"C:\Program Files (x86)").join("Steam"));
@@ -252,7 +292,7 @@ impl Discovery {
         for root in roots.clone() {
             let file = root.join(r"steamapps\libraryfolders.vdf");
             if file.is_file() {
-                let v = parse_vdf(&fs::read_to_string(file)?)?;
+                let v = parse_vdf(&read_metadata_text(file)?)?;
                 let map = v
                     .get("libraryfolders")
                     .unwrap_or(&v)
@@ -282,7 +322,7 @@ impl Discovery {
                 {
                     continue;
                 }
-                let Ok(text) = fs::read_to_string(file) else {
+                let Ok(text) = read_metadata_text(file) else {
                     continue;
                 };
                 let Ok(v) = parse_vdf(&text) else { continue };
@@ -434,7 +474,7 @@ impl Discovery {
         }
         let file = env_path("PROGRAMDATA", r"C:\ProgramData").join(r"Battle.net\Agent\product.db");
         if file.is_file() {
-            let bytes = fs::read(file)?;
+            let bytes = read_metadata(file)?;
             for (key, record) in protobuf_fields(&bytes)? {
                 if key != 1 {
                     continue;
@@ -477,7 +517,7 @@ impl Discovery {
         for drive in b'C'..=b'Z' {
             let drive = PathBuf::from(format!("{}:\\", drive as char));
             let file = drive.join(".GamingRoot");
-            if let Ok(bytes) = fs::read(file)
+            if let Ok(bytes) = read_metadata(file)
                 && bytes.len() > 8
             {
                 let units: Vec<u16> = bytes[8..]
@@ -504,7 +544,7 @@ impl Discovery {
                     child.clone()
                 };
                 let file = location.join("MicrosoftGame.config");
-                if let Ok(text) = fs::read_to_string(file)
+                if let Ok(text) = read_metadata_text(file)
                     && let Ok(doc) = roxmltree::Document::parse(&text)
                 {
                     let id = doc
@@ -718,5 +758,15 @@ mod tests {
         );
         assert!(protobuf_fields(&[10, 50, 1]).is_err());
         assert!(protobuf_fields(&[128]).is_err());
+    }
+    #[test]
+    fn excessive_metadata_nesting_is_rejected_without_stack_exhaustion() {
+        let input = "\"key\" {".repeat(100) + &"}".repeat(100);
+        assert!(
+            parse_vdf(&input)
+                .unwrap_err()
+                .to_string()
+                .contains("nesting")
+        );
     }
 }

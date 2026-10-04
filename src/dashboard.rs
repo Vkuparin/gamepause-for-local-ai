@@ -87,9 +87,7 @@ pub fn feedback_position(settings_visible: bool, dpi: i32) -> (i32, i32, i32, i3
     )
 }
 
-/// Pure: the sys-color index a `WM_CTLCOLOR*` control paints its background with.
-/// Statics sit on the window background; buttons on the button face. Theme-correct
-/// in both light and dark because both are `GetSysColor`-backed.
+/// Classic system/contrast colors. This does not opt native client controls into app dark mode.
 #[must_use]
 pub fn ctlcolor_index(message: u32) -> SYS_COLOR_INDEX {
     if message == WM_CTLCOLORSTATIC {
@@ -336,7 +334,12 @@ const LAYOUT: [Layout; 31] = [
         // P1-4: owner-drawn rows so each game gets a state dot. `LBS_NOINTEGRALHEIGHT`
         // is dropped (owner-draw items have a fixed height we set in WM_MEASUREITEM,
         // so the listbox no longer rounds the last partial row).
-        style: WS_TABSTOP | WS_VSCROLL | WS_HSCROLL | LBS_NOTIFY as u32 | LBS_OWNERDRAWFIXED as u32,
+        style: WS_TABSTOP
+            | WS_VSCROLL
+            | WS_HSCROLL
+            | LBS_NOTIFY as u32
+            | LBS_OWNERDRAWFIXED as u32
+            | LBS_HASSTRINGS as u32,
         x: 24,
         y: 270,
         w: 836,
@@ -395,7 +398,7 @@ const LAYOUT: [Layout; 31] = [
     Layout {
         id: VERIFY,
         class: "BUTTON",
-        label: "Test round-trip",
+        label: "Reload models / test",
         style: WS_TABSTOP,
         x: 608,
         y: 594,
@@ -538,6 +541,45 @@ fn apply_settings_visibility(hwnd: HWND, dpi: i32, visible: bool) {
 /// between monitors re-scales the controls instead of bitmap-stretching them.
 fn relayout(hwnd: HWND, dpi: i32, settings_visible: bool) {
     unsafe {
+        let cached = snapshot().and_then(|s| s.fonts.get(&dpi).copied());
+        let font = cached.unwrap_or_else(|| {
+            CreateFontW(
+                -scale(16, dpi),
+                0,
+                0,
+                0,
+                400,
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET as u32,
+                0,
+                0,
+                CLEARTYPE_QUALITY as u32,
+                0,
+                wide("Segoe UI").as_ptr(),
+            )
+        });
+        if font.is_null() {
+            return;
+        }
+        STATE.with(|state| {
+            if let Some(s) = state.borrow_mut().as_mut() {
+                s.font = font;
+                s.fonts.insert(dpi, font);
+            }
+        });
+        // Controls may retain selected fonts in cached DCs until destruction.
+        // Keep one owned font per DPI and release them after all children die.
+        for e in LAYOUT {
+            SendMessageW(GetDlgItem(hwnd, e.id), WM_SETFONT, font as usize, 1);
+        }
+        SendMessageW(
+            GetDlgItem(hwnd, LIST),
+            LB_SETITEMHEIGHT,
+            0,
+            row_height(dpi) as isize,
+        );
         let mut rect: RECT = std::mem::zeroed();
         GetWindowRect(hwnd, &mut rect);
         MoveWindow(
@@ -595,6 +637,7 @@ struct WindowState {
     last_status: String,
     revision: u64,
     font: HFONT,
+    fonts: std::collections::BTreeMap<i32, HFONT>,
     settings_visible: bool,
 }
 thread_local! {static STATE:RefCell<Option<WindowState>>=const {RefCell::new(None)};}
@@ -1021,7 +1064,7 @@ unsafe fn measure_list_item(lparam: LPARAM, dpi: i32) {
 /// the item text. Background/text/selection come from system colors (correct in
 /// light and dark); the dot color is the pure `dot_color` mapping. If the index
 /// has no row (shouldn't happen) the row is just filled — never a crash.
-unsafe fn draw_list_item(lparam: LPARAM, index: usize, font: HFONT, rows: &[Row]) {
+unsafe fn draw_list_item(lparam: LPARAM, index: usize, font: HFONT, rows: &[Row], dpi: i32) {
     let (hdc, rc, selected);
     unsafe {
         let item = *(lparam as *const DRAWITEMSTRUCT);
@@ -1054,14 +1097,15 @@ unsafe fn draw_list_item(lparam: LPARAM, index: usize, font: HFONT, rows: &[Row]
 
         // State dot: small filled circle near the left edge, vertically centered.
         let mid_y = (rc.top + rc.bottom) / 2;
-        let r = 4i32;
-        let cx = rc.left + 12;
+        let r = scale(4, dpi);
+        let cx = rc.left + scale(12, dpi);
         let dot_brush = unsafe { CreateSolidBrush(dot_color(row.ignored, row.running)) };
         unsafe {
             let old_brush = SelectObject(hdc, dot_brush);
-            SelectObject(hdc, GetStockObject(BLACK_PEN)); // thin outline so it reads on any bg
+            let old_pen = SelectObject(hdc, GetStockObject(BLACK_PEN)); // thin outline so it reads on any bg
             Ellipse(hdc, cx - r, mid_y - r, cx + r, mid_y + r);
             SelectObject(hdc, old_brush);
+            SelectObject(hdc, old_pen);
         }
         unsafe {
             DeleteObject(dot_brush);
@@ -1069,9 +1113,9 @@ unsafe fn draw_list_item(lparam: LPARAM, index: usize, font: HFONT, rows: &[Row]
 
         // Item text, after the dot.
         let mut text_rect = RECT {
-            left: cx + r + 8,
+            left: cx + r + scale(8, dpi),
             top: rc.top,
-            right: rc.right - 4,
+            right: rc.right - scale(4, dpi),
             bottom: rc.bottom,
         };
         let label = wide(&row.label);
@@ -1131,6 +1175,18 @@ pub fn refresh() {
         set(
             GetDlgItem(state.hwnd, PAUSE),
             pause_button_label(shared.active_mode, shared.manual_pause),
+        );
+        EnableWindow(
+            GetDlgItem(state.hwnd, VERIFY),
+            i32::from(
+                shared.active_mode
+                    && !shared.pending
+                    && !shared.manual_pause
+                    && !shared.verifying
+                    && shared.discovery_ready
+                    && shared.active_games.is_empty()
+                    && shared.discovery_errors.is_empty(),
+            ),
         );
         EnableWindow(GetDlgItem(state.hwnd, PAUSE), i32::from(shared.active_mode));
         EnableWindow(
@@ -1330,7 +1386,9 @@ fn command(id: i32, notification: u32) {
         VERIFY => {
             // P2-1: round-trip test against the live backend. Runs in the
             // worker thread; the per-step result lands in the FEEDBACK line.
-            let _ = state.tx.send(Action::Verify);
+            if unsafe { tray::confirm_verify(state.hwnd) } {
+                crate::app::request_verify(&state.shared, &state.tx);
+            }
         }
         ADD => {
             if let Some(path) = browse(state.hwnd) {
@@ -1423,6 +1481,18 @@ fn show_error(hwnd: HWND, message: &str) {
     }
 }
 unsafe extern "system" fn procedure(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        procedure_inner(hwnd, message, w, l)
+    }))
+    .unwrap_or_else(|_| {
+        crate::app::log(
+            &crate::config::data_directory(),
+            "Dashboard callback panic contained",
+        );
+        0
+    })
+}
+unsafe fn procedure_inner(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     match message {
         WM_COMMAND => {
             command((w & 0xffff) as i32, ((w >> 16) & 0xffff) as u32);
@@ -1432,7 +1502,25 @@ unsafe extern "system" fn procedure(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
             refresh();
             0
         }
+        WM_SETTINGCHANGE | WM_THEMECHANGED => {
+            theme_changed();
+            0
+        }
         WM_DPICHANGED => {
+            if l != 0 {
+                unsafe {
+                    let rect = *(l as *const RECT);
+                    SetWindowPos(
+                        hwnd,
+                        null_mut(),
+                        rect.left,
+                        rect.top,
+                        rect.right - rect.left,
+                        rect.bottom - rect.top,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                }
+            }
             let dpi = (w >> 16) as i32;
             let settings_visible = snapshot().map(|s| s.settings_visible).unwrap_or(false);
             relayout(hwnd, dpi, settings_visible);
@@ -1460,7 +1548,13 @@ unsafe extern "system" fn procedure(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
             if item.CtlID == LIST as u32 {
                 let state = snapshot();
                 if let Some(st) = state {
-                    draw_list_item(l, item.itemID as usize, st.font, &st.rows);
+                    draw_list_item(
+                        l,
+                        item.itemID as usize,
+                        st.font,
+                        &st.rows,
+                        GetDpiForWindow(hwnd) as i32,
+                    );
                 }
                 1 // TRUE: handled
             } else {
@@ -1475,10 +1569,15 @@ unsafe extern "system" fn procedure(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
         }
         WM_DESTROY => {
             RUNNING_REQUESTED.store(false, Ordering::Relaxed);
+            0
+        }
+        WM_NCDESTROY => {
             let old = STATE.with(|s| s.borrow_mut().take());
             if let Some(old) = old {
                 unsafe {
-                    DeleteObject(old.font);
+                    for font in old.fonts.values() {
+                        DeleteObject(*font);
+                    }
                 }
             }
             0
@@ -1491,6 +1590,14 @@ pub fn is_dialog_message(msg: &MSG) -> bool {
         unsafe { IsDialogMessageW(state.hwnd, msg) != 0 }
     } else {
         false
+    }
+}
+pub fn theme_changed() {
+    if let Some(state) = snapshot() {
+        unsafe {
+            tray::apply_theme(state.hwnd);
+            InvalidateRect(state.hwnd, null(), 1);
+        }
     }
 }
 pub fn close() {
@@ -1595,6 +1702,7 @@ pub fn show(shared: SharedState, tx: Sender<Action>, folder: PathBuf) {
                 last_status: String::new(),
                 revision,
                 font,
+                fonts: [(dpi, font)].into_iter().collect(),
                 settings_visible: false,
             })
         });
@@ -1787,7 +1895,7 @@ mod tests {
         // rather than dereferenced — an empty/short list must not panic.
         let lp = &mut item as *mut _ as isize;
         unsafe {
-            super::draw_list_item(lp, 0, std::ptr::null_mut(), &[]);
+            super::draw_list_item(lp, 0, std::ptr::null_mut(), &[], 96);
         }
         assert_eq!(
             item.CtlID,
@@ -1878,20 +1986,20 @@ mod tests {
                     detail: "1 model(s) unloaded".into(),
                 },
                 crate::engine::VerifyStep {
-                    name: "verify-stopped".into(),
+                    name: "verify-unloaded".into(),
                     ok: false,
                     detail: "models still loaded after unload".into(),
                 },
             ],
             ok: false,
-            summary: "Round-trip verify failed at: verify-stopped".into(),
+            summary: "Round-trip verify failed at: verify-unloaded".into(),
         };
         let rendered = super::render_verify_report(&report);
         for needle in [
             "capture: 1 model(s) captured (ok)",
             "unload: 1 model(s) unloaded (ok)",
-            "verify-stopped: models still loaded after unload (FAIL)",
-            "Round-trip verify failed at: verify-stopped",
+            "verify-unloaded: models still loaded after unload (FAIL)",
+            "Round-trip verify failed at: verify-unloaded",
         ] {
             assert!(rendered.contains(needle), "missing {needle} in: {rendered}");
         }
@@ -1998,5 +2106,72 @@ mod tests {
         let err = super::apply_rename(&cfg, "C:\\Games\\App\\game.exe", "   ")
             .expect_err("a blank name must be rejected");
         assert!(err.contains("empty"), "got: {err}");
+    }
+    #[test]
+    #[ignore = "requires an interactive Windows desktop; opens the test dashboard"]
+    fn native_dashboard_rescales_font_and_fixed_rows_without_gdi_leaks() {
+        use std::sync::{Arc, Mutex, mpsc};
+        use windows_sys::Win32::System::Threading::{
+            GR_GDIOBJECTS, GetCurrentProcess, GetGuiResources,
+        };
+        let shared = Arc::new(Mutex::new(Shared {
+            active_mode: false,
+            ..Default::default()
+        }));
+        let (tx, _rx) = mpsc::channel();
+        show(shared, tx, PathBuf::new());
+        fn pump() {
+            unsafe {
+                let mut message: MSG = std::mem::zeroed();
+                while PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE) != 0 {
+                    TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
+            }
+        }
+        let hwnd = snapshot().unwrap().hwnd;
+        // Native controls allocate cached drawing resources on their first layout/paint.
+        for dpi in [96, 144, 192, 144, 96, 192, 96]
+            .into_iter()
+            .cycle()
+            .take(49)
+        {
+            relayout(hwnd, dpi, false);
+            pump();
+        }
+        let before = unsafe { GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS) };
+        for dpi in [96, 144, 192, 144, 96, 192, 96]
+            .into_iter()
+            .cycle()
+            .take(49)
+        {
+            relayout(hwnd, dpi, false);
+            pump();
+            let state = snapshot().unwrap();
+            let mut font: LOGFONTW = unsafe { std::mem::zeroed() };
+            unsafe {
+                assert_ne!(
+                    GetObjectW(
+                        state.font,
+                        std::mem::size_of::<LOGFONTW>() as i32,
+                        &mut font as *mut _ as *mut _
+                    ),
+                    0
+                );
+                assert_eq!(font.lfHeight, -scale(16, dpi));
+                assert_eq!(
+                    SendMessageW(GetDlgItem(hwnd, LIST), LB_GETITEMHEIGHT, 0, 0),
+                    row_height(dpi) as isize
+                );
+            }
+        }
+        theme_changed();
+        pump();
+        let after = unsafe { GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS) };
+        close();
+        assert!(
+            after <= before + 2,
+            "GDI handles leaked: {before} -> {after}"
+        );
     }
 }

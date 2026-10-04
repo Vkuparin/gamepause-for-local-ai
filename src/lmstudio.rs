@@ -39,6 +39,9 @@ pub trait Backend {
     fn loaded(&mut self) -> Result<Vec<Value>>;
     fn stop_server(&mut self) -> Result<()>;
     fn start_server(&mut self, port: u16) -> Result<()>;
+    fn ensure_server(&mut self, port: u16) -> Result<()> {
+        self.start_server(port)
+    }
     fn unload(&mut self, id: &str) -> Result<()>;
     fn restore(&mut self, model: &Model) -> Result<()>;
     /// Re-read the live load config for a model after it has been restored,
@@ -67,9 +70,63 @@ fn capture_with_server<B: Backend, T>(
     }
     captured
 }
+fn cli_version_tag(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let clean = regex::Regex::new(r"\x1b\[[0-?]*[ -/]*[@-~]")
+        .expect("constant ANSI pattern")
+        .replace_all(&text, "")
+        .into_owned();
+    let lines: Vec<_> = clean
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    lines
+        .iter()
+        .find(|s| {
+            s.starts_with("CLI commit:")
+                || s.to_lowercase().starts_with("lms version")
+                || s.starts_with("Version:")
+        })
+        .copied()
+        .or_else(|| {
+            if lines.len() == 1 {
+                lines.first().copied()
+            } else {
+                None
+            }
+        })
+        .unwrap_or("unknown")
+        .chars()
+        .take(200)
+        .collect()
+}
+fn control_port(server: &Value, api_host: &str) -> Result<u16> {
+    let running = server["running"]
+        .as_bool()
+        .context("Unsupported LM Studio server status")?;
+    if running {
+        let port = server["port"]
+            .as_u64()
+            .context("LM Studio server port missing")?;
+        let port = u16::try_from(port).context("Invalid LM Studio server port")?;
+        if port == 0 {
+            bail!("Invalid LM Studio server port");
+        }
+        Ok(port)
+    } else {
+        api_host
+            .rsplit_once(':')
+            .and_then(|(_, port)| port.parse::<u16>().ok())
+            .filter(|port| *port != 0)
+            .context("Invalid configured control port")
+    }
+}
 pub struct LMStudio {
     pub config: Config,
     pub lms: PathBuf,
+    log_folder: Option<PathBuf>,
+    cli_version: std::sync::OnceLock<String>,
 }
 impl LMStudio {
     pub fn new(config: Config) -> Result<Self> {
@@ -97,7 +154,81 @@ impl LMStudio {
             .into_iter()
             .find(|p| p.is_file())
             .context("Waiting for LM Studio: its CLI could not be found. Open LM Studio and install its CLI, or use Locate lms in GamePause")?;
-        Ok(Self { config, lms })
+        Ok(Self {
+            config,
+            lms,
+            log_folder: None,
+            cli_version: std::sync::OnceLock::new(),
+        })
+    }
+    pub fn set_log_folder(&mut self, folder: PathBuf) {
+        self.log_folder = Some(folder);
+    }
+    fn logged<T>(&self, step: &str, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+        let result = operation();
+        if let Some(folder) = &self.log_folder {
+            let version = self.cli_version.get_or_init(|| {
+                run_command(
+                    &self.lms.to_string_lossy(),
+                    &["version"],
+                    Duration::from_secs(5),
+                )
+                .map(|b| cli_version_tag(&b))
+                .unwrap_or_else(|_| "unknown".into())
+            });
+            // Errors are reduced to the differing field; never log transport payloads or credentials.
+            let detail = result
+                .as_ref()
+                .err()
+                .map(|e| format!("{e:#}"))
+                .unwrap_or_default();
+            ws_log(
+                folder,
+                &format!("cli:{version}"),
+                step,
+                result.is_ok(),
+                &detail,
+            );
+        }
+        result
+    }
+    /// Independent read-only probes; a stopped server is reported, never started.
+    pub fn doctor(&mut self, folder: &Path) -> Value {
+        fn probe<T: Serialize>(result: Result<T>) -> Value {
+            match result {
+                Ok(value) => json!({"ok":true,"value":value}),
+                Err(e) => json!({"ok":false,"error":format!("{e:#}")}),
+            }
+        }
+        let version = probe(
+            run_command(
+                &self.lms.to_string_lossy(),
+                &["version"],
+                Duration::from_secs(5),
+            )
+            .map(|b| cli_version_tag(&b)),
+        );
+        let server = probe(self.cli(&["server", "status", "--json"]));
+        let loaded = self.loaded();
+        let ws = match loaded.as_ref().ok().and_then(|m| m.first()) {
+            Some(model) if server["value"]["running"] == true => probe((|| {
+                let id = model["identifier"].as_str().context("Missing identifier")?;
+                self.raw_config(
+                    if model["type"] == "embedding" {
+                        "embedding"
+                    } else {
+                        "llm"
+                    },
+                    id,
+                )
+                .map(|_| "compatible")
+            })()),
+            _ => {
+                json!({"ok":null,"detail":"Not tested: requires a running server and loaded model"})
+            }
+        };
+        json!({"cli_version":version,"server":server,"loaded_models":probe(loaded),"ws_protocol":ws,
+            "data_dir":{"path":folder.to_string_lossy(),"writable":data_dir_writable(folder)},"read_only":true})
     }
     fn capture_snapshot(&mut self, loaded: Vec<Value>, server: Value) -> Result<Snapshot> {
         let mut snapshot = Snapshot {
@@ -135,6 +266,9 @@ impl LMStudio {
                 .flat_map(|m| m["loaded_instances"].as_array().into_iter().flatten())
                 .find(|m| m["id"] == id)
                 .context("Inventory changed during snapshot")?;
+            if !instance["config"].is_object() {
+                bail!("Unsupported native configuration; capture refused");
+            }
             snapshot.models.push(Model {
                 identifier: id.into(),
                 model_key: resolved_key(info)?,
@@ -209,10 +343,16 @@ impl LMStudio {
         Ok(socket)
     }
     fn raw_config(&self, namespace: &str, id: &str) -> Result<Value> {
+        self.logged(&format!("getLoadConfig:{namespace}:{id}"), || {
+            self.raw_config_inner(namespace, id)
+        })
+    }
+    fn raw_config_inner(&self, namespace: &str, id: &str) -> Result<Value> {
         let mut ws = self.socket(namespace)?;
         ws.send(Message::Text(json!({"type":"rpcCall","callId":1,"endpoint":"getLoadConfig","parameter":{"specifier":{"type":"query","query":{"identifier":id}}}}).to_string().into()))?;
+        let deadline = Instant::now() + Duration::from_secs(15);
         loop {
-            let v = receive(&mut ws)?;
+            let v = receive_until(&mut ws, deadline)?;
             if v["callId"] == 1 {
                 if v["type"] != "rpcResult" {
                     bail!("LM Studio rejected configuration query");
@@ -230,6 +370,12 @@ impl LMStudio {
         }
     }
     fn load_model(&self, model: &Model) -> Result<()> {
+        self.logged(
+            &format!("loadModel:{}:{}", model.namespace, model.identifier),
+            || self.load_model_inner(model),
+        )
+    }
+    fn load_model_inner(&self, model: &Model) -> Result<()> {
         // The native inventory associates instances with the catalog base key.
         // Loading by a variant/file key produces an instance omitted from that API.
         // Require the original variant to remain selected, then verify the exact
@@ -259,7 +405,7 @@ impl LMStudio {
             if started.elapsed() > Duration::from_secs(300) {
                 bail!("Model load timed out; recovery retained");
             }
-            let v = receive(&mut ws)?;
+            let v = receive_until(&mut ws, started + Duration::from_secs(300))?;
             if v["type"] == "channelError" || v["type"] == "communicationWarning" {
                 bail!(
                     "LM Studio model load failed: {}",
@@ -312,7 +458,15 @@ impl LMStudio {
     }
 }
 fn receive(ws: &mut WebSocket<TcpStream>) -> Result<Value> {
+    receive_until(ws, Instant::now() + Duration::from_secs(15))
+}
+fn receive_until(ws: &mut WebSocket<TcpStream>, deadline: Instant) -> Result<Value> {
     loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .context("LM Studio operation timed out; recovery retained")?;
+        ws.get_mut()
+            .set_read_timeout(Some(remaining.min(Duration::from_secs(180))))?;
         match ws.read()? {
             Message::Text(s) => return Ok(serde_json::from_str(&s)?),
             Message::Ping(bytes) => ws.send(Message::Pong(bytes))?,
@@ -478,7 +632,11 @@ pub fn ws_log_line(version: &str, step: &str, ok: bool, detail: &str) -> String 
             None => "failed".to_string(),
         }
     };
-    format!("ws {step} lm={version} {outcome}")
+    format!(
+        "ws {} lm={} {outcome}",
+        step.replace(['\r', '\n', '\t'], " "),
+        version.replace(['\r', '\n', '\t'], " ")
+    )
 }
 /// Append a WS protocol line to the local `gamepause.log` under `folder`.
 /// Local-only: this never transmits data and is a no-op if the directory is
@@ -497,9 +655,6 @@ impl Backend for LMStudio {
     fn snapshot(&mut self) -> Result<Snapshot> {
         let loaded = self.loaded()?;
         let mut server = self.cli(&["server", "status", "--json"])?;
-        if loaded.is_empty() {
-            return self.capture_snapshot(loaded, server);
-        }
         if loaded.iter().any(|m| {
             m["status"].as_str().is_some_and(|s| s != "idle")
                 || m["queued"].as_u64().unwrap_or(0) > 0
@@ -507,19 +662,12 @@ impl Backend for LMStudio {
             bail!("AI is busy; pause deferred until idle");
         }
         let temporary = server["running"] != true;
-        let port = if temporary {
-            self.config
-                .api_host
-                .rsplit_once(':')
-                .and_then(|(_, p)| p.parse::<u16>().ok())
-                .unwrap_or(1234)
-        } else {
-            server["port"]
-                .as_u64()
-                .context("LM Studio server port missing")? as u16
-        };
+        let port = control_port(&server, &self.config.api_host)?;
         self.config.api_host = format!("127.0.0.1:{port}");
         server["port"] = json!(port);
+        if loaded.is_empty() {
+            return self.capture_snapshot(loaded, server);
+        }
         capture_with_server(self, temporary, port, |backend| {
             backend.capture_snapshot(loaded, server)
         })
@@ -531,6 +679,23 @@ impl Backend for LMStudio {
     fn start_server(&mut self, port: u16) -> Result<()> {
         self.config.api_host = format!("127.0.0.1:{port}");
         self.cli(&["server", "start", "--port", &port.to_string()])?;
+        Ok(())
+    }
+    fn ensure_server(&mut self, port: u16) -> Result<()> {
+        let status = self.cli(&["server", "status", "--json"])?;
+        if !status["running"]
+            .as_bool()
+            .context("Unsupported LM Studio server status")?
+        {
+            return self.start_server(port);
+        }
+        let actual = status["port"]
+            .as_u64()
+            .context("LM Studio server port missing")?;
+        if actual != u64::from(port) {
+            bail!("Server port changed; recovery retained");
+        }
+        self.config.api_host = format!("127.0.0.1:{port}");
         Ok(())
     }
     fn unload(&mut self, id: &str) -> Result<()> {
@@ -546,7 +711,9 @@ impl Backend for LMStudio {
             .iter()
             .find(|m| m["identifier"] == model.identifier)
         {
-            return self.verify(model, info);
+            return self.logged(&format!("restore-verify:{}", model.identifier), || {
+                self.verify(model, info)
+            });
         }
         self.load_model(model)?;
         let loaded = self.loaded()?;
@@ -554,13 +721,51 @@ impl Backend for LMStudio {
             .iter()
             .find(|m| m["identifier"] == model.identifier)
             .context("Restored model missing")?;
-        self.verify(model, info)
+        self.logged(&format!("restore-verify:{}", model.identifier), || {
+            self.verify(model, info)
+        })
     }
     fn read_config(&mut self, model: &Model) -> Result<Value> {
         self.raw_config(&model.namespace, &model.identifier)
     }
 }
 pub fn run_command(program: &str, args: &[&str], timeout: Duration) -> Result<Vec<u8>> {
+    use std::{io::Read, os::windows::io::AsRawHandle};
+    use windows_sys::Win32::{Foundation::ERROR_BROKEN_PIPE, System::Pipes::PeekNamedPipe};
+    const CAP: usize = 4 * 1024 * 1024;
+    // Poll pipe availability on this thread: no unbounded reader joins or detached readers.
+    fn drain(
+        pipe: &mut (impl Read + AsRawHandle),
+        bytes: &mut Vec<u8>,
+        truncated: &mut bool,
+    ) -> Result<bool> {
+        let mut available = 0;
+        if unsafe {
+            PeekNamedPipe(
+                pipe.as_raw_handle(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut available,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) {
+                return Ok(true);
+            }
+            return Err(error.into());
+        }
+        if available != 0 {
+            let mut buffer = [0; 8192];
+            let count = pipe.read(&mut buffer[..(available as usize).min(8192)])?;
+            let retained = count.min(CAP.saturating_sub(bytes.len()));
+            bytes.extend_from_slice(&buffer[..retained]);
+            *truncated |= retained < count;
+        }
+        Ok(false)
+    }
     let mut child = Command::new(program)
         .args(args)
         .creation_flags(0x08000000)
@@ -568,41 +773,44 @@ pub fn run_command(program: &str, args: &[&str], timeout: Duration) -> Result<Ve
         .stderr(Stdio::piped())
         .spawn()
         .context("Unable to launch local command")?;
-    use std::io::Read;
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
-    // Drain both pipes so verbose output cannot deadlock the timeout loop.
-    let read = |stream: Box<dyn Read + Send>| {
-        std::thread::spawn(move || {
-            let mut b = Vec::new();
-            stream.take(4 * 1024 * 1024).read_to_end(&mut b).map(|_| b)
-        })
-    };
-    let out = read(Box::new(stdout));
-    let err = read(Box::new(stderr));
-    let start = Instant::now();
-    let status = loop {
-        if let Some(s) = child.try_wait()? {
-            break s;
+    let mut stdout = child.stdout.take().context("Command stdout unavailable")?;
+    let mut stderr = child.stderr.take().context("Command stderr unavailable")?;
+    let deadline = Instant::now() + timeout;
+    let result = (|| {
+        let (mut output, mut errors) = (Vec::new(), Vec::new());
+        let (mut out_done, mut err_done, mut truncated) = (false, false, false);
+        loop {
+            if Instant::now() >= deadline {
+                bail!("Local command timed out (including pipe completion)");
+            }
+            if !out_done {
+                out_done = drain(&mut stdout, &mut output, &mut truncated)?;
+            }
+            if !err_done {
+                err_done = drain(&mut stderr, &mut errors, &mut truncated)?;
+            }
+            if let Some(status) = child.try_wait()?
+                && out_done
+                && err_done
+            {
+                if truncated {
+                    bail!("Local command output exceeded 4 MiB and was truncated");
+                }
+                if !status.success() {
+                    bail!("Local command failed: {}", String::from_utf8_lossy(&errors));
+                }
+                return Ok(output);
+            }
+            std::thread::sleep(Duration::from_millis(2));
         }
-        if start.elapsed() > timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!("Local command timed out");
-        }
-        std::thread::sleep(Duration::from_millis(40));
-    };
-    let output = out
-        .join()
-        .map_err(|_| anyhow::anyhow!("Command output reader failed"))??;
-    let errors = err
-        .join()
-        .map_err(|_| anyhow::anyhow!("Command error reader failed"))??;
-    if !status.success() {
-        bail!("Local command failed: {}", String::from_utf8_lossy(&errors));
+    })();
+    if result.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
     }
-    Ok(output)
+    result
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -779,7 +987,7 @@ mod tests {
         // P2-1 acceptance test exercises. compare_fields reports it.
         let expected = json!({"fields":[{"key":"temperature","value":0.7}]});
         let actual = json!({"fields":[{"key":"temperature","value":0.999}]});
-        // The real failure detail, exactly as verify_backend would carry it
+        // The real failure detail, exactly as verify_round_trip would carry it
         // (with a model identifier prefix, as in `format!("{id}: {err}")`).
         let err = crate::lmstudio::compare_fields(&expected, &actual).unwrap_err();
         let detail = format!("chat: {err}");
@@ -860,5 +1068,152 @@ mod tests {
         crate::lmstudio::ws_log(&as_file, "v1.5.1", "restore", false, "boom");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_file(&as_file);
+    }
+    #[test]
+    fn websocket_ping_traffic_cannot_extend_operation_deadline() {
+        use std::net::TcpListener;
+        use tungstenite::protocol::Role;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let worker = std::thread::spawn(move || {
+            let (peer, _) = listener.accept().unwrap();
+            let mut ws = WebSocket::from_raw_socket(peer, Role::Server, None);
+            let end = Instant::now() + Duration::from_millis(250);
+            while Instant::now() < end {
+                if ws.send(Message::Ping(vec![1].into())).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let mut ws = WebSocket::from_raw_socket(stream, Role::Client, None);
+        let start = Instant::now();
+        assert!(receive_until(&mut ws, start + Duration::from_millis(80)).is_err());
+        assert!(start.elapsed() < Duration::from_millis(240));
+        drop(ws);
+        worker.join().unwrap();
+    }
+    #[test]
+    fn protocol_operation_logging_records_failure_without_leaking_payload() {
+        let mut backend = LMStudio {
+            config: Config::default(),
+            lms: PathBuf::new(),
+            log_folder: None,
+            cli_version: std::sync::OnceLock::new(),
+        };
+        let folder =
+            std::env::temp_dir().join(format!("gamepause-operation-log-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        backend.set_log_folder(folder.clone());
+        backend.cli_version.set("test-cli".into()).unwrap();
+        let result: Result<()> = backend.logged("getLoadConfig", || {
+            bail!("Restored load field contextLength differs; token=secret")
+        });
+        assert!(result.is_err());
+        let log = std::fs::read_to_string(folder.join("gamepause.log")).unwrap();
+        assert!(log.contains("getLoadConfig lm=cli:test-cli failed:contextLength"));
+        assert!(!log.contains("secret"));
+    }
+    #[test]
+    fn command_timeout_includes_inherited_pipe_handles() {
+        let started = Instant::now();
+        let result = run_command(
+            &std::env::current_exe().unwrap().to_string_lossy(),
+            &[
+                "--ignored",
+                "--exact",
+                "lmstudio::tests::command_descendant_fixture",
+                "--nocapture",
+            ],
+            Duration::from_millis(500),
+        );
+        assert!(result.unwrap_err().to_string().contains("pipe completion"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+    #[test]
+    #[ignore = "subprocess fixture: invoked only by command timeout regression"]
+    #[allow(clippy::zombie_processes)] // Deliberately outlives its parent to hold inherited pipes.
+    fn command_descendant_fixture() {
+        // Intentionally inherit these pipes and outlive the direct child.
+        let _child = Command::new("powershell.exe")
+            .creation_flags(0x08000000)
+            .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 2"])
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+    }
+    #[test]
+    fn oversized_output_is_drained_and_reported_as_truncated() {
+        let result = run_command(
+            &std::env::current_exe().unwrap().to_string_lossy(),
+            &[
+                "--ignored",
+                "--exact",
+                "lmstudio::tests::command_output_fixture",
+                "--nocapture",
+            ],
+            Duration::from_secs(5),
+        );
+        assert!(result.unwrap_err().to_string().contains("truncated"));
+    }
+    #[test]
+    #[ignore = "subprocess fixture: invoked only by output cap regression"]
+    fn command_output_fixture() {
+        std::io::stdout()
+            .write_all(&vec![b'x'; 4 * 1024 * 1024 + 65536])
+            .unwrap();
+    }
+    #[test]
+    fn actual_config_transport_logs_success_and_protocol_failure() {
+        use std::net::TcpListener;
+        for valid in [true, false] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let peer = std::thread::spawn(move || {
+                let mut ws = tungstenite::accept(listener.accept().unwrap().0).unwrap();
+                ws.read().unwrap(); // auth
+                ws.send(Message::Text(json!({"success":true}).to_string().into()))
+                    .unwrap();
+                ws.read().unwrap(); // getLoadConfig
+                ws.send(Message::Text(json!({"type":"rpcResult","callId":1,"result":if valid { json!({"fields":[]}) } else { json!({"unexpected":"secret"}) }}).to_string().into())).unwrap();
+                let _ = ws.read();
+            });
+            let folder = std::env::temp_dir().join(format!(
+                "gamepause-transport-{}-{valid}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&folder).unwrap();
+            let backend = LMStudio {
+                config: Config {
+                    api_host: address.to_string(),
+                    ..Default::default()
+                },
+                lms: PathBuf::new(),
+                log_folder: Some(folder.clone()),
+                cli_version: std::sync::OnceLock::new(),
+            };
+            backend.cli_version.set("fixture".into()).unwrap();
+            assert_eq!(backend.raw_config("llm", "instance").is_ok(), valid);
+            peer.join().unwrap();
+            let log = std::fs::read_to_string(folder.join("gamepause.log")).unwrap();
+            assert!(log.contains(&format!(
+                "getLoadConfig:llm:instance lm=cli:fixture {}",
+                if valid { "success" } else { "failed" }
+            )));
+            assert!(!log.contains("secret"));
+        }
+    }
+    #[test]
+    fn stopped_server_without_port_and_cli_banner_are_normalized() {
+        assert_eq!(
+            control_port(&json!({"running":false}), "127.0.0.1:4321").unwrap(),
+            4321
+        );
+        assert!(control_port(&json!({"running":true,"port":65536}), "127.0.0.1:4321").is_err());
+        assert_eq!(
+            cli_version_tag(b"\x1b[31mLOGO\x1b[0m\nCLI commit: 69d945a\nDocs: ignored"),
+            "CLI commit: 69d945a"
+        );
     }
 }

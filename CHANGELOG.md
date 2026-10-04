@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.5 — 2026-10-04 (stabilisation preview)
+
+- Make release discovery panics recoverable with unwinding; bound launcher metadata/nesting and contain native callback panics. Add a production-profile panic regression.
+- Journal round-trip verification before unloading, recover other models after partial failures, retain unresolved recovery, and preserve initially stopped/nondefault-port server state. Validate snapshots before mutation.
+- Guard verification against games, observation/manual pause, discovery errors, and pending recovery; confirm disruptive GUI tests and reject duplicate requests. CLI restore uses remembered games even after removal/exclusion.
+- Refuse CLI verify while the GUI owns the lock, reject conflicting commands, distinguish live status from stale files, and escape line delimiters/backslashes. Games remain a cached inventory.
+- Return independent doctor probes even when CLI/configuration/data-directory checks fail; doctor never changes model/server state. WS compatibility is unknown if it cannot be checked safely.
+- Log actual configuration/load/restore checks from normal and diagnostic paths, with instance identifiers and an accurately labelled cached CLI version. Bound WS operations and subprocess pipe completion; drain and report oversized output.
+- Notify pause/restore only on completion, keep pending recovery visible during countdown, scale fonts/list rows/drawing offsets across DPI, and cache fonts until child windows are destroyed.
+- Use the Windows app-theme preference for caption colour, follow theme changes, and respect high contrast. Full dark client controls and an embedded doctor view are explicitly deferred. System notification sounds are currently always enabled.
+- Refresh preview/docs/installer version and omit internal review/plan files from release documentation bundles. Schema-2 recovery and existing settings remain compatible.
+
+### Validation limits
+- Local automated, CLI process, release panic, and interactive popup/DPI checks are recorded in `docs/VALIDATION.md`. Live v0.3.5 LM Studio/gameplay and installer upgrade validation are still required before publication. Historical v0.2.0 performance measurements have not been relabelled.
+
 ## 0.3.0 — 2026-10-04 (preview)
 
 ### Resilience
@@ -9,18 +24,18 @@
 
 ### UX and native polish
 - Per-Monitor v2 DPI with `WM_DPICHANGED` relayout, so the dashboard stays crisp and unstretched across mixed-DPI multi-monitor setups.
-- Follow the Windows theme: DWM dark caption for the window and tray-anchored panel, and control colors taken from system brushes so light and dark both look native.
+- Follow the Windows theme: DWM dark caption for the window and tray-anchored panel, and control colors taken from classic system brushes; full dark client rendering remained incomplete.
 - **Status dots in the games list** — a colored dot per row: green = running, amber = automatic pausing off, gray = idle — so the per-game state reads at a glance as well as in the row text.
 - Group-box sectioning (Games / Settings / Actions) and a tighter, single-source-of-truth layout grid.
-- State toasts plus an optional system sound on pause, restore, and failure.
+- State toasts plus a system sound on pause, restore, and failure.
 - Tray icon now reflects state — idle, paused, and attention.
 - Usage-path fixes and expanded acceptance tests.
 
 ### Development and scripting
 - **Test round-trip (verify AI):** run the full capture → unload → confirm-server-emptied → restore → field-compare cycle on demand from the dashboard, the tray, or `GamePauseCLI.exe --verify`, and see which step failed.
-- **Diagnostics core:** a structured doctor report (LM Studio version, server state, loaded models, data-dir writability) backing both the `--doctor` panel and the CLI.
+- **Diagnostics core:** a structured doctor report (LM Studio version, server state, loaded models, data-dir writability) backing CLI output; an embedded dashboard diagnostics view remained incomplete.
 - **Stable CLI output for scripting:** `--status` (key=value state) and `--games` (name / launcher / path), plus `--doctor` and `--verify`; the read-only commands work while a GUI instance is running.
-- **Per-capture/restore WS logging:** each WebSocket step records the LM Studio version and a `success` or `failed:<field>` line (naming the diverged field) to the local log.
+- **Per-capture/restore WS logging:** CLI verification stage logs record the CLI version (actual WS instrumentation was completed in 0.3.5) and a `success` or `failed:<field>` line (naming the diverged field) to the local log.
 
 ### Documentation
 - README "Recovery" section: what to do if GamePause disappears mid-pause — relaunch it and the restore resumes.

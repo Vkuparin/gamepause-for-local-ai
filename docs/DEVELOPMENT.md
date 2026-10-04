@@ -74,3 +74,17 @@ cargo test --locked native_popup_survives_repeated_timer_reentry -- --ignored --
 This test opens and dismisses three native menus belonging to its own observation-only test process. Each must survive at least two actual status timer callbacks. It does not load or unload models, change startup settings, or send actions to the running watcher. Keep the desktop unlocked and avoid interacting with the test menus while it runs. It is excluded from unattended CI because popup tracking requires an interactive desktop.
 
 Win32 popup tracking runs a nested message loop. Never hold a UI-state RefCell borrow or shared-state mutex across native calls that may dispatch messages synchronously.
+
+## Stabilisation regression checks
+
+```powershell
+cargo run --locked --release --features resilience-test --example resilience_probe
+cargo test --locked native_popup_survives_repeated_timer_reentry -- --ignored --nocapture
+cargo test --locked native_dashboard_rescales_font_and_fixed_rows_without_gdi_leaks -- --ignored --nocapture
+```
+
+The feature-gated probe injects a discovery panic under the production release profile and verifies retention, subsequent refresh and local panic logging. It is not included in default release executables. Unit tests alone do not prove the release panic strategy. Interactive tests open only isolated test windows; protocol fixtures bind localhost and do not connect to LM Studio. Two ignored command fixtures are invoked as child processes by ordinary timeout/output-cap tests; do not run all ignored tests as a batch.
+
+Verification uses the normal staged schema-2 journal and shares the exclusion-free remembered-game guard. Per-model restore failure does not prevent recovering later models. Recovery is cleared on disk before it is forgotten in memory. Actual WS logging is best effort and labels its version source as CLI; transport payloads/authentication tokens are not logged. Operation-wide WS deadlines and polled Windows pipes prevent reader joins or irrelevant frames extending the wait forever.
+
+Native captions track the app-theme preference and theme-change messages, preserving high contrast. Classic client controls still use system colours; a complete dark client palette and embedded doctor view are deferred. DPI fonts are owned per window/DPI and freed after child destruction. The interactive regression warms native drawing caches, then checks another 49 relayouts for resource growth; this is not a physical multi-monitor appearance check.

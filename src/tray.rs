@@ -20,7 +20,11 @@ use windows_sys::Win32::{
     },
     System::Diagnostics::Debug::MessageBeep,
     System::LibraryLoader::GetModuleHandleW,
-    UI::{Shell::*, WindowsAndMessaging::*},
+    UI::{
+        Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW},
+        Shell::*,
+        WindowsAndMessaging::*,
+    },
 };
 use winreg::{RegKey, enums::*};
 
@@ -73,6 +77,8 @@ struct UI {
     taskbar_message: u32,
     last_error: String,
     last_kind: StateKind,
+    last_pause: u64,
+    last_restore: u64,
     menu_open: bool,
 }
 thread_local! {static UI_STATE:RefCell<Option<UI>>=const{RefCell::new(None)};}
@@ -120,6 +126,13 @@ pub fn show_existing(folder: &Path) -> bool {
             return false;
         }
         PostMessageW(window, SHOW_DASHBOARD, 0, 0) != 0
+    }
+}
+/// # Safety
+/// `hwnd` must be a live owner window or null.
+pub unsafe fn confirm_verify(hwnd: HWND) -> bool {
+    unsafe {
+        MessageBoxW(hwnd, wide("This test unloads and reloads every loaded model. Finish inference and close games first. Unfinished restoration is kept in the recovery journal. Continue?").as_ptr(), wide("Reload models and verify").as_ptr(), MB_YESNO | MB_ICONWARNING) == IDYES
     }
 }
 pub fn request_exit() {
@@ -214,13 +227,13 @@ pub fn icon_tint(kind: StateKind) -> [u8; 3] {
     }
 }
 /// Read the OS app-color preference. `true` = dark mode. The key/value is the
-/// documented `HKCU\...\Themes\Personalize\ColorsUseLightTheme` DWORD; a missing
+/// documented `HKCU\...\Themes\Personalize\AppsUseLightTheme` DWORD; a missing
 /// value or read error is treated as "light" (the Windows default) so the app
 /// never mis-colors a window it can't read.
 pub fn system_is_dark() -> bool {
     RegKey::predef(HKEY_CURRENT_USER)
         .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
-        .and_then(|k| k.get_value::<u32, _>("ColorsUseLightTheme"))
+        .and_then(|k| k.get_value::<u32, _>("AppsUseLightTheme"))
         .map(|v| v == 0)
         .unwrap_or(false)
 }
@@ -235,7 +248,16 @@ pub fn system_is_dark() -> bool {
 /// caller is responsible for not leaking an unowned handle.
 pub unsafe fn apply_theme(hwnd: HWND) {
     unsafe {
-        let use_dark: u32 = if system_is_dark() { 1 } else { 0 };
+        let mut contrast: HIGHCONTRASTW = std::mem::zeroed();
+        contrast.cbSize = size_of::<HIGHCONTRASTW>() as u32;
+        SystemParametersInfoW(
+            SPI_GETHIGHCONTRAST,
+            contrast.cbSize,
+            &mut contrast as *mut _ as *mut _,
+            0,
+        );
+        let use_dark: u32 =
+            u32::from(system_is_dark() && contrast.dwFlags & HCF_HIGHCONTRASTON == 0);
         let _ = DwmSetWindowAttribute(
             hwnd,
             DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
@@ -277,12 +299,12 @@ unsafe fn icon(color: [u8; 3]) -> HICON {
 }
 unsafe fn notification(hwnd: HWND, operation: u32, ui: &UI) {
     unsafe {
-        let (message, manual_pause) = ui
+        let (message, manual_pause, pending) = ui
             .shared
             .lock()
-            .map(|s| (s.message.clone(), s.manual_pause))
-            .unwrap_or_else(|_| ("GamePause".into(), false));
-        let kind = state_kind(&message, manual_pause);
+            .map(|s| (s.message.clone(), s.manual_pause, s.pending))
+            .unwrap_or_else(|_| ("GamePause".into(), false, false));
+        let kind = display_kind(&message, manual_pause, pending);
         let mut data: NOTIFYICONDATAW = std::mem::zeroed();
         data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
         data.hWnd = hwnd;
@@ -321,6 +343,32 @@ pub fn state_kind(message: &str, manual_pause: bool) -> StateKind {
         return StateKind::Paused;
     }
     StateKind::Idle
+}
+fn display_kind(message: &str, manual_pause: bool, pending: bool) -> StateKind {
+    let kind = state_kind(message, manual_pause);
+    if pending && kind == StateKind::Idle {
+        StateKind::Paused
+    } else {
+        kind
+    }
+}
+fn completion_notification(
+    last_pause: u64,
+    last_restore: u64,
+    pause: u64,
+    restore: u64,
+    old: StateKind,
+    kind: StateKind,
+) -> Option<StateKind> {
+    if restore != last_restore {
+        Some(StateKind::Idle)
+    } else if pause != last_pause {
+        Some(StateKind::Paused)
+    } else if kind == StateKind::Attention && old != kind {
+        Some(kind)
+    } else {
+        None
+    }
 }
 /// Toast severity. Pure data so the mapping is unit-testable (P1-5 acceptance).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -467,7 +515,12 @@ unsafe fn menu(hwnd: HWND, ui: &UI) {
             }
             3 => Some(Action::Disable),
             4 => Some(Action::Refresh),
-            10 => Some(Action::Verify),
+            10 => {
+                if confirm_verify(hwnd) {
+                    crate::app::request_verify(&ui.shared, &ui.tx);
+                }
+                None
+            }
             8 => Some(Action::Quit),
             5 | 9 => {
                 dashboard::show(ui.shared.clone(), ui.tx.clone(), ui.folder.clone());
@@ -492,7 +545,26 @@ unsafe fn menu(hwnd: HWND, ui: &UI) {
     }
 }
 unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        window_proc_inner(hwnd, message, w, l)
+    }))
+    .unwrap_or_else(|_| {
+        crate::app::log(
+            &crate::config::data_directory(),
+            "Tray callback panic contained",
+        );
+        0
+    })
+}
+unsafe fn window_proc_inner(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     match message {
+        WM_SETTINGCHANGE | WM_THEMECHANGED => {
+            unsafe {
+                apply_theme(hwnd);
+            }
+            dashboard::theme_changed();
+            0
+        }
         WM_TIMER => {
             if FINISHED.load(Ordering::Relaxed) {
                 unsafe {
@@ -532,24 +604,42 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, w: WPARAM, l: LP
                         current.last_error.clear();
                     }
                 });
-                // Edge-triggered toast + system sound on a state *transition*
-                // (pause-success, restore-success, restore/pause-failure), not on
-                // every tick — a held state toasts exactly once. The mapping and
-                // the `MessageBeep` code live in `state_toast` so the table is
-                // unit-testable (P1-5).
-                let kind = state_kind(&text, manual_pause);
-                UI_STATE.with(|state| {
+                let (pause, restore) = ui
+                    .shared
+                    .lock()
+                    .map(|s| (s.pause_completions, s.restore_completions))
+                    .unwrap_or((0, 0));
+                let kind = display_kind(&text, manual_pause, pending);
+                let event = UI_STATE.with(|state| {
                     let mut state = state.borrow_mut();
-                    let Some(current) = state.as_mut() else {
-                        return;
-                    };
-                    if kind != current.last_kind {
-                        current.last_kind = kind;
-                        unsafe {
-                            state_toast(hwnd, &text, kind);
-                        }
-                    }
+                    let current = state.as_mut()?;
+                    let event = completion_notification(
+                        current.last_pause,
+                        current.last_restore,
+                        pause,
+                        restore,
+                        current.last_kind,
+                        kind,
+                    );
+                    current.last_kind = kind;
+                    current.last_pause = pause;
+                    current.last_restore = restore;
+                    event
                 });
+                // Shell calls can reenter the callback: release all state borrows first.
+                if let Some(event) = event {
+                    unsafe {
+                        state_toast(
+                            hwnd,
+                            match event {
+                                StateKind::Idle => "AI restored — configuration verified",
+                                StateKind::Paused => "AI paused — recovery snapshot saved",
+                                StateKind::Attention => &text,
+                            },
+                            event,
+                        );
+                    }
+                }
             }
             0
         }
@@ -637,6 +727,8 @@ pub fn run(shared: SharedState, tx: Sender<Action>, folder: PathBuf, show: bool)
             taskbar_message: RegisterWindowMessageW(taskbar.as_ptr()),
             last_error: String::new(),
             last_kind: StateKind::Idle,
+            last_pause: 0,
+            last_restore: 0,
             menu_open: false,
         };
         UI_STATE.with(|state| *state.borrow_mut() = Some(ui));
@@ -795,6 +887,9 @@ mod tests {
             revision: 0,
             discovery_ready: false,
             verify_report: None,
+            verifying: false,
+            pause_completions: 0,
+            restore_completions: 0,
         }));
         UI_STATE.with(|state| {
             *state.borrow_mut() = Some(UI {
@@ -809,6 +904,8 @@ mod tests {
                 taskbar_message: WM_APP + 9,
                 last_error: String::new(),
                 last_kind: StateKind::Idle,
+                last_pause: 0,
+                last_restore: 0,
                 menu_open: false,
             })
         });
@@ -859,6 +956,9 @@ mod tests {
             revision: 0,
             discovery_ready: false,
             verify_report: None,
+            verifying: false,
+            pause_completions: 0,
+            restore_completions: 0,
         }));
         let (tx, _rx) = mpsc::channel();
         let driver = std::thread::spawn(|| {
@@ -943,6 +1043,29 @@ mod tests {
         assert!(
             !super::shell_execute_failed(v(0x0040_0000)),
             "a real HINSTANCE (a pointer-sized handle) is a success"
+        );
+    }
+    #[test]
+    fn notifications_follow_completions_not_countdowns_or_retry_states() {
+        assert_eq!(
+            display_kind("Restoring AI in 30s", false, true),
+            StateKind::Paused
+        );
+        assert_eq!(
+            completion_notification(0, 0, 1, 0, StateKind::Idle, StateKind::Paused),
+            Some(StateKind::Paused)
+        );
+        assert_eq!(
+            completion_notification(1, 0, 1, 0, StateKind::Paused, StateKind::Idle),
+            None
+        );
+        assert_eq!(
+            completion_notification(1, 0, 1, 1, StateKind::Paused, StateKind::Idle),
+            Some(StateKind::Idle)
+        );
+        assert_eq!(
+            completion_notification(1, 0, 1, 0, StateKind::Attention, StateKind::Idle),
+            None
         );
     }
 }

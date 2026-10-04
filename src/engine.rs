@@ -38,47 +38,74 @@ pub struct Engine<B: Backend> {
     /// Separate from `last_error` so a *pause* failure is never mislabelled as
     /// a restore failure.
     pub restore_failed: bool,
-    /// Populated by `verify_round_trip` (P2-1) with the per-step outcome, so
-    /// the dashboard and CLI can render the round-trip result without a live
-    /// side effect.
+    /// Latest report from the journalled, disruptive round-trip operation.
     pub verify_report: Option<crate::engine::VerifyReport>,
+    pub pause_completions: u64,
+    pub restore_completions: u64,
     quiet_since: Option<f64>,
     retry_at: f64,
 }
 
+fn validate_snapshot(snapshot: &Snapshot) -> Result<()> {
+    if !snapshot.server["running"].is_boolean()
+        || snapshot.server["port"]
+            .as_u64()
+            .is_none_or(|port| port == 0 || port > 65535)
+    {
+        bail!("Invalid recovery server settings; recovery retained");
+    }
+    if snapshot.schema != 2 {
+        bail!("Unsupported recovery format; preserve state.json and inspect manually");
+    }
+    {
+        if snapshot
+            .games
+            .iter()
+            .any(|g| g.name.is_empty() || !std::path::Path::new(&g.path).is_absolute())
+        {
+            bail!("Invalid recovery game location; recovery retained");
+        }
+        let mut identifiers = std::collections::BTreeSet::new();
+        for model in &snapshot.models {
+            if model.identifier.is_empty()
+                || model.model_key.is_empty()
+                || model.base_key.is_empty()
+                || !identifiers.insert(&model.identifier)
+                || !["llm", "embedding"].contains(&model.namespace.as_str())
+                || !["planned", "unloading", "unloaded", "restoring", "restored"]
+                    .contains(&model.stage.as_str())
+                || !model.load_config["fields"].is_array()
+                || !model.native_config.is_object()
+            {
+                bail!("Invalid recovery model; preserve state.json and inspect manually");
+            }
+        }
+    }
+    Ok(())
+}
+
 impl<B: Backend> Engine<B> {
     pub fn new(config: Config, backend: B, path: PathBuf) -> Result<Self> {
-        let state: Option<Snapshot> = if path.exists() {
-            serde_json::from_str(&fs::read_to_string(&path)?)?
-        } else {
-            None
+        let mut state: Option<Snapshot> = match fs::read_to_string(&path) {
+            Ok(text) => serde_json::from_str(&text)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
         };
-        if state.as_ref().is_some_and(|s| s.schema != 2) {
-            bail!("Unsupported recovery format; preserve state.json and inspect manually");
-        }
-        if let Some(snapshot) = &state {
-            if snapshot
-                .games
-                .iter()
-                .any(|g| g.name.is_empty() || !std::path::Path::new(&g.path).is_absolute())
+        if let Some(snapshot) = &mut state {
+            // Older schema-2 empty snapshots omitted the port when the server was stopped.
+            if snapshot.server["running"] == false
+                && snapshot.models.is_empty()
+                && snapshot.server.get("port").is_none()
             {
-                bail!("Invalid recovery game location; recovery retained");
+                snapshot.server["port"] = serde_json::json!(
+                    config
+                        .api_host
+                        .rsplit_once(':')
+                        .and_then(|(_, port)| port.parse::<u16>().ok())
+                        .unwrap_or(1234)
+                );
             }
-            let mut identifiers = std::collections::BTreeSet::new();
-            for model in &snapshot.models {
-                if model.identifier.is_empty()
-                    || model.model_key.is_empty()
-                    || model.base_key.is_empty()
-                    || !identifiers.insert(&model.identifier)
-                    || !["llm", "embedding"].contains(&model.namespace.as_str())
-                    || !["planned", "unloading", "unloaded", "restoring", "restored"]
-                        .contains(&model.stage.as_str())
-                    || !model.load_config["fields"].is_array()
-                    || !model.native_config.is_object()
-                {
-                    bail!("Invalid recovery model; preserve state.json and inspect manually");
-                }
-            }
+            validate_snapshot(snapshot)?;
         }
         let remembered_games = state.as_ref().map(|s| s.games.clone()).unwrap_or_default();
         Ok(Self {
@@ -93,6 +120,8 @@ impl<B: Backend> Engine<B> {
             manual_pause: false,
             restore_failed: false,
             verify_report: None,
+            pause_completions: 0,
+            restore_completions: 0,
             quiet_since: None,
             retry_at: 0.,
         })
@@ -194,17 +223,23 @@ impl<B: Backend> Engine<B> {
         }
     }
     pub fn pause(&mut self) -> Result<()> {
+        self.pause_guarded(&mut || false)
+    }
+    fn pause_guarded(&mut self, cancelled: &mut dyn FnMut() -> bool) -> Result<()> {
         if self.state.as_ref().is_some_and(|s| s.pause_complete) {
             self.message = "AI paused for gaming".into();
             return Ok(());
         }
         if self.state.is_none() {
-            self.state = Some(self.backend.snapshot()?);
+            let snapshot = self.backend.snapshot()?;
+            validate_snapshot(&snapshot)?;
+            self.state = Some(snapshot);
             self.state.as_mut().unwrap().games = self.remembered_games.clone();
             self.save()?;
         }
         if self.config.stop_server_during_gaming
-            && self.state.as_ref().unwrap().server["running"] == true
+            && (self.state.as_ref().unwrap().server["running"] == true
+                || self.state.as_ref().unwrap().server_stopped)
         {
             self.state.as_mut().unwrap().server_stopped = true;
             self.save()?;
@@ -212,6 +247,9 @@ impl<B: Backend> Engine<B> {
         }
         let count = self.state.as_ref().unwrap().models.len();
         for index in 0..count {
+            if cancelled() {
+                bail!("Game detected; recovery retained");
+            }
             let model = self.state.as_ref().unwrap().models[index].clone();
             if ["planned", "unloading", "restoring", "restored"].contains(&model.stage.as_str()) {
                 let loaded = self.backend.loaded()?;
@@ -226,10 +264,18 @@ impl<B: Backend> Engine<B> {
         }
         self.state.as_mut().unwrap().pause_complete = true;
         self.save()?;
+        self.pause_completions += 1;
         self.message = "AI paused for gaming".into();
         Ok(())
     }
     pub fn restore(&mut self, cancelled: &mut dyn FnMut() -> bool) -> Result<()> {
+        self.restore_checked(cancelled, false)
+    }
+    fn restore_checked(
+        &mut self,
+        cancelled: &mut dyn FnMut() -> bool,
+        compare: bool,
+    ) -> Result<()> {
         if self.state.is_none() {
             return Ok(());
         }
@@ -239,11 +285,19 @@ impl<B: Backend> Engine<B> {
         }
         self.state.as_mut().unwrap().pause_complete = false;
         self.save()?;
-        let state = self.state.as_ref().unwrap();
-        if state.server_stopped || !state.models.is_empty() {
+        let needs_server = self
+            .state
+            .as_ref()
+            .is_some_and(|state| state.server_stopped || !state.models.is_empty());
+        if needs_server {
+            // Persist control-server intent so a game interrupt can close a server we opened.
+            self.state.as_mut().unwrap().server_stopped = true;
+            self.save()?;
+            let state = self.state.as_ref().unwrap();
             self.backend
-                .start_server(state.server["port"].as_u64().unwrap_or(1234) as u16)?;
+                .ensure_server(state.server["port"].as_u64().unwrap_or(1234) as u16)?;
         }
+        let mut failures = Vec::new();
         for index in 0..self.state.as_ref().unwrap().models.len() {
             if cancelled() {
                 self.message = "Game restarted; restoration interrupted".into();
@@ -253,7 +307,16 @@ impl<B: Backend> Engine<B> {
             if ["unloading", "unloaded", "restoring", "restored"].contains(&model.stage.as_str()) {
                 self.state.as_mut().unwrap().models[index].stage = "restoring".into();
                 self.save()?;
-                self.backend.restore(&model)?;
+                let restored = self.backend.restore(&model).and_then(|()| {
+                    if compare {
+                        compare_fields(&model.load_config, &self.backend.read_config(&model)?)?;
+                    }
+                    Ok(())
+                });
+                if let Err(error) = restored {
+                    failures.push(format!("{}: {error:#}", model.identifier));
+                    continue;
+                }
                 self.state.as_mut().unwrap().models[index].stage = "restored".into();
                 self.save()?;
             }
@@ -262,182 +325,147 @@ impl<B: Backend> Engine<B> {
             self.message = "Game restarted; restoration interrupted".into();
             return Ok(());
         }
-        if self.state.as_ref().unwrap().server["running"] != true {
+        if !failures.is_empty() {
+            bail!("{}; recovery retained", failures.join("; "));
+        }
+        if self.state.as_ref().unwrap().server["running"] != true
+            && self.state.as_ref().unwrap().server_stopped
+        {
             self.backend.stop_server()?;
         }
+        // Do not forget pending recovery until clearing the disk succeeds.
+        write_json(&self.path, &Option::<Snapshot>::None)?;
         self.state = None;
         self.remembered_games.clear();
-        self.save()?;
         self.quiet_since = None;
+        self.restore_completions += 1;
         self.message = "AI restored".into();
         Ok(())
     }
-    /// P2-1: run the full capture → unload → verify-stopped → restore →
-    /// field-compare pipeline against the current LM Studio state and record
-    /// the per-step report on the engine. The pipeline itself lives in the
-    /// module-level [`verify_backend`] so the CLI can drive it directly against
-    /// a backend (no persistent state.json, no recovery journal).
-    pub fn verify_round_trip(&mut self) -> VerifyReport {
-        let report = verify_backend(&mut self.backend);
+    /// Round-trip the live models through the same durable journal as gaming.
+    /// The caller supplies a fail-closed game/quit guard checked between stages.
+    pub fn verify_round_trip(&mut self, cancelled: &mut dyn FnMut() -> bool) -> VerifyReport {
+        let mut steps = Vec::new();
+        let mut phase = "guard";
+        let result = (|| -> Result<()> {
+            if self.config.mode != "active"
+                || self.disabled
+                || self.manual_pause
+                || self.state.is_some()
+            {
+                bail!(
+                    "Verification unavailable in observe/disabled/paused mode or while recovery is pending"
+                );
+            }
+            if cancelled() {
+                bail!(
+                    "Verification unavailable while a game is running or detection is unavailable"
+                );
+            }
+            phase = "capture";
+            let snapshot = self.backend.snapshot()?;
+            validate_snapshot(&snapshot)?;
+            // A newly created transaction is schema 2 and remains readable by older builds.
+            self.state = Some(snapshot);
+            self.save()?;
+            steps.push(VerifyStep {
+                name: "capture".into(),
+                ok: true,
+                detail: "Snapshot persisted before unloading".into(),
+            });
+            let unloaded = self.pause_guarded(cancelled);
+            steps.push(VerifyStep {
+                name: "unload".into(),
+                ok: unloaded.is_ok(),
+                detail: unloaded
+                    .as_ref()
+                    .err()
+                    .map(|e| format!("{e:#}"))
+                    .unwrap_or_else(|| "Captured models unloaded".into()),
+            });
+            // Even a partial unload must be recovered; retain the original failure.
+            let check = if unloaded.is_ok() {
+                self.backend.loaded().and_then(|models| {
+                    if !models.is_empty() {
+                        bail!("Models still loaded after unload");
+                    }
+                    Ok(())
+                })
+            } else {
+                Ok(())
+            };
+            if unloaded.is_ok() {
+                steps.push(VerifyStep {
+                    name: "verify-unloaded".into(),
+                    ok: check.is_ok(),
+                    detail: check
+                        .as_ref()
+                        .err()
+                        .map(|e| format!("{e:#}"))
+                        .unwrap_or_else(|| "Inventory empty".into()),
+                });
+            }
+            let recovered = self.restore_checked(cancelled, true).and_then(|()| {
+                if self.state.is_some() {
+                    bail!("Game detected; restoration deferred, recovery pending");
+                }
+                Ok(())
+            });
+            steps.push(VerifyStep {
+                name: "restore".into(),
+                ok: recovered.is_ok(),
+                detail: recovered
+                    .as_ref()
+                    .err()
+                    .map(|e| format!("{e:#}"))
+                    .unwrap_or_else(|| "Models and original server state restored".into()),
+            });
+            steps.push(VerifyStep {
+                name: "verify-fields".into(),
+                ok: recovered.is_ok(),
+                detail: recovered
+                    .as_ref()
+                    .err()
+                    .map(|e| format!("{e:#}"))
+                    .unwrap_or_else(|| {
+                        "Load configuration verified before clearing recovery".into()
+                    }),
+            });
+            unloaded?;
+            check?;
+            recovered
+        })();
+        if let Err(error) = result {
+            if steps.is_empty() {
+                steps.push(VerifyStep {
+                    name: phase.into(),
+                    ok: false,
+                    detail: format!("{error:#}"),
+                });
+            }
+            self.last_error = format!("{error:#}");
+        }
+        let ok = !steps.is_empty() && steps.iter().all(|s| s.ok);
+        if ok {
+            self.last_error.clear();
+        }
+        let summary = if ok {
+            "Round-trip verify passed".into()
+        } else {
+            format!(
+                "Round-trip verify failed{}: {}",
+                if self.state.is_some() {
+                    " — recovery pending"
+                } else {
+                    ""
+                },
+                self.last_error
+            )
+        };
+        let report = VerifyReport { steps, ok, summary };
         self.verify_report = Some(report.clone());
         report
     }
-}
-/// Drive the P2-1 round-trip verification pipeline against a backend, with no
-/// game involved and no recovery journal written. Self-contained: it runs
-/// against whatever `Backend` it is given (the `Fake` mock in tests, the real
-/// LM Studio only when the user explicitly invokes it) and never touches the
-/// persistent state.json.
-///
-/// Returns a report with one entry per logical step (capture, unload,
-/// verify-stopped, restore, verify-fields). On any failure it stops there,
-/// records the exact failing field/detail, and still returns a report
-/// (ok = false) so the caller can render it rather than surface an opaque
-/// error.
-pub fn verify_backend<B: Backend>(backend: &mut B) -> VerifyReport {
-    let mut report_steps: Vec<VerifyStep> = Vec::new();
-    macro_rules! step {
-        ($name:expr, $ok:expr, $detail:expr) => {{
-            report_steps.push(VerifyStep {
-                name: $name.into(),
-                ok: $ok,
-                detail: $detail,
-            });
-        }};
-    }
-    let finish = |steps: &[VerifyStep]| -> VerifyReport {
-        let ok = !steps.is_empty() && steps.iter().all(|s| s.ok);
-        let summary = if ok {
-            "Round-trip verify passed: capture, unload, restore, and field-compare all succeeded"
-                .to_string()
-        } else {
-            let first_failure = steps
-                .iter()
-                .find(|s| !s.ok)
-                .map(|s| s.name.clone())
-                .unwrap_or_default();
-            format!("Round-trip verify failed at: {first_failure}")
-        };
-        VerifyReport {
-            steps: steps.to_vec(),
-            ok,
-            summary,
-        }
-    };
-
-    // 1. Capture the live state (snapshot). A failure here means we cannot
-    // round-trip at all.
-    let snapshot = match backend.snapshot() {
-        Ok(s) => s,
-        Err(e) => {
-            step!("capture", false, format!("{e:#}"));
-            return finish(&report_steps);
-        }
-    };
-    let models = snapshot.models.clone();
-    let server_was_running = snapshot.server["running"] == true;
-    step!(
-        "capture",
-        true,
-        format!("{} model(s) captured", models.len())
-    );
-
-    // 2. Unload each captured model (only if it is currently loaded — the
-    // snapshot said it was).
-    {
-        let mut detail = String::new();
-        let mut ok = true;
-        for model in &models {
-            let still_loaded = match backend.loaded() {
-                Ok(loaded) => loaded.iter().any(|m| m["identifier"] == model.identifier),
-                Err(e) => {
-                    ok = false;
-                    detail = format!("{e:#}");
-                    break;
-                }
-            };
-            if still_loaded && let Err(e) = backend.unload(&model.identifier) {
-                ok = false;
-                detail = format!("{}: {e:#}", model.identifier);
-                break;
-            }
-        }
-        if ok && detail.is_empty() {
-            detail = format!("{} model(s) unloaded", models.len());
-        }
-        step!("unload", ok, detail);
-        if !ok {
-            return finish(&report_steps);
-        }
-    }
-
-    // 3. Verify the server actually stopped (only meaningful when it was up).
-    if server_was_running {
-        match backend.loaded() {
-            Ok(loaded) if !loaded.is_empty() => {
-                step!(
-                    "verify-stopped",
-                    false,
-                    "models still loaded after unload".into()
-                );
-                return finish(&report_steps);
-            }
-            Ok(_) => step!("verify-stopped", true, "server empty".into()),
-            Err(e) => {
-                step!("verify-stopped", false, format!("{e:#}"));
-                return finish(&report_steps);
-            }
-        }
-    }
-
-    // 4. Restore each model.
-    {
-        let mut detail = String::new();
-        let mut ok = true;
-        for model in &models {
-            if let Err(e) = backend.restore(model) {
-                ok = false;
-                detail = format!("{}: {e:#}", model.identifier);
-                break;
-            }
-        }
-        if ok && detail.is_empty() {
-            detail = format!("{} model(s) restored", models.len());
-        }
-        step!("restore", ok, detail);
-        if !ok {
-            return finish(&report_steps);
-        }
-    }
-
-    // 5. Field-compare the read-back config against what we captured.
-    {
-        let mut detail = String::new();
-        let mut ok = true;
-        for model in &models {
-            match backend.read_config(model) {
-                Ok(actual) => match compare_fields(&model.load_config, &actual) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        ok = false;
-                        detail = format!("{}: {e:#}", model.identifier);
-                        break;
-                    }
-                },
-                Err(e) => {
-                    ok = false;
-                    detail = format!("{}: {e:#}", model.identifier);
-                    break;
-                }
-            }
-        }
-        if ok && detail.is_empty() {
-            detail = format!("{} config(s) match", models.len());
-        }
-        step!("verify-fields", ok, detail);
-    }
-
-    finish(&report_steps)
 }
 
 #[cfg(test)]
@@ -454,10 +482,19 @@ mod tests {
     struct Fake {
         current: BTreeSet<String>,
         running: bool,
+        port: u16,
+        fail_start: bool,
         events: Vec<String>,
         fail_unload: Option<String>,
         fail_restore: Option<String>,
         fail_stop: bool,
+        fail_read: Option<String>,
+        fail_loaded_on: Option<usize>,
+        loaded_calls: usize,
+        lock_after_unload: bool,
+        lock_after_restore: bool,
+        lock_after_stop: bool,
+        held_lock: Option<std::sync::Arc<std::fs::File>>,
         journal: PathBuf,
         /// When set, `read_config` returns a value that differs from the
         /// captured `load_config` (temperature 0.999 vs 0.7), so the P2-1
@@ -469,13 +506,34 @@ mod tests {
             Self {
                 current: ["chat".into(), "embed".into()].into_iter().collect(),
                 running: true,
+                port: 1234,
+                fail_start: false,
                 events: vec![],
                 fail_unload: None,
                 fail_restore: None,
                 fail_stop: false,
+                fail_read: None,
+                fail_loaded_on: None,
+                loaded_calls: 0,
+                lock_after_unload: false,
+                lock_after_restore: false,
+                lock_after_stop: false,
+                held_lock: None,
                 journal: PathBuf::new(),
                 mutate_read: false,
             }
+        }
+    }
+    impl Fake {
+        fn lock_journal(&mut self) {
+            use std::os::windows::fs::OpenOptionsExt;
+            self.held_lock = Some(std::sync::Arc::new(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(0)
+                    .open(&self.journal)
+                    .unwrap(),
+            ));
         }
     }
     impl Backend for Fake {
@@ -484,7 +542,7 @@ mod tests {
             Ok(Snapshot {
                 games: vec![],
                 schema: 2,
-                server: json!({"running":self.running,"port":1234}),
+                server: json!({"running":self.running,"port":self.port}),
                 server_stopped: false,
                 pause_complete: false,
                 models: self
@@ -503,7 +561,10 @@ mod tests {
                     .collect(),
             })
         }
-        fn read_config(&mut self, _: &Model) -> Result<Value> {
+        fn read_config(&mut self, model: &Model) -> Result<Value> {
+            if !self.running || self.fail_read.as_deref() == Some(&model.identifier) {
+                bail!("Configuration read failed");
+            }
             // Round-trip read-back: normally identical to the captured
             // load_config; with `mutate_read` the temperature drifts so the
             // verify field-compare reports exactly that field.
@@ -511,6 +572,10 @@ mod tests {
             Ok(json!({"fields":[{"key":"temperature","value":value}]}))
         }
         fn loaded(&mut self) -> Result<Vec<Value>> {
+            self.loaded_calls += 1;
+            if self.fail_loaded_on == Some(self.loaded_calls) {
+                bail!("Inventory read failed");
+            }
             Ok(self
                 .current
                 .iter()
@@ -523,11 +588,27 @@ mod tests {
                 bail!("stop failed");
             }
             self.running = false;
+            if self.lock_after_stop {
+                self.lock_journal();
+            }
             Ok(())
         }
-        fn start_server(&mut self, _: u16) -> Result<()> {
+        fn start_server(&mut self, port: u16) -> Result<()> {
             self.events.push("start".into());
+            if self.fail_start {
+                bail!("Server start failed");
+            }
+            self.port = port;
             self.running = true;
+            Ok(())
+        }
+        fn ensure_server(&mut self, port: u16) -> Result<()> {
+            if self.running && self.port != port {
+                bail!("Server port changed");
+            }
+            if !self.running {
+                self.start_server(port)?;
+            }
             Ok(())
         }
         fn unload(&mut self, id: &str) -> Result<()> {
@@ -549,14 +630,23 @@ mod tests {
                 bail!("unload failed");
             }
             self.current.remove(id);
+            if self.lock_after_unload {
+                self.lock_journal();
+            }
             Ok(())
         }
         fn restore(&mut self, m: &Model) -> Result<()> {
+            if !self.running {
+                bail!("REST/WS server is stopped");
+            }
             self.events.push(format!("restore:{}", m.identifier));
             if self.fail_restore.as_deref() == Some(&m.identifier) {
                 bail!("restore failed");
             }
             self.current.insert(m.identifier.clone());
+            if self.lock_after_restore {
+                self.lock_journal();
+            }
             Ok(())
         }
     }
@@ -853,7 +943,7 @@ mod tests {
     #[test]
     fn verify_reports_success_when_mock_round_trips() {
         let mut e = engine(Fake::new());
-        let report = e.verify_round_trip();
+        let report = e.verify_round_trip(&mut || false);
         assert!(
             report.ok,
             "expected a successful round-trip, got: {}",
@@ -861,11 +951,11 @@ mod tests {
         );
         let names: Vec<&str> = report.steps.iter().map(|s| s.name.as_str()).collect();
         // Capture, unload and verify-fields are always present; the server was
-        // running in the Fake, so verify-stopped is exercised too.
+        // running in the Fake, so verify-unloaded is exercised too.
         for expected in [
             "capture",
             "unload",
-            "verify-stopped",
+            "verify-unloaded",
             "restore",
             "verify-fields",
         ] {
@@ -883,7 +973,7 @@ mod tests {
     fn verify_reports_exact_failing_field_when_config_mutated() {
         let mut e = engine(Fake::new());
         e.backend.mutate_read = true;
-        let report = e.verify_round_trip();
+        let report = e.verify_round_trip(&mut || false);
         assert!(
             !report.ok,
             "expected a failing round-trip, got: {}",
@@ -891,7 +981,12 @@ mod tests {
         );
         // The field-compare step is the one that fails…
         let failing = report.steps.iter().find(|s| !s.ok).expect("a failing step");
-        assert_eq!(failing.name, "verify-fields");
+        assert!(
+            report
+                .steps
+                .iter()
+                .any(|s| s.name == "verify-fields" && !s.ok)
+        );
         // …and it names the exact field that drifted (temperature).
         assert!(
             failing.detail.contains("temperature"),
@@ -903,5 +998,212 @@ mod tests {
             "detail should carry compare_fields' message, got: {:?}",
             failing.detail
         );
+    }
+    #[test]
+    fn verify_guards_do_not_mutate_or_replace_recovery() {
+        for mode in 0..5 {
+            let mut e = engine(Fake::new());
+            match mode {
+                0 => e.config.mode = "observe".into(),
+                1 => e.manual_pause = true,
+                2 => e.disabled = true,
+                3 => {
+                    e.pause().unwrap();
+                }
+                _ => (),
+            }
+            let before = e.backend.events.clone();
+            let disk = fs::read(&e.path).ok();
+            assert!(!e.verify_round_trip(&mut || mode == 4).ok);
+            assert_eq!(before, e.backend.events);
+            assert_eq!(disk, fs::read(&e.path).ok());
+        }
+    }
+    #[test]
+    fn verify_restores_original_server_state_and_avoids_redundant_start() {
+        for running in [false, true] {
+            let mut b = Fake::new();
+            b.running = running;
+            let mut e = engine(b);
+            e.config.stop_server_during_gaming = false;
+            assert!(e.verify_round_trip(&mut || false).ok);
+            assert_eq!(e.backend.running, running);
+            assert_eq!(e.backend.current.len(), 2);
+            assert_eq!(
+                e.backend.events.iter().filter(|s| *s == "start").count(),
+                usize::from(!running)
+            );
+        }
+    }
+    #[test]
+    fn verify_partial_unload_and_inventory_failure_attempt_cleanup() {
+        for failure in 0..3 {
+            let mut b = Fake::new();
+            match failure {
+                0 => b.fail_unload = Some("chat".into()),
+                1 => b.fail_unload = Some("embed".into()),
+                _ => b.fail_loaded_on = Some(3),
+            }
+            let mut e = engine(b);
+            assert!(!e.verify_round_trip(&mut || false).ok);
+            assert_eq!(e.backend.current.len(), 2);
+            assert!(
+                e.state.is_none(),
+                "cleanup succeeded despite original failure"
+            );
+        }
+    }
+    #[test]
+    fn verify_restore_or_read_failure_recovers_other_models_and_survives_restart() {
+        for read in [false, true] {
+            let mut b = Fake::new();
+            if read {
+                b.fail_read = Some("chat".into());
+            } else {
+                b.fail_restore = Some("chat".into());
+            }
+            let mut e = engine(b);
+            let report = e.verify_round_trip(&mut || false);
+            assert!(!report.ok);
+            assert!(report.summary.contains("recovery pending"));
+            assert!(
+                e.backend.current.contains("embed"),
+                "later model must still recover"
+            );
+            let mut resumed =
+                Engine::new(e.config.clone(), e.backend.clone(), e.path.clone()).unwrap();
+            resumed.backend.fail_read = None;
+            resumed.backend.fail_restore = None;
+            resumed.restore(&mut || false).unwrap();
+            assert!(resumed.state.is_none());
+            assert_eq!(resumed.backend.current.len(), 2);
+        }
+    }
+    #[test]
+    fn verify_game_start_after_unload_retains_durable_recovery() {
+        let mut e = engine(Fake::new());
+        let mut calls = 0;
+        assert!(
+            !e.verify_round_trip(&mut || {
+                calls += 1;
+                calls >= 4
+            })
+            .ok
+        );
+        assert!(e.backend.current.is_empty());
+        assert!(e.state.is_some());
+        let mut resumed = Engine::new(e.config.clone(), e.backend.clone(), e.path.clone()).unwrap();
+        resumed.restore(&mut || false).unwrap();
+        assert_eq!(resumed.backend.current.len(), 2);
+    }
+    #[test]
+    fn verify_cannot_unload_when_initial_journal_write_fails() {
+        let mut e = engine(Fake::new());
+        fs::create_dir(&e.path).unwrap();
+        assert!(!e.verify_round_trip(&mut || false).ok);
+        assert_eq!(e.backend.events, vec!["snapshot"]);
+        assert_eq!(e.backend.current.len(), 2);
+    }
+    #[test]
+    fn restart_recovers_each_destructive_stage() {
+        for stage in ["unloading", "unloaded", "restoring", "restored"] {
+            let mut e = engine(Fake::new());
+            e.pause().unwrap();
+            for model in &mut e.state.as_mut().unwrap().models {
+                model.stage = stage.into();
+            }
+            e.save().unwrap();
+            let mut resumed =
+                Engine::new(e.config.clone(), e.backend.clone(), e.path.clone()).unwrap();
+            resumed.restore(&mut || false).unwrap();
+            assert!(resumed.state.is_none());
+            assert_eq!(resumed.backend.current.len(), 2);
+        }
+    }
+    #[test]
+    fn failed_stage_and_final_writes_keep_recovery_in_memory_and_on_disk() {
+        for boundary in 0..3 {
+            let mut b = Fake::new();
+            b.running = false;
+            match boundary {
+                0 => b.lock_after_unload = true,
+                1 => b.lock_after_restore = true,
+                _ => b.lock_after_stop = true,
+            }
+            let mut e = engine(b);
+            assert!(!e.verify_round_trip(&mut || false).ok);
+            assert!(e.state.is_some());
+            e.backend.held_lock = None;
+            e.backend.lock_after_unload = false;
+            e.backend.lock_after_restore = false;
+            e.backend.lock_after_stop = false;
+            let mut resumed =
+                Engine::new(e.config.clone(), e.backend.clone(), e.path.clone()).unwrap();
+            assert!(resumed.state.is_some());
+            resumed.restore(&mut || false).unwrap();
+            assert!(resumed.state.is_none());
+            assert_eq!(resumed.backend.current.len(), 2);
+        }
+    }
+    #[test]
+    fn interrupted_restore_of_initially_stopped_server_is_closed_on_repause() {
+        let mut b = Fake::new();
+        b.running = false;
+        let mut e = engine(b);
+        e.pause().unwrap();
+        let mut calls = 0;
+        e.restore(&mut || {
+            calls += 1;
+            calls >= 2
+        })
+        .unwrap();
+        assert!(e.backend.running);
+        e.pause().unwrap();
+        assert!(!e.backend.running);
+        assert!(e.backend.current.is_empty());
+    }
+    #[test]
+    fn verify_nondefault_port_and_server_failures_remain_recoverable() {
+        for failure in 0..3 {
+            let mut b = Fake::new();
+            b.running = false;
+            b.port = 4321;
+            b.fail_start = failure == 1;
+            b.fail_stop = failure == 2;
+            let mut e = engine(b);
+            let report = e.verify_round_trip(&mut || false);
+            assert_eq!(report.ok, failure == 0);
+            assert_eq!(e.backend.port, 4321);
+            if failure != 0 {
+                assert!(e.state.is_some());
+                e.backend.fail_start = false;
+                e.backend.fail_stop = false;
+                let mut resumed =
+                    Engine::new(e.config.clone(), e.backend.clone(), e.path.clone()).unwrap();
+                resumed.restore(&mut || false).unwrap();
+                assert!(resumed.state.is_none());
+            }
+            assert_eq!(e.backend.current.len(), if failure == 1 { 0 } else { 2 });
+        }
+    }
+    #[test]
+    fn externally_changed_port_does_not_load_into_another_server() {
+        let mut e = engine(Fake::new());
+        e.pause().unwrap();
+        e.backend.running = true;
+        e.backend.port = 4322;
+        assert!(e.restore(&mut || false).is_err());
+        assert!(e.backend.current.is_empty());
+        assert!(e.state.is_some());
+    }
+    #[test]
+    fn legacy_empty_stopped_server_journal_remains_schema_two_compatible() {
+        let mut e = engine(Fake::new());
+        write_json(&e.path, &json!({"schema":2,"server":{"running":false},"server_stopped":false,"models":[],"pause_complete":true})).unwrap();
+        e = Engine::new(e.config.clone(), e.backend.clone(), e.path.clone()).unwrap();
+        assert_eq!(e.state.as_ref().unwrap().schema, 2);
+        assert_eq!(e.state.as_ref().unwrap().server["port"], 1234);
+        e.restore(&mut || false).unwrap();
+        assert!(e.state.is_none());
     }
 }

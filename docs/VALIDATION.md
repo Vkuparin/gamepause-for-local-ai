@@ -1,5 +1,15 @@
 # Validation
 
+## v0.3.5 stabilisation checks — 2026-10-04
+
+- Windows x64, pinned Rust 1.98.1: 108 unit tests and 5 CLI process integration tests passed (four tests are ignored by default: two interactive tests and two subprocess fixtures exercised by ordinary regressions). The two interactive tests also passed explicitly. Checks include locked tests, formatting, Clippy (all targets/features), release build and feature-gated release panic probe. The probe catches an injected discovery panic, retains inventory, services a later refresh and confirms panic logging under the actual release profile.
+- Automated cases cover journal writes before unload, partial unload/inventory/restore/read-back failures, failed stage/final persistence, restart from each destructive stage, observation/pending/game guards, nondefault port and server start/stop failure, and closing a temporary control server after an interrupted restore.
+- CLI child-process tests cover busy instance locks, observation/corrupt-journal refusals, conflicting modes, live versus stale status, and structured doctor output with missing CLI/unwritable storage. Local WS fixtures check protocol logging and deadlines despite ping traffic; subprocess fixtures check inherited pipes and oversized output. These fixtures never connect to LM Studio.
+- Interactive popup/timer reentry passes. Interactive dashboard font and fixed-row scaling passes across 100/150/200% synthetic relayouts; after native caches warm up, another 49 relayouts show stable GDI usage. This checks native controls/resources, not physical multi-monitor visual appearance.
+- Full dark client controls and an embedded doctor view are deferred. Captions use the app-theme preference, track setting changes and preserve high contrast; classic client controls remain system-coloured.
+
+A read-only smoke test against the installed CLI (commit 69d945a) reported the HTTP server stopped, writable private report storage, and WS compatibility correctly unknown; it did not start the server or unload models. No live v0.3.5 unload/restore/gameplay or installer upgrade/uninstall tests were performed. The release-script PowerShell syntax check passed; Inno Setup compilation was not run because its compiler was unavailable. Those remain publication gates. Historical v0.2.0 lifecycle and performance results below retain their original versions and dates.
+
 Results below describe v0.2.0 tested on Windows with LM Studio 0.4.25 on 2026-10-03, with earlier release evidence identified separately. Automated tests, metadata compatibility, live behavior, and benchmarks are separate evidence.
 
 ## Automated checks

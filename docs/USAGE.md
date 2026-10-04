@@ -45,7 +45,11 @@ Selected rows show their path and why they are recognized. Discovery and save er
 .\GamePauseCLI.exe --verify
 ```
 
-If the app is not running, `--status` prints `status=absent` and `--games` prints `games=absent`; a corrupt state file is an explicit error, not silence. `--verify` needs a live LM Studio server and exits non-zero if any step fails.
+`--status` checks the instance lock and prints `status=absent` after quit/crash, even if an old status file remains. `--games` reads cached inventory and returns `games=absent` only when that file is missing. Permission/I/O errors and corrupt cached files are errors. Text fields escape backslashes, tabs, carriage returns and newlines as `\\`, `\t`, `\r`, `\n`; paths use the same escaping. `active_games` is a JSON array on one status line.
+
+`--verify` unloads/reloads all current models through a durable schema-2 recovery journal. Close the GUI and games and finish inference first. It rejects observation mode, discovery errors and existing recovery. A temporary server is used if needed, then returned to its original state after successful recovery. A game appearing between steps defers remaining loads. Failure/cancellation exits nonzero; unresolved models stay recoverable. The GUI action asks for confirmation and is unavailable during pause/recovery. `verify-unloaded` means an empty model inventory, not a stopped server.
+
+`--doctor` performs independent read-only LM Studio probes and also works while the GUI is open. It never starts/stops the server or loads/unloads models. A stopped server or no loaded model leaves the WS compatibility probe unknown. Reports/logs and a writability probe are local filesystem writes. An embedded dashboard doctor view is deferred; use CLI JSON output.
 
 ## Background AI applications
 

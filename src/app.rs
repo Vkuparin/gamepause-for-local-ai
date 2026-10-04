@@ -44,6 +44,9 @@ pub struct Shared {
     /// P2-1: the latest round-trip verify report, for the dashboard/CLI to
     /// render. `None` until a verify has been run.
     pub verify_report: Option<crate::engine::VerifyReport>,
+    pub verifying: bool,
+    pub pause_completions: u64,
+    pub restore_completions: u64,
 }
 pub type SharedState = Arc<Mutex<Shared>>;
 #[derive(Default)]
@@ -89,6 +92,21 @@ fn options() -> Result<Options> {
             _ => bail!("Unknown argument {arg}"),
         }
     }
+    if [
+        options.doctor,
+        options.discover,
+        options.restore,
+        options.verify,
+        options.status,
+        options.games,
+    ]
+    .into_iter()
+    .filter(|v| *v)
+    .count()
+        > 1
+    {
+        bail!("Choose only one of doctor/discover/restore/verify/status/games");
+    }
     if options.active && options.observe {
         bail!("Choose active or observe, not both");
     }
@@ -108,7 +126,7 @@ fn options() -> Result<Options> {
 fn format_status(status: &Value) -> String {
     let field = |key: &str| match status.get(key) {
         Some(Value::Null) | None => "-".to_string(),
-        Some(Value::String(s)) => s.clone(),
+        Some(Value::String(s)) => escape_field(s),
         Some(Value::Bool(b)) => bool_word(*b),
         Some(other) => other.to_string(),
     };
@@ -141,13 +159,20 @@ fn format_games(inventory: &Value) -> String {
         .map(|g| {
             format!(
                 "{}\t{}\t{}",
-                g["name"].as_str().unwrap_or(""),
-                g["launcher"].as_str().unwrap_or(""),
-                g["path"].as_str().unwrap_or("")
+                escape_field(g["name"].as_str().unwrap_or("")),
+                escape_field(g["launcher"].as_str().unwrap_or("")),
+                escape_field(g["path"].as_str().unwrap_or(""))
             )
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+fn escape_field(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\t', "\\t")
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
 }
 fn bool_word(b: bool) -> String {
     if b { "yes".into() } else { "no".into() }
@@ -163,7 +188,8 @@ fn status_output(folder: &Path) -> Result<String> {
                 serde_json::from_slice(&bytes).context("status.json is not valid JSON")?;
             Ok(format_status(&status))
         }
-        Err(_) => Ok("status=absent".into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok("status=absent".into()),
+        Err(e) => Err(e.into()),
     }
 }
 /// Read `inventory.json` and format it for stdout. A missing file (discovery
@@ -176,7 +202,8 @@ fn games_output(folder: &Path) -> Result<String> {
                 serde_json::from_slice(&bytes).context("inventory.json is not valid JSON")?;
             Ok(format_games(&inventory))
         }
-        Err(_) => Ok("games=absent".into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok("games=absent".into()),
+        Err(e) => Err(e.into()),
     }
 }
 pub fn main(console: bool) -> Result<()> {
@@ -187,11 +214,45 @@ pub fn main(console: bool) -> Result<()> {
     }
     if args.help {
         println!(
-            "GamePause for LM Studio\n--headless --active --observe --duration SECONDS\n--doctor --discover --restore --verify --status --games --data-dir PATH\nDefault: automatic pausing with a native dashboard. --background starts in the tray. --observe is a diagnostic override. --verify round-trips the loaded model and checks its fields. --status/--games print stable, parseable one-line-per-item output for scripting."
+            "GamePause for LM Studio\n--headless --active --observe --duration SECONDS\n--doctor --discover --restore --verify --status --games --data-dir PATH\nDefault: automatic pausing with a native dashboard. --background starts in the tray. --observe is a diagnostic override. --verify unloads/reloads all loaded models using durable recovery; close games and the GUI first. --doctor never starts/stops the server or unloads models. --status/--games print stable, parseable one-line-per-item output for scripting."
         );
         return Ok(());
     }
     let folder = args.folder.unwrap_or_else(config::data_directory);
+    if args.doctor {
+        let _ = fs::create_dir_all(&folder);
+        let config_result = (|| -> Result<Config> {
+            let value: Config = match fs::read_to_string(folder.join("config.json")) {
+                Ok(text) => serde_json::from_str(text.trim_start_matches('\u{feff}'))?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::default(),
+                Err(e) => return Err(e.into()),
+            };
+            value.validate()?;
+            Ok(value)
+        })();
+        let mut report = match config_result
+            .as_ref()
+            .map_err(|e| anyhow::anyhow!("{e:#}"))
+            .and_then(|c| LMStudio::new(c.clone()))
+        {
+            Ok(mut backend) => {
+                backend.set_log_folder(folder.clone());
+                backend.doctor(&folder)
+            }
+            Err(e) => {
+                json!({"cli_version":{"ok":false,"error":format!("{e:#}")}, "server":{"ok":null},"loaded_models":{"ok":null},"ws_protocol":{"ok":null},"data_dir":{"path":folder.to_string_lossy(),"writable":crate::lmstudio::data_dir_writable(&folder)},"read_only":true})
+            }
+        };
+        report["configuration"] = match config_result {
+            Ok(_) => json!({"ok":true}),
+            Err(e) => json!({"ok":false,"error":format!("{e:#}")}),
+        };
+        if let Err(e) = write_json(&folder.join("doctor-report.json"), &report) {
+            report["report_write_error"] = json!(format!("{e:#}"));
+        }
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
     fs::create_dir_all(&folder)?;
     let folder = fs::canonicalize(folder)?;
     install_panic_hook(&folder);
@@ -201,7 +262,24 @@ pub fn main(console: bool) -> Result<()> {
     // GUI instance holds it (the main use case: `gamepause --status` from a
     // script next to a live app). Output is one line per field/item.
     if args.status {
-        println!("{}", status_output(&folder)?);
+        let running = match config::lock(&folder) {
+            Ok(_) => false,
+            Err(e)
+                if e.downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.raw_os_error() == Some(32)) =>
+            {
+                true
+            }
+            Err(e) => return Err(e),
+        };
+        println!(
+            "{}",
+            if running {
+                status_output(&folder)?
+            } else {
+                "status=absent".into()
+            }
+        );
         return Ok(());
     }
     if args.games {
@@ -215,6 +293,7 @@ pub fn main(console: bool) -> Result<()> {
                 && !args.doctor
                 && !args.discover
                 && !args.restore
+                && !args.verify
                 && tray::show_existing(&folder)
             {
                 return Ok(());
@@ -237,99 +316,49 @@ pub fn main(console: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
-    let mut backend = LMStudio::new(config.clone());
-    if args.verify {
-        // P2-1: round-trip verify against the live backend. Intentionally
-        // driven directly on the backend — a diagnostic must not be blocked by
-        // a corrupt state.json — and it never touches the recovery journal.
-        let backend = backend
-            .as_mut()
-            .map_err(|e| anyhow::anyhow!("{e:#}"))
-            .context("LM Studio server is not available")?;
-        let report = crate::engine::verify_backend(backend);
-        // P2-4: record the WS protocol outcome for each step, local-only.
-        // `lms version` is a read-only CLI call (no server action), so this is
-        // safe to run alongside the verify; if the CLI is absent we log
-        // "unavailable" rather than dropping the line. `backend` is already the
-        // unwrapped `&mut LMStudio` here (the `--verify` path unwrapped it).
-        let lms_path = backend.lms.to_string_lossy().to_string();
-        let version = crate::lmstudio::run_command(
-            &lms_path,
-            &["version"],
-            std::time::Duration::from_secs(5),
-        )
-        .map(|b| String::from_utf8_lossy(&b).trim().to_string())
-        .unwrap_or_else(|e| format!("unavailable: {e:#}"));
-        for step in &report.steps {
-            crate::lmstudio::ws_log(&folder, &version, &step.name, step.ok, &step.detail);
-        }
-        let pretty = serde_json::to_string_pretty(&report)?;
-        write_json(&folder.join("verify-report.json"), &report)?;
-        println!("{pretty}");
-        if !report.ok {
-            bail!("{}", report.summary);
-        }
-        return Ok(());
-    }
-    // Observe mode must work even when LM Studio is absent.
-    if args.doctor {
-        // P2-2: route the live doctor report through the same diagnostics()
-        // core the unit test exercises, so the shape the user sees is the shape
-        // the test asserts. `lms version` is a local, read-only CLI call (it
-        // does not start the server); if the CLI is absent the core still
-        // assembles everything else and marks the version unknown.
-        let lms_path: String = match backend.as_ref() {
-            Ok(b) => b.lms.to_string_lossy().to_string(),
-            Err(_) => String::new(),
-        };
-        let version = crate::lmstudio::run_command(
-            &lms_path,
-            &["version"],
-            std::time::Duration::from_secs(5),
-        )
-        .map(|b| String::from_utf8_lossy(&b).trim().to_string())
-        .unwrap_or_else(|e| format!("unavailable: {e:#}"));
-        let backend = backend.as_mut().map_err(|e| anyhow::anyhow!("{e:#}"))?;
-        let snapshot = backend.snapshot()?;
-        let models: Vec<serde_json::Value> = snapshot
-            .models
-            .iter()
-            .map(|m| {
-                json!({
-                    "identifier": m.identifier,
-                    "modelKey": m.model_key,
-                    "namespace": m.namespace,
-                    "status": "loaded",
-                    "ttl_ms": m.ttl_ms,
-                })
-            })
-            .collect();
-        let data_dir_ok = crate::lmstudio::data_dir_writable(&folder);
-        let report =
-            crate::lmstudio::diagnostics(&version, &snapshot.server, &models, &folder, data_dir_ok);
-        write_json(&folder.join("doctor-report.json"), &report)?;
-        println!("{}", serde_json::to_string_pretty(&report)?);
-        return Ok(());
-    }
+    let backend = LMStudio::new(config.clone());
     let backend = OptionalBackend {
         backend: backend.ok(),
         config: config.clone(),
+        folder: Some(folder.clone()),
     };
     let mut engine = Engine::new(config.clone(), backend, folder.join("state.json"))?;
-    if args.restore {
-        let mut discovery = Discovery::default();
-        let games = discovery.refresh(&config, 0., true, false);
-        let mut scanner = Scanner::new(config)?;
-        if !scanner.scan(&games)?.is_empty() {
-            bail!("Close the detected game before restoring AI");
+    if args.restore || args.verify {
+        if config.mode != "active" {
+            bail!("Observe mode cannot restore or verify models");
         }
-        engine.restore(&mut || {
+        let mut discovery = Discovery::default();
+        let games = discovery.recover_refresh(&config, 0., true, false).0;
+        if !discovery.errors.is_empty() {
+            bail!(
+                "Resolve discovery errors before restoring or verifying: {:?}",
+                discovery.errors
+            );
+        }
+        let guard_games = recovery_games(&engine, &games);
+        let mut scanner = recovery_scanner(&config)?;
+        if !scanner.scan(&guard_games)?.is_empty() {
+            bail!("Close the detected game before restoring or verifying AI");
+        }
+        let mut cancelled = || {
             scanner
-                .scan(&games)
-                .map(|active| !active.is_empty())
-                .unwrap_or(true)
-        })?;
-        println!("{}", engine.message);
+                .scan(&guard_games)
+                .map_or(true, |active| !active.is_empty())
+        };
+        if args.verify {
+            let report = engine.verify_round_trip(&mut cancelled);
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            write_json(&folder.join("verify-report.json"), &report)?;
+            if !report.ok {
+                bail!("{}", report.summary);
+            }
+        } else {
+            engine.restore(&mut cancelled)?;
+            println!("{}", engine.message);
+            if engine.state.is_some() {
+                bail!("Restoration deferred; recovery pending");
+            }
+        }
         return Ok(());
     }
     let state = Arc::new(Mutex::new(Shared {
@@ -347,6 +376,9 @@ pub fn main(console: bool) -> Result<()> {
         revision: 0,
         discovery_ready: false,
         verify_report: None,
+        verifying: false,
+        pause_completions: 0,
+        restore_completions: 0,
     }));
     let (tx, rx) = mpsc::channel();
     if args.headless {
@@ -382,13 +414,18 @@ pub fn main(console: bool) -> Result<()> {
 struct OptionalBackend {
     backend: Option<LMStudio>,
     config: Config,
+    folder: Option<PathBuf>,
 }
 impl OptionalBackend {
     fn get(&mut self) -> Result<&mut LMStudio> {
         if self.backend.is_none() {
             self.backend = Some(LMStudio::new(self.config.clone())?);
         }
-        Ok(self.backend.as_mut().unwrap())
+        let backend = self.backend.as_mut().unwrap();
+        if let Some(folder) = &self.folder {
+            backend.set_log_folder(folder.clone());
+        }
+        Ok(backend)
     }
 }
 impl Backend for OptionalBackend {
@@ -403,6 +440,9 @@ impl Backend for OptionalBackend {
     }
     fn start_server(&mut self, p: u16) -> Result<()> {
         self.get()?.start_server(p)
+    }
+    fn ensure_server(&mut self, p: u16) -> Result<()> {
+        self.get()?.ensure_server(p)
     }
     fn unload(&mut self, id: &str) -> Result<()> {
         self.get()?.unload(id)
@@ -473,10 +513,7 @@ fn apply_action(
                 return Ok(false);
             }
             engine.manual_pause = false;
-            let mut guard_config = engine.config.clone();
-            guard_config.excluded_paths.clear();
-            guard_config.excluded_executables.clear();
-            let mut guard = Scanner::new(guard_config)?;
+            let mut guard = recovery_scanner(&engine.config)?;
             let guard_games = recovery_games(engine, games);
             let result =
                 engine.restore(&mut || guard.scan(&guard_games).map_or(true, |a| !a.is_empty()));
@@ -484,8 +521,18 @@ fn apply_action(
             engine.attempt(result, now);
         }
         Action::Verify => {
-            let report = engine.verify_round_trip();
+            let ready = state
+                .lock()
+                .map(|s| s.discovery_ready && s.discovery_errors.is_empty())
+                .unwrap_or(false);
+            let guard_games = recovery_games(engine, games);
+            let mut guard = recovery_scanner(&engine.config)?;
+            let report = engine.verify_round_trip(&mut || {
+                !ready || guard.scan(&guard_games).map_or(true, |a| !a.is_empty())
+            });
             if let Ok(mut shared) = state.lock() {
+                shared.verifying = false;
+                shared.pending = engine.state.is_some();
                 shared.verify_report = Some(report.clone());
                 shared.message = report.summary.clone();
                 shared.revision += 1;
@@ -496,6 +543,33 @@ fn apply_action(
         Action::Quit => (),
     }
     Ok(false)
+}
+pub fn request_verify(state: &SharedState, tx: &mpsc::Sender<Action>) {
+    if let Ok(mut shared) = state.lock() {
+        if shared.verifying
+            || !shared.active_mode
+            || shared.disabled
+            || shared.pending
+            || shared.manual_pause
+            || !shared.discovery_ready
+            || !shared.active_games.is_empty()
+            || !shared.discovery_errors.is_empty()
+        {
+            shared.settings_error = "Round-trip unavailable: finish recovery, close games, enable active detection, and wait for discovery.".into();
+            return;
+        }
+        shared.settings_error.clear();
+        shared.verifying = true;
+        if tx.send(Action::Verify).is_err() {
+            shared.verifying = false;
+        }
+    }
+}
+fn recovery_scanner(config: &Config) -> Result<Scanner> {
+    let mut guard = config.clone();
+    guard.excluded_paths.clear();
+    guard.excluded_executables.clear();
+    Scanner::new(guard)
 }
 fn recovery_games(engine: &Engine<OptionalBackend>, games: &[Game]) -> Vec<Game> {
     let mut known = games.to_vec();
@@ -520,16 +594,15 @@ struct Monitor {
 impl Monitor {
     const NEEDS_ATTENTION_AFTER: u32 = 10;
     fn handle(&mut self, err: &str, folder: &std::path::Path, state: &SharedState) {
-        self.failures += 1;
+        self.failures = self.failures.saturating_add(1);
         log(
             folder,
             &format!("Transient failure ({} consecutive): {err}", self.failures),
         );
-        if !self.needs_attention && self.failures >= Self::NEEDS_ATTENTION_AFTER {
+        if self.failures >= Self::NEEDS_ATTENTION_AFTER {
             self.needs_attention = true;
             if let Ok(mut shared) = state.lock() {
-                shared.message =
-                    "Needs attention — repeated data-directory failures; check the data dir".into();
+                shared.message = format!("Needs attention — repeated monitoring failures: {err}");
             }
         }
     }
@@ -584,6 +657,7 @@ fn run(
     let mut force_requested = false;
     let mut queued = None;
     let mut inventory_ready = false;
+    let mut inventory_dirty = false;
     let mut steam_roots = vec![];
     let mut monitor = Monitor::default();
     loop {
@@ -598,7 +672,7 @@ fn run(
                 quit = true;
                 break;
             }
-            if apply_action(
+            if match apply_action(
                 action,
                 &mut engine,
                 &folder,
@@ -606,7 +680,17 @@ fn run(
                 &games,
                 now,
                 &state,
-            )? {
+            ) {
+                Ok(refresh) => refresh,
+                Err(e) => {
+                    log(&folder, &format!("Action failed: {e:#}"));
+                    if let Ok(mut shared) = state.lock() {
+                        shared.verifying = false;
+                        shared.message = format!("Needs attention: {e:#}");
+                    }
+                    false
+                }
+            } {
                 force_requested = true;
             }
         }
@@ -614,13 +698,14 @@ fn run(
             break;
         }
         let tick = (|| -> Result<()> {
+            let mut persistence_error = None;
             if let Ok((updated, updated_errors, roots)) = result_rx.try_recv() {
                 inventory_ready = true;
                 steam_roots = roots;
                 games = updated;
                 errors = updated_errors;
                 inventory_pending = false;
-                write_json(&folder.join("inventory.json"), &games)?;
+                inventory_dirty = true;
                 log(
                     &folder,
                     &format!("Inventory refreshed: {} installed locations", games.len()),
@@ -689,18 +774,12 @@ fn run(
                     "Waiting for LM Studio — open it; automatic pausing will resume".into();
             }
             let status = json!({"version":env!("CARGO_PKG_VERSION"),"implementation":"Rust","mode":engine.config.mode,"automation_enabled":engine.config.automation_enabled,"message":engine.message,"active_games":active,"installed_locations":games.len(),"detection_disabled":engine.disabled,"manual_pause":engine.manual_pause,"last_error":engine.last_error,"discovery_errors":errors,"inaccessible_processes":scanner.inaccessible,"recovery_pending":engine.state.is_some()});
-            if status != last_status {
-                write_json(&folder.join("status.json"), &status)?;
-                log(&folder, &engine.message);
-                if console {
-                    println!("{}", engine.message);
-                }
-                last_status = status;
-            }
             if let Ok(mut shared) = state.lock() {
                 shared.message = engine.message.clone();
                 shared.disabled = engine.disabled;
                 shared.manual_pause = engine.manual_pause;
+                shared.pause_completions = engine.pause_completions;
+                shared.restore_completions = engine.restore_completions;
                 shared.pending = engine.state.is_some();
                 shared.active_mode = engine.config.mode == "active";
                 shared.config = engine.config.clone();
@@ -714,6 +793,27 @@ fn run(
                 };
                 shared.discovery_errors = errors.clone();
             }
+            if inventory_dirty {
+                match write_json(&folder.join("inventory.json"), &games) {
+                    Ok(()) => inventory_dirty = false,
+                    Err(e) => persistence_error = Some(e),
+                }
+            }
+            if status != last_status {
+                if let Err(e) = write_json(&folder.join("status.json"), &status) {
+                    persistence_error = Some(e);
+                } else {
+                    last_status = status;
+                }
+                log(&folder, &engine.message);
+                if console {
+                    println!("{}", engine.message);
+                }
+            }
+            if let Some(error) = persistence_error {
+                return Err(error);
+            }
+
             Ok(())
         })();
         match tick {
@@ -808,6 +908,7 @@ mod tests {
             config.clone(),
             OptionalBackend {
                 backend: None,
+                folder: None,
                 config: config.clone(),
             },
             path.clone(),
@@ -843,11 +944,15 @@ mod tests {
         let folder = base.join("data"); // created as a FILE below
         fs::write(&folder, "block").unwrap();
 
-        let config = Config::default();
+        let config = Config {
+            mode: "observe".into(),
+            ..Default::default()
+        };
         let engine = Engine::new(
             config.clone(),
             OptionalBackend {
                 backend: None,
+                folder: None,
                 config: config.clone(),
             },
             folder.join("state.json"),
@@ -913,6 +1018,7 @@ mod tests {
         let config = Config::default();
         let backend = OptionalBackend {
             backend: None,
+            folder: None,
             config: config.clone(),
         };
         let mut engine = Engine::new(config.clone(), backend, folder.join("state.json")).unwrap();
@@ -1081,7 +1187,8 @@ mod tests {
         ]
         .join("\n");
         assert_eq!(
-            out, expected,
+            out,
+            expected.replace('\\', "\\\\"),
             "exact --games shape: name<TAB>launcher<TAB>path per line, inventory order"
         );
 
@@ -1094,5 +1201,64 @@ mod tests {
         let _ = fs::remove_dir_all(&none);
 
         let _ = fs::remove_dir_all(&folder);
+    }
+    #[test]
+    fn recovery_guard_uses_remembered_paths_even_after_exclusion_and_removal() {
+        let mut config = Config::default();
+        config.excluded_paths.push(r"D:\Removed".into());
+        config.excluded_executables.push("game.exe".into());
+        let mut engine = Engine::new(
+            config.clone(),
+            OptionalBackend {
+                backend: None,
+                config: config.clone(),
+                folder: None,
+            },
+            std::env::temp_dir().join("nonexistent-guard-state.json"),
+        )
+        .unwrap();
+        engine.remembered_games.push(Game::new(
+            "Custom",
+            "custom",
+            "Removed",
+            r"D:\Removed\game.exe",
+        ));
+        let games = recovery_games(&engine, &[]);
+        assert!(
+            recovery_scanner(&config)
+                .unwrap()
+                .match_path(r"D:\Removed\game.exe", &games)
+                .is_some()
+        );
+        assert!(
+            Scanner::new(config)
+                .unwrap()
+                .match_path(r"D:\Removed\game.exe", &games)
+                .is_none()
+        );
+    }
+    #[test]
+    fn verify_request_rejects_duplicates_and_unsafe_shared_states() {
+        let state = Arc::new(Mutex::new(Shared {
+            active_mode: true,
+            discovery_ready: true,
+            ..Default::default()
+        }));
+        let (tx, rx) = mpsc::channel();
+        request_verify(&state, &tx);
+        request_verify(&state, &tx);
+        assert!(matches!(rx.try_recv(), Ok(Action::Verify)));
+        assert!(rx.try_recv().is_err());
+        state.lock().unwrap().verifying = false;
+        state.lock().unwrap().pending = true;
+        request_verify(&state, &tx);
+        assert!(rx.try_recv().is_err());
+    }
+    #[test]
+    fn line_protocol_escapes_record_delimiters() {
+        assert_eq!(
+            escape_field("name\tvalue\nnext\rline"),
+            "name\\tvalue\\nnext\\rline"
+        );
     }
 }

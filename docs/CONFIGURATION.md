@@ -47,3 +47,5 @@ child directory as a game; installed folder contents are not recursively scanned
 Launcher clients, common installers, crash reporters, Lossless Scaling, Wallpaper Engine,
 and known anti-cheat services are excluded by default. Unusual helpers need explicit exclusions.
 Unknown configuration keys are errors so a misspelling doesn't silently change behaviour.
+
+All timing values must be finite, respect their documented minimums, and be at most 86400 seconds (one day). Observation mode refuses manual restore and round-trip verification. Existing recovery is protected against game removal/exclusions for GUI, automatic and CLI restore. Notification sounds currently follow completion/error events and are always enabled; there is no sound preference in this preview.

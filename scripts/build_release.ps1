@@ -13,7 +13,12 @@ try {
     Copy-Item -LiteralPath 'target\release\GamePause.exe','target\release\GamePauseCLI.exe' -Destination $taskBundle -Force
     foreach ($taskFile in @('README.md','LICENSE','CHANGELOG.md','config.example.json')) { Copy-Item -LiteralPath $taskFile -Destination $taskBundle -Force }
     New-Item -ItemType Directory -Path (Join-Path $taskBundle 'docs') -Force | Out-Null
-    Copy-Item -Path 'docs\*' -Destination (Join-Path $taskBundle 'docs') -Recurse -Force
+    $taskUserDocs = Get-ChildItem -LiteralPath 'docs' -File | Where-Object { $_.Name -notlike '*-review.md' -and $_.Name -notlike '*-plan.md' }
+    if (Test-Path -LiteralPath (Join-Path $taskBundle 'docs')) {
+        $taskInternalDocs = Get-ChildItem -LiteralPath (Join-Path $taskBundle 'docs') -File | Where-Object { $_.Name -like '*-review.md' -or $_.Name -like '*-plan.md' }
+        foreach ($taskInternalDoc in $taskInternalDocs) { Remove-Item -LiteralPath $taskInternalDoc.FullName -Force }
+    }
+    foreach ($taskDoc in $taskUserDocs) { Copy-Item -LiteralPath $taskDoc.FullName -Destination (Join-Path $taskBundle 'docs') -Force }
     $taskNotices = @()
     foreach ($taskPackage in ($taskMetadata.packages | Sort-Object name,version)) {
         if ($taskPackage.name -eq 'gamepause-lmstudio') { continue }
