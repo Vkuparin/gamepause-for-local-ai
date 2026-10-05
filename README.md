@@ -1,4 +1,4 @@
-# GamePause
+# GamePause for Local AI
 
 [![CI](https://github.com/Vkuparin/gamepause-lmstudio/actions/workflows/ci.yml/badge.svg)](https://github.com/Vkuparin/gamepause-lmstudio/actions/workflows/ci.yml)
 [![MIT](https://img.shields.io/badge/license-MIT-155e75.svg)](LICENSE)
