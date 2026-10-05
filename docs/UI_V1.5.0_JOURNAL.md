@@ -12,7 +12,7 @@ The main shell uses a status hero, compact automation strip, Games/Running apps/
 
 ## Status
 
-Implementation and final automated/rendered verification are complete. The owner approved v1.5.0 publication; packaging and publication are in progress. The live/physical acceptance limits below remain open.
+Implementation and final automated/rendered verification are complete. The owner approved v1.5.0 publication. The release branch, tag and verified downloads are published. The live/physical acceptance limits below remain open.
 
 - Read CONTRIBUTING.md, docs/DEVELOPMENT.md and the supplied specification.
 - Inspected dashboard, theme, shared presentation/control policy and confirmation flows.
@@ -61,3 +61,9 @@ Live LM Studio/Ollama unload/reload, actual games, sleep/wake, startup registrat
 ## Publication preparation - 2026-10-05
 
 The owner confirmed the redesigned app works and requested "commit and publish". Updated release/acceptance documentation and prepared the v1.5.0 installer and portable ZIP. The package verifier found missing license texts in several new crate archives. Added pinned upstream license copies and bundled font licenses, and updated packaging to include them and the dashboard preview. Package checks now pass for checksums, executable versions, defaults, license texts and archive contents. Publication will include the installer, ZIP, SHA256SUMS.txt, BUILD-INFO.json and a separate acceptance record. Existing local AGENTS.md and playtest_notes.md remain excluded from the commit. No new live/physical acceptance is inferred from the owner's feedback.
+
+## Publication completed
+
+Published [GamePause 1.5.0](https://github.com/Vkuparin/gamepause-lmstudio/releases/tag/v1.5.0) from commit `4b127db13879a890bf8a47f51feb351cd586470f` on `codex/v1.5.0-release`, with annotated tag `v1.5.0`. The installer, portable ZIP, SHA256SUMS.txt, BUILD-INFO.json and RELEASE-ACCEPTANCE.md are uploaded; all five GitHub asset digests match local SHA-256 hashes. GitHub CI and release-build workflows were started and remain in progress at publication time. Local final checks and package verification passed.
+
+Automatic approval review rejected the combined push because it included the default `main` branch. Published the authorized release branch and tag instead; `main` remains unchanged. This journal update is a separate documentation commit after the immutable release tag. Owner-local AGENTS.md and playtest_notes.md remain untracked and untouched.
