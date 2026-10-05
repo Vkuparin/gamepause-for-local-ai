@@ -12,15 +12,7 @@ pub const HERO_FONT: f32 = 46.0;
 pub const HERO_ACTION: Vec2 = Vec2::new(220.0, 64.0);
 const PALETTE: &str = "gamepause-palette";
 
-/// The four visual states. Every worker activity folds into one of them.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum Look {
-    #[default]
-    Running,
-    Paused,
-    Loading,
-    Attention,
-}
+pub use crate::presentation::Look;
 
 #[derive(Clone, Copy)]
 pub struct Palette {

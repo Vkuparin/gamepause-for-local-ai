@@ -12,7 +12,7 @@ Additional games share the original snapshot. Alt-tabbing keeps the session acti
 
 ## Dashboard
 
-Left-click the tray icon or open GamePause from Start. Closing the window leaves monitoring running in the tray. Right-click the tray icon for quick actions; **Quit** stops the watcher and keeps pending recovery.
+Left-click the tray icon or open GamePause from Start. Closing the window leaves monitoring running in the tray. Right-click the tray icon for the current state and the quick controls: the automatic-pausing toggle, **Pause AI**, **Resume AI**, **Open GamePause** and **Quit**. Everything else is in the dashboard. **Quit** stops the watcher and keeps pending recovery.
 
 The status card at the top always shows one of four states, each with its own color:
 
@@ -38,9 +38,9 @@ Choose **Appearance** in **Advanced > General** for **Follow Windows**, **Light*
 - **Add game…:** browse for a standalone game's executable. Its full path is saved; the installation directory is not broadly classified.
 - **More... > Remove:** removes only the selected game you added yourself. The confirmation names the game and defaults to Cancel. Launcher entries use Ignore instead. Failed saves leave the entry unchanged; removing a running game does not erase its pending recovery guard.
 - **Ignored:** re-enable games or saved path exclusions. Built-in launcher/helper exclusions remain automatic.
-- **Advanced > Detection > Refresh game list** (also **Refresh games** in the tray menu): request discovery immediately. Feedback reports queued work, completion, no changes or errors after the discovery result arrives. Repeated requests share the pending refresh. Routine use does not require it.
+- **Advanced > Detection > Refresh game list**: request discovery immediately. Feedback reports queued work, completion, no changes or errors after the discovery result arrives. Repeated requests share the pending refresh. Routine use does not require it.
 - **Automatically pause AI while gaming:** takes effect without restarting and is remembered. Turning it off does not discard captured models: an existing session waits for recognized games to exit, then restores normally.
-- **Advanced:** a saved page-visibility preference, initially off. Categories cover General, Detection, LM Studio, experimental Ollama, Recovery and Diagnostics. Settings include connection/delay fields, launcher roots and exclusions, read-only diagnostics, Test round-trip, logs/status folder and Windows startup. Corresponding advanced tray tools remain available while Advanced is shown. Back to games leaves automation, providers and recovery unchanged.
+- **Advanced:** a saved page-visibility preference, initially off. Categories cover General, Detection, LM Studio, experimental Ollama, Recovery and Diagnostics. Settings include connection/delay fields, launcher roots and exclusions, read-only diagnostics, Test round-trip, logs/status folder and Windows startup. These tools are dashboard-only; the tray menu is the same whether Advanced is shown or not. Back to games leaves automation, providers and recovery unchanged.
 - **Quit:** stops the watcher and retains pending recovery. Closing the dashboard alone keeps monitoring running.
 
 Selected rows show their path and why they are recognized. Discovery and save errors appear in the window. A missing LM Studio connection retains models/recovery and is retried automatically.
@@ -65,7 +65,7 @@ The warning also offers separate, initially unchecked **Ignore in future** choic
 
 The hint line under the state distinguishes a gaming pause, your own pause, the resume delay, waiting for a response to finish, and each kind of failure. A recovery journal alone does not mean AI has been unloaded, so unfinished recovery shows **AI NEEDS ATTENTION**, not **AI PAUSED**. Watching without a provider probe does not establish LM Studio availability. Partial failures retain recovery and never report a completed pause or restore.
 
-Basic dashboard and tray summaries show enabled providers separately, including pending recovery and errors. Advanced settings is not required to see a failure. **Models restored** describes completed work; current residency is not polled afterward. Retry backoff values describe the last update. Automatic retries leave completed healthy-provider work alone. CLI `status.json` includes the same evidence under `provider_outcomes`.
+The basic dashboard shows enabled providers separately, including pending recovery and errors. Advanced settings is not required to see a failure. The tray menu shows only the overall state, such as **AI needs attention** with a one-line hint; open the dashboard for provider detail. **Models restored** describes completed work; current residency is not polled afterward. Retry backoff values describe the last update. Automatic retries leave completed healthy-provider work alone. CLI `status.json` includes the same evidence under `provider_outcomes`.
 
 Game detection continues while AI capture or loading is busy. If a recognized game starts during restoration, GamePause defers remaining loads after the current operation returns. A failed or timed-out fresh scan holds recovery. The dashboard can update detected games before the ongoing model operation finishes.
 

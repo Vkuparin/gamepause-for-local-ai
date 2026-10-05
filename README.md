@@ -8,9 +8,9 @@
 
 GamePause is a small native Rust app for Windows. It notices when a game starts, saves the models currently loaded in LM Studio, unloads them, and restores them afterward. Experimental Ollama control is available by explicit opt-in and is off by default. The model name can change: there is no fixed model list to maintain.
 
-GamePause **1.6.0** was published on 2026-10-06 at the owner's request. Download the installer or portable ZIP from [Releases](https://github.com/Vkuparin/gamepause-lmstudio/releases/tag/v1.6.0). See [Acceptance](docs/ACCEPTANCE.md) for the approval and evidence limits.
+GamePause **1.7.0** was published on 2026-10-06 at the owner's request. Download the installer or portable ZIP from [Releases](https://github.com/Vkuparin/gamepause-lmstudio/releases/tag/v1.7.0). See [Acceptance](docs/ACCEPTANCE.md) for the approval and evidence limits.
 
-**v1.6.0** restyles the Rust-native eframe dashboard around four color-coded states, shows each game's executable icon, and makes the installer start GamePause in the tray. The Win32 tray and the control/recovery engine are unchanged. See the [changelog](CHANGELOG.md); the [v1.5.0 implementation journal](docs/UI_V1.5.0_JOURNAL.md) records the original dashboard redesign.
+**v1.7.0** slims the tray menu to a short state header and the quick controls: the automatic-pausing toggle, Pause AI, Resume AI, Open GamePause and Quit. Tools and details stay in the dashboard, which v1.6.0 restyled around four color-coded states. The control/recovery engine is unchanged. See the [changelog](CHANGELOG.md); the [v1.5.0 implementation journal](docs/UI_V1.5.0_JOURNAL.md) records the original dashboard redesign.
 
 ## Features
 
@@ -23,7 +23,7 @@ GamePause **1.6.0** was published on 2026-10-06 at the owner's request. Download
 - Shows one of four color-coded states (AI running, AI paused, loading, needs attention), detected games with their executable icons, separate enabled-provider outcomes and command results. Confirmed gameplay Restore applies only to the approved live game instances.
 - Offers saved Advanced visibility, read-only provider diagnostics, separate sound/notification preferences, and native dark/light/high-contrast behavior.
 - Coordinates independent provider recovery while periodic game detection continues during blocked model operations.
-- Tests the full pause/restore round-trip on demand, with durable recovery on failure: capture, unload, confirm the server emptied, restore, and field-compare the read-back settings — from the dashboard, tray, or `GamePauseCLI.exe --verify`.
+- Tests the full pause/restore round-trip on demand, with durable recovery on failure: capture, unload, confirm the server emptied, restore, and field-compare the read-back settings — from the dashboard or `GamePauseCLI.exe --verify`.
 - Escaped one-line-per-item CLI output for scripting: `--status` (key=value state), `--games` (name/launcher/path), plus read-only `--doctor` and disruptive `--verify`. Status, cached games, and doctor work alongside the GUI; verify requires it to be closed.
 - Includes a native dashboard, searchable games, live settings, tray controls, automatic startup at Windows sign-in, a per-user installer, and a portable ZIP.
 

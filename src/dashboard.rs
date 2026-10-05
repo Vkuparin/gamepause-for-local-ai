@@ -433,83 +433,14 @@ struct Hero {
     look: Look,
     glyph: Icon,
 }
-/// Every worker activity folds into one of four looks with short, plain text.
-/// "AI RUNNING" means GamePause is not holding AI paused. Idle residency is not polled.
+/// The shared short status plus the dashboard's glyph for its look.
 fn hero(s: &Shared) -> Hero {
-    use crate::control::Activity::*;
-    let activity = if s.verifying { Verifying } else { s.activity };
-    let (title, hint, look) = match activity {
-        Unknown => ("LOADING", "Checking for running games...", Look::Loading),
-        Watching if s.config.automation_enabled => {
-            ("AI RUNNING", "Watching for game launches", Look::Running)
-        }
-        Watching => ("AI RUNNING", "Automatic pausing is off", Look::Running),
-        Observation => (
-            "AI RUNNING",
-            "Observation mode. Games are detected and AI is left alone.",
-            Look::Running,
-        ),
-        Coexistence => (
-            "AI RUNNING",
-            "Resumed while a game is running. Pause AI to free memory.",
-            Look::Running,
-        ),
-        Paused => (
-            "AI PAUSED",
-            "AI paused for gaming. Resume to load your model.",
-            Look::Paused,
-        ),
-        ManualHold => (
-            "AI PAUSED",
-            "You paused AI. Resume when you are ready.",
-            Look::Paused,
-        ),
-        Countdown => (
-            "AI PAUSED",
-            "Game closed. AI resumes shortly.",
-            Look::Paused,
-        ),
-        Capturing | Unloading | Restoring => ("LOADING", "Processing request...", Look::Loading),
-        WaitingForInference => (
-            "LOADING",
-            "Waiting for the current response to finish.",
-            Look::Loading,
-        ),
-        Verifying => ("LOADING", "Testing pause and resume...", Look::Loading),
-        Unavailable => (
-            "AI NEEDS ATTENTION",
-            "AI is not reachable. Open your AI app or check Advanced.",
-            Look::Attention,
-        ),
-        DetectionUnavailable => (
-            "AI NEEDS ATTENTION",
-            "Game detection is not working. AI is left alone until it recovers.",
-            Look::Attention,
-        ),
-        Recovery => (
-            "AI NEEDS ATTENTION",
-            "Your models are saved but not loaded. Resume to try again.",
-            Look::Attention,
-        ),
-        PartialFailure => (
-            "AI NEEDS ATTENTION",
-            "Something did not finish. Open Activity for details.",
-            Look::Attention,
-        ),
-    };
-    let reliable =
-        s.discovery_ready && s.detection_ok && !s.disabled && s.discovery_errors.is_empty();
-    let game = s.active_games.first().filter(|_| reliable).map(|first| {
-        if s.active_games.len() == 1 {
-            format!("{} is running", first.game)
-        } else {
-            format!(
-                "{} and {} more are running",
-                first.game,
-                s.active_games.len() - 1
-            )
-        }
-    });
+    let crate::presentation::Status {
+        title,
+        game,
+        hint,
+        look,
+    } = crate::presentation::status(s);
     Hero {
         title,
         game,

@@ -258,14 +258,13 @@ pub fn request_folder(state: &SharedState, folder: &Path) {
     }
 }
 
-fn command_items(state: &crate::app::Shared, startup: bool) -> Vec<(usize, String, u32)> {
+/// The tray carries quick controls only. Tools and settings stay in the dashboard.
+fn command_items(state: &crate::app::Shared) -> Vec<(usize, String, u32)> {
     let availability = state.controls().availability();
-    let mut items = vec![
-        (Command::OpenDashboard as usize, "Open GamePause".into(), 0),
-        (0, String::new(), MF_SEPARATOR),
+    vec![
         (
             Command::Automation as usize,
-            "Automatically pause AI while gaming".into(),
+            "Pause AI automatically while gaming".into(),
             if state.config.automation_enabled {
                 MF_CHECKED
             } else {
@@ -292,69 +291,9 @@ fn command_items(state: &crate::app::Shared, startup: bool) -> Vec<(usize, Strin
             },
         ),
         (0, String::new(), MF_SEPARATOR),
-        (Command::Refresh as usize, "Refresh games".into(), 0),
-    ];
-    if state.config.advanced_settings_visible {
-        items.extend([
-            (0, String::new(), MF_SEPARATOR),
-            (
-                0,
-                format!(
-                    "LM Studio: {}. Endpoint: {}",
-                    if state.config.lm_enabled() {
-                        "enabled"
-                    } else {
-                        "disabled"
-                    },
-                    state.config.lm_endpoint()
-                ),
-                MF_GRAYED,
-            ),
-            (
-                0,
-                "Guarantee: captured settings and original server-state verification".into(),
-                MF_GRAYED,
-            ),
-            (
-                0,
-                if state.provider_pending(crate::provider::Kind::LMStudio) {
-                    "Recovery pending: restore before disabling or changing the endpoint".into()
-                } else {
-                    "No pending LM recovery".into()
-                },
-                MF_GRAYED,
-            ),
-            (
-                Command::Doctor as usize,
-                "Read-only provider diagnostics".into(),
-                if state.doctor_pending { MF_GRAYED } else { 0 },
-            ),
-            (
-                Command::Verify as usize,
-                "Test round-trip".into(),
-                if crate::ui_commands::verify_available(state) {
-                    0
-                } else {
-                    MF_GRAYED
-                },
-            ),
-            (
-                Command::OpenFolder as usize,
-                "Open logs and status folder".into(),
-                0,
-            ),
-            (
-                Command::Startup as usize,
-                "Start when I sign in to Windows".into(),
-                if startup { MF_CHECKED } else { 0 },
-            ),
-        ]);
-    }
-    items.extend([
-        (0, String::new(), MF_SEPARATOR),
+        (Command::OpenDashboard as usize, "Open GamePause".into(), 0),
         (Command::Quit as usize, "Quit".into(), 0),
-    ]);
-    items
+    ]
 }
 /// The tray glyph's solid fill color per state. Pure + unit-testable: this is
 /// the "state -> icon variant" mapping P1-6 wants asserted without Win32.
@@ -565,35 +504,12 @@ impl crate::notifications::Sink for NativeNotifications {
 unsafe fn menu(hwnd: HWND, ui: &UI) {
     unsafe {
         let state = ui.shared.lock().unwrap();
-        let summary = crate::presentation::summarize(&state);
-        let mut items = vec![(
-            0,
-            format!("GamePause v{}", env!("CARGO_PKG_VERSION")),
-            MF_GRAYED,
-        )];
-        items.extend(
-            summary
-                .tray_lines()
-                .into_iter()
-                .map(|line| (0, line, MF_GRAYED)),
-        );
-        items.extend([(
-            0,
-            state
-                .commands
-                .latest
-                .as_ref()
-                .map(|result| result.message.clone())
-                .or_else(|| {
-                    state
-                        .restore_feedback
-                        .as_ref()
-                        .map(|feedback| feedback.text())
-                })
-                .unwrap_or_default(),
-            MF_GRAYED,
-        )]);
-        items.extend(command_items(&state, startup_enabled()));
+        let mut items = crate::presentation::status(&state)
+            .tray_lines()
+            .map(|line| (0, line, MF_GRAYED))
+            .to_vec();
+        items.push((0, String::new(), MF_SEPARATOR));
+        items.extend(command_items(&state));
         let dark = crate::theme::effective_dark(state.config.appearance);
         let activity = state.activity;
         drop(state);
@@ -640,32 +556,6 @@ unsafe fn menu(hwnd: HWND, ui: &UI) {
                 );
                 None
             }
-            Command::Refresh => {
-                crate::app::request_action(
-                    &ui.shared,
-                    &ui.tx,
-                    Action::Refresh,
-                    "Discovery refresh",
-                );
-                None
-            }
-            Command::Doctor => {
-                crate::app::request_action(
-                    &ui.shared,
-                    &ui.tx,
-                    Action::Doctor,
-                    "Read-only diagnostics",
-                );
-                None
-            }
-            Command::Verify => {
-                dashboard::request_verify_modal(
-                    ui.shared.clone(),
-                    ui.tx.clone(),
-                    ui.folder.clone(),
-                );
-                None
-            }
             Command::Quit => {
                 crate::app::request_quit(&ui.shared, &ui.tx);
                 None
@@ -674,14 +564,12 @@ unsafe fn menu(hwnd: HWND, ui: &UI) {
                 dashboard::show(ui.shared.clone(), ui.tx.clone(), ui.folder.clone());
                 None
             }
-            Command::OpenFolder => {
-                request_folder(&ui.shared, &ui.folder);
-                None
-            }
-            Command::Startup => {
-                request_startup(&ui.shared, !startup_enabled(), &ui.folder);
-                None
-            }
+            // Dashboard-only commands; the tray menu never offers them.
+            Command::Refresh
+            | Command::Doctor
+            | Command::Verify
+            | Command::OpenFolder
+            | Command::Startup => None,
         };
         if let Some(action) = action {
             let _ = ui.tx.send(action);
@@ -964,7 +852,7 @@ mod tests {
             activity: Activity::ManualHold,
             ..Default::default()
         };
-        let items = command_items(&state, false);
+        let items = command_items(&state);
         assert_eq!(items.iter().filter(|item| item.1 == "Resume AI").count(), 1);
         assert!(!items.iter().any(|item| item.1.contains("Restore")));
         assert_eq!(
@@ -986,53 +874,37 @@ mod tests {
     }
 
     #[test]
-    fn advanced_menu_matches_dashboard_commands_and_retains_core_order() {
+    fn menu_is_the_same_quick_controls_with_or_without_advanced() {
         let mut state = crate::app::Shared::default();
+        let basic = crate::dashboard::shared_command_ids(false);
         for advanced in [false, true] {
             state.config.advanced_settings_visible = advanced;
-            let items = super::command_items(&state, false);
+            let items = super::command_items(&state);
             let ids = items
                 .iter()
                 .filter_map(|item| crate::ui_commands::Command::from_id(item.0 as i32))
                 .collect::<Vec<_>>();
-            let mut tray = ids
-                .iter()
-                .filter(|command| **command != crate::ui_commands::Command::OpenDashboard)
-                .map(|command| *command as i32)
-                .collect::<Vec<_>>();
-            let mut dashboard = crate::dashboard::shared_command_ids(advanced);
-            tray.sort();
-            dashboard.sort();
-            assert_eq!(tray, dashboard);
             assert_eq!(
-                &ids[..6],
-                &[
-                    crate::ui_commands::Command::OpenDashboard,
+                ids,
+                [
                     crate::ui_commands::Command::Automation,
                     crate::ui_commands::Command::Pause,
                     crate::ui_commands::Command::Resume,
-                    crate::ui_commands::Command::Refresh,
-                    if advanced {
-                        crate::ui_commands::Command::Doctor
-                    } else {
-                        crate::ui_commands::Command::Quit
-                    }
+                    crate::ui_commands::Command::OpenDashboard,
+                    crate::ui_commands::Command::Quit,
                 ]
             );
-            assert_eq!(items.last().unwrap().1, "Quit");
-            if advanced {
-                assert!(
-                    items
-                        .iter()
-                        .position(|item| item.1.contains("Endpoint:"))
-                        .unwrap()
-                        < items
-                            .iter()
-                            .position(|item| item.0 == crate::ui_commands::Command::Verify as usize)
-                            .unwrap()
-                );
-            }
-            assert!(!items.iter().any(|item| item.1 == "Settings and games"));
+            // Every tray action has a dashboard counterpart that needs no Advanced toggle.
+            assert!(ids.iter().all(|command| {
+                *command == crate::ui_commands::Command::OpenDashboard
+                    || basic.contains(&(*command as i32))
+            }));
+            // No informational rows hide among the commands.
+            assert!(
+                items
+                    .iter()
+                    .all(|item| item.0 != 0 || item.2 == MF_SEPARATOR)
+            );
         }
     }
     use super::*;

@@ -15,7 +15,7 @@ Reports, `status.json`, `inventory.json`, and rotated `gamepause.log` files are 
 
 ## A game is missed
 
-Check `inventory.json` after an inventory refresh. Newly installed launcher games normally appear within 30 seconds; Xbox package metadata can take five minutes when idle. Use **Refresh games** in the tray menu, or **Advanced > Detection > Refresh game list** in the dashboard, for a manual update. A game started before its installation metadata appears may be detected after the next refresh.
+Check `inventory.json` after an inventory refresh. Newly installed launcher games normally appear within 30 seconds; Xbox package metadata can take five minutes when idle. Use **Advanced > Detection > Refresh game list** in the dashboard for a manual update. A game started before its installation metadata appears may be detected after the next refresh.
 
 Open **Running apps**, select the actual game, and choose **Add selected as game**, or use **Add game…** to browse for its executable. No restart is needed. Protected processes cannot always be inspected without elevation; GamePause deliberately runs without administrator rights. The inaccessible-process count includes Windows services and does not mean all those processes are games.
 

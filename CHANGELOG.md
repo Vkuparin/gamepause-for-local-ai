@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.7.0 — 2026-10-06
+
+- Slim the tray menu to quick controls: a two-row state header using the dashboard's short wording, the automatic-pausing toggle, **Pause AI**, **Resume AI**, **Open GamePause** and **Quit**. The menu no longer grows when Advanced is shown.
+- Remove from the tray the version row, provider/next-step/reason lines, last command feedback, **Refresh games**, provider details, diagnostics, **Test round-trip**, the logs folder and the startup toggle. All remain in the dashboard.
+- The owner requested publication. No owner test report for this build was supplied; the new menu was not viewed on a desktop before release, and no new live provider, installer or physical accessibility coverage is claimed. See [Acceptance](docs/ACCEPTANCE.md).
+
 ## 1.6.0 — 2026-10-06
 
 - Restyle the dashboard after the three state mockups: blue **AI RUNNING**, orange **AI PAUSED**, yellow **LOADING** and red **AI NEEDS ATTENTION**, with a glowing state ring, a state-colored main button, attached tabs, a tinted title bar (Windows 11) and a state-colored window icon. Light and high-contrast modes are kept.

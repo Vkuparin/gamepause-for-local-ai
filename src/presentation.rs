@@ -7,16 +7,122 @@ pub struct Summary {
     pub next: String,
     pub reason: String,
 }
-impl Summary {
-    pub fn tray_lines(&self) -> Vec<String> {
-        let mut lines = self.games.lines().map(str::to_owned).collect::<Vec<_>>();
-        lines.extend(self.provider.lines().map(str::to_owned));
-        lines.push(format!("Next: {}", self.next));
-        if !self.reason.is_empty() {
-            lines.push(self.reason.clone());
-        }
-        lines
+/// The four visual states. Every worker activity folds into one of them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Look {
+    #[default]
+    Running,
+    Paused,
+    Loading,
+    Attention,
+}
+/// The short, plain state shown by the dashboard hero and the tray menu header.
+pub struct Status {
+    pub title: &'static str,
+    pub game: Option<String>,
+    pub hint: &'static str,
+    pub look: Look,
+}
+impl Status {
+    /// Two tray header rows: the state, then the running game or the hint.
+    pub fn tray_lines(&self) -> [String; 2] {
+        let title = match self.look {
+            Look::Running => "AI running",
+            Look::Paused => "AI paused",
+            Look::Loading => "Loading",
+            Look::Attention => "AI needs attention",
+        };
+        let detail = match &self.game {
+            Some(game) if self.look == Look::Paused => game.clone(),
+            _ => self.hint.into(),
+        };
+        [title.into(), detail]
     }
+}
+/// "AI RUNNING" means GamePause is not holding AI paused. Idle residency is not polled.
+pub fn status(s: &Shared) -> Status {
+    use Activity::*;
+    let activity = if s.verifying { Verifying } else { s.activity };
+    let (title, hint, look) = match activity {
+        Unknown => ("LOADING", "Checking for running games...", Look::Loading),
+        Watching if s.config.automation_enabled => {
+            ("AI RUNNING", "Watching for game launches", Look::Running)
+        }
+        Watching => ("AI RUNNING", "Automatic pausing is off", Look::Running),
+        Observation => (
+            "AI RUNNING",
+            "Observation mode. Games are detected and AI is left alone.",
+            Look::Running,
+        ),
+        Coexistence => (
+            "AI RUNNING",
+            "Resumed while a game is running. Pause AI to free memory.",
+            Look::Running,
+        ),
+        Paused => (
+            "AI PAUSED",
+            "AI paused for gaming. Resume to load your model.",
+            Look::Paused,
+        ),
+        ManualHold => (
+            "AI PAUSED",
+            "You paused AI. Resume when you are ready.",
+            Look::Paused,
+        ),
+        Countdown => (
+            "AI PAUSED",
+            "Game closed. AI resumes shortly.",
+            Look::Paused,
+        ),
+        Capturing | Unloading | Restoring => ("LOADING", "Processing request...", Look::Loading),
+        WaitingForInference => (
+            "LOADING",
+            "Waiting for the current response to finish.",
+            Look::Loading,
+        ),
+        Verifying => ("LOADING", "Testing pause and resume...", Look::Loading),
+        Unavailable => (
+            "AI NEEDS ATTENTION",
+            "AI is not reachable. Open your AI app or check Advanced.",
+            Look::Attention,
+        ),
+        DetectionUnavailable => (
+            "AI NEEDS ATTENTION",
+            "Game detection is not working. AI is left alone until it recovers.",
+            Look::Attention,
+        ),
+        Recovery => (
+            "AI NEEDS ATTENTION",
+            "Your models are saved but not loaded. Resume to try again.",
+            Look::Attention,
+        ),
+        PartialFailure => (
+            "AI NEEDS ATTENTION",
+            "Something did not finish. Open Activity for details.",
+            Look::Attention,
+        ),
+    };
+    let reliable =
+        s.discovery_ready && s.detection_ok && !s.disabled && s.discovery_errors.is_empty();
+    let game = s.active_games.first().filter(|_| reliable).map(|first| {
+        if s.active_games.len() == 1 {
+            format!("{} is running", first.game)
+        } else {
+            format!(
+                "{} and {} more are running",
+                first.game,
+                s.active_games.len() - 1
+            )
+        }
+    });
+    Status {
+        title,
+        game,
+        hint,
+        look,
+    }
+}
+impl Summary {
     pub fn ai_text(&self) -> String {
         format!(
             "{}\r\nNext: {}{}",
@@ -258,20 +364,6 @@ mod tests {
                 .provider
                 .contains("Retry backoff at last update: 10s")
         );
-        let tray = summary.tray_lines();
-        assert_eq!(
-            tray.iter()
-                .filter(|line| line.starts_with("LM Studio:"))
-                .count(),
-            1
-        );
-        assert_eq!(
-            tray.iter()
-                .filter(|line| line.starts_with("Ollama:"))
-                .count(),
-            1
-        );
-        assert!(tray.iter().all(|line| !line.contains('\n')));
         for provider in &mut shared.config.providers {
             if let crate::config::Provider::Ollama { enabled, .. } = provider {
                 *enabled = false;
@@ -372,10 +464,49 @@ mod tests {
             assert!(summary.provider.starts_with("LM Studio:"));
             assert!(!summary.next.is_empty());
             assert!(!summary.ai_text().contains("Ollama"));
-            let tray = summary.tray_lines();
-            assert!(tray.contains(&summary.provider));
-            assert!(tray.contains(&format!("Next: {}", summary.next)));
-            assert!(!tray.iter().any(|line| line.contains("Ollama")));
         }
+    }
+    #[test]
+    fn tray_header_is_two_short_rows_for_every_activity() {
+        let mut shared = Shared {
+            active_mode: true,
+            discovery_ready: true,
+            detection_ok: true,
+            active_games: vec![game(42, 1)],
+            ..Default::default()
+        };
+        for activity in [
+            Activity::Unknown,
+            Activity::Watching,
+            Activity::Observation,
+            Activity::Unavailable,
+            Activity::DetectionUnavailable,
+            Activity::Capturing,
+            Activity::WaitingForInference,
+            Activity::Unloading,
+            Activity::Paused,
+            Activity::ManualHold,
+            Activity::Countdown,
+            Activity::Restoring,
+            Activity::Recovery,
+            Activity::PartialFailure,
+            Activity::Verifying,
+            Activity::Coexistence,
+        ] {
+            shared.activity = activity;
+            let status = status(&shared);
+            let [title, detail] = status.tray_lines();
+            assert!(title.eq_ignore_ascii_case(status.title), "{activity:?}");
+            assert!(!detail.is_empty() && !detail.contains('\n'));
+            // The running game replaces the hint only while AI is paused.
+            assert_eq!(
+                detail == "Fixture game 42 is running",
+                status.look == Look::Paused,
+                "{activity:?}"
+            );
+        }
+        shared.activity = Activity::Paused;
+        shared.detection_ok = false;
+        assert_eq!(status(&shared).tray_lines()[1], status(&shared).hint);
     }
 }
