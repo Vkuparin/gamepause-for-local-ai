@@ -1,6 +1,6 @@
-//! Read-only P0-1 evidence for the pinned Ollama source target.
-//! The experimental adapter consumes candidates; production enrollment and
-//! journal routing remain disabled until mixed-provider engine integration.
+//! Bounded Ollama evidence, validated candidates and limited wire construction
+//! for the pinned source target, live-checked against Ollama 0.35.1.
+use crate::ollama_expiry::Policy;
 use anyhow::{Result, bail};
 use serde::{Deserialize, de::DeserializeOwned};
 use std::{collections::BTreeMap, io::Read};
@@ -246,11 +246,11 @@ fn classify_details(show: &WireShow, entry: &CatalogEntry) -> ModelEvidence {
     if capabilities.iter().any(|s| s == "embedding") {
         return ModelEvidence::Embedding;
     }
-    if capabilities.as_slice() == ["completion"] {
+    if capabilities.iter().any(|s| s == "completion") {
+        // Tools, thinking, vision and later capability names describe what a
+        // completion model accepts, not load state an empty preload must replay.
         ModelEvidence::LocalCompletionCandidate
     } else {
-        // Vision, tools, thinking, unknown capabilities and other formats need
-        // their own replay contract, even when completion is also advertised.
         ModelEvidence::Unknown
     }
 }
@@ -288,7 +288,7 @@ impl ReplayCandidate {
     pub fn captured_at(&self) -> std::time::Duration {
         self.deadline.captured_at()
     }
-    pub fn validate(&self) -> Result<()> {
+    pub fn validate(&self, policy: Policy) -> Result<()> {
         let normalized = identity(WireIdentity {
             name: self.resident.identity.name.clone(),
             model: self.resident.identity.name.clone(),
@@ -303,15 +303,17 @@ impl ReplayCandidate {
             bail!("Ollama persisted candidate identity/context is invalid");
         }
         local_reference(&self.resident.identity.name)?;
-        self.deadline.validate(self.resident.expires_at.as_deref())
+        self.deadline
+            .validate(self.resident.expires_at.as_deref(), policy)
     }
-    /// Capture only the limited identity/context/absolute-deadline contract.
+    /// Capture only the limited identity/context/deadline contract.
     /// The caller must journal this original evidence before sending any change.
     pub fn capture(
         resident: &Resident,
         catalog: &Catalog,
         show: impl Read,
         now: std::time::SystemTime,
+        policy: Policy,
     ) -> Result<Self> {
         verify_catalog_identity(resident, catalog)?;
         let normalized = identity(WireIdentity {
@@ -345,7 +347,7 @@ impl ReplayCandidate {
             bail!("Ollama observed context exceeds or lacks model context evidence");
         }
         let deadline =
-            crate::ollama_expiry::Deadline::capture(resident.expires_at.as_deref(), now)?;
+            crate::ollama_expiry::Deadline::capture(resident.expires_at.as_deref(), now, policy)?;
         Ok(Self {
             resident: resident.clone(),
             deadline,
@@ -353,10 +355,7 @@ impl ReplayCandidate {
     }
 
     pub fn unload_request(&self) -> Result<serde_json::Value> {
-        Ok(
-            serde_json::json!({"model":local_reference(&self.resident.identity.name)?,
-            "prompt":"", "stream":false, "keep_alive":0}),
-        )
+        unload_request(&self.resident.identity)
     }
 
     /// Expired obligations have no load request; report their separate outcome.
@@ -366,18 +365,62 @@ impl ReplayCandidate {
         &self,
         now: std::time::SystemTime,
         elapsed: Option<std::time::Duration>,
+        policy: Policy,
     ) -> Result<Option<serde_json::Value>> {
-        match self.deadline.plan(now, elapsed)? {
-            crate::ollama_expiry::ResidencyPlan::Expired => Ok(None),
+        let keep_alive = match self.deadline.plan(now, elapsed, policy)? {
+            crate::ollama_expiry::ResidencyPlan::Expired => return Ok(None),
             crate::ollama_expiry::ResidencyPlan::KeepFor(remaining) => {
-                Ok(Some(serde_json::json!({
-                    "model":local_reference(&self.resident.identity.name)?, "prompt":"", "stream":false,
-                    "keep_alive":format!("{}ns", remaining.as_nanos()),
-                    "options":{"num_ctx": self.resident.context_length}
-                })))
+                serde_json::json!(format!("{}ns", remaining.as_nanos()))
             }
+            crate::ollama_expiry::ResidencyPlan::Indefinite => serde_json::json!(-1),
+        };
+        Ok(Some(serde_json::json!({
+            "model":local_reference(&self.resident.identity.name)?, "prompt":"", "stream":false,
+            "keep_alive":keep_alive,
+            "options":{"num_ctx": self.resident.context_length}
+        })))
+    }
+    /// Residency the frozen policy asks the load to keep; `None` when the
+    /// obligation is expired, indefinite or governed by the absolute policy.
+    pub fn frozen_residency(&self, policy: Policy) -> Option<std::time::Duration> {
+        match self
+            .deadline
+            .plan(std::time::UNIX_EPOCH, None, policy)
+            .ok()?
+        {
+            crate::ollama_expiry::ResidencyPlan::KeepFor(remaining)
+                if policy == Policy::FrozenRemaining =>
+            {
+                Some(remaining)
+            }
+            _ => None,
         }
     }
+}
+
+pub fn unload_request(identity: &Identity) -> Result<serde_json::Value> {
+    Ok(serde_json::json!({"model":local_reference(&identity.name)?,
+        "prompt":"", "stream":false, "keep_alive":0}))
+}
+
+/// A resident local model that cannot be replayed (embedding, unknown format
+/// or capabilities, unsupported context or expiry) may still be unloaded and
+/// reported as not restored. Its catalog identity and locality must hold:
+/// remote, changed or ambiguously routed content refuses the whole capture.
+pub fn unload_only(resident: &Resident, catalog: &Catalog, show: impl Read) -> Result<Identity> {
+    verify_catalog_identity(resident, catalog)?;
+    let normalized = identity(WireIdentity {
+        name: resident.identity.name.clone(),
+        model: resident.identity.name.clone(),
+        digest: resident.identity.digest.clone(),
+    })?;
+    local_reference(&resident.identity.name)?;
+    if normalized != resident.identity
+        || classify_show(show, &catalog.0[&resident.identity.name])? == ModelEvidence::Remote
+    {
+        bail!("Ollama resident model is remote or not canonical; no control started");
+    }
+    Ok(normalized)
 }
 
 /// Acknowledgement is not residency evidence. Reject inference/error/remote
@@ -583,9 +626,21 @@ mod tests {
             ReplayBlock::EmbeddingContractUnresolved
         );
         for caps in [
-            json!([]),
             json!(["completion", "vision"]),
+            json!(["tools", "thinking", "completion"]),
+            json!(["completion", "future-capability"]),
+        ] {
+            let mut wider = show();
+            wider["capabilities"] = caps;
+            assert_eq!(classify(wider), ModelEvidence::LocalCompletionCandidate);
+        }
+        let mut both = show();
+        both["capabilities"] = json!(["completion", "embedding"]);
+        assert_eq!(classify(both), ModelEvidence::Embedding);
+        for caps in [
+            json!([]),
             json!(["unknown"]),
+            json!(["vision"]),
             Value::Null,
         ] {
             let mut unknown = show();
@@ -672,7 +727,7 @@ mod tests {
         assert_eq!(saved.0.len(), 1); // Original evidence is never replaced or accumulated.
     }
 
-    fn capture(wire: Value, details: Value) -> Result<ReplayCandidate> {
+    fn capture_with(wire: Value, details: Value, policy: Policy) -> Result<ReplayCandidate> {
         let saved = inventory(vec![wire.clone()]);
         let catalog = catalog(vec![wire]);
         ReplayCandidate::capture(
@@ -680,8 +735,14 @@ mod tests {
             &catalog,
             details.to_string().as_bytes(),
             clock(),
+            policy,
         )
     }
+    fn capture(wire: Value, details: Value) -> Result<ReplayCandidate> {
+        capture_with(wire, details, ABSOLUTE)
+    }
+    const ABSOLUTE: Policy = Policy::AbsoluteDeadline;
+    const FROZEN: Policy = Policy::FrozenRemaining;
     fn clock() -> std::time::SystemTime {
         std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_791_201_300)
     }
@@ -703,7 +764,7 @@ mod tests {
             "prompt":"", "stream":false, "keep_alive":0})
         );
         let request = candidate
-            .preload_request(clock(), Some(std::time::Duration::ZERO))
+            .preload_request(clock(), Some(std::time::Duration::ZERO), ABSOLUTE)
             .unwrap()
             .unwrap();
         assert_eq!(request["options"], json!({"num_ctx":4096}));
@@ -713,7 +774,11 @@ mod tests {
         assert!(request.get("messages").is_none());
         assert_eq!(
             candidate
-                .preload_request(clock() + std::time::Duration::from_secs(300), None)
+                .preload_request(
+                    clock() + std::time::Duration::from_secs(300),
+                    None,
+                    ABSOLUTE
+                )
                 .unwrap(),
             None
         );
@@ -724,7 +789,7 @@ mod tests {
             wire["context_length"] = json!(observed);
             let request = capture(wire, completion_details())
                 .unwrap()
-                .preload_request(clock(), None)
+                .preload_request(clock(), None, ABSOLUTE)
                 .unwrap()
                 .unwrap();
             assert_eq!(request["options"]["num_ctx"], observed);
@@ -738,7 +803,7 @@ mod tests {
             wire["context_length"] = json!(observed);
             assert!(capture(wire, completion_details()).is_err());
         }
-        for capabilities in [json!(["embedding"]), json!(["completion", "vision"])] {
+        for capabilities in [json!(["embedding"]), json!(["vision"]), json!([])] {
             let mut details = completion_details();
             details["capabilities"] = capabilities;
             assert!(capture(model("fixture:latest", 'a'), details).is_err());
@@ -898,5 +963,77 @@ mod tests {
                 .all(|(line, body)| line.starts_with("GET /api/ps ") && body.is_empty())
         );
         assert_eq!(saved.0.len(), 1);
+    }
+
+    #[test]
+    fn frozen_capture_replays_remaining_time_and_indefinite_residency() {
+        let candidate =
+            capture_with(model("fixture:latest", 'a'), completion_details(), FROZEN).unwrap();
+        candidate.validate(FROZEN).unwrap();
+        let later = clock() + std::time::Duration::from_secs(7200);
+        let request = candidate
+            .preload_request(later, Some(std::time::Duration::from_secs(7200)), FROZEN)
+            .unwrap()
+            .unwrap();
+        assert_eq!(request["keep_alive"], "300000000000ns");
+        assert_eq!(request["options"], json!({"num_ctx":4096}));
+        assert_eq!(
+            candidate.frozen_residency(FROZEN),
+            Some(std::time::Duration::from_secs(300))
+        );
+        assert_eq!(candidate.frozen_residency(ABSOLUTE), None);
+        let mut wire = model("fixture:latest", 'a');
+        wire["expires_at"] = json!("2319-01-16T01:01:52.618468107+02:00");
+        assert!(capture(wire.clone(), completion_details()).is_err());
+        let forever = capture_with(wire, completion_details(), FROZEN).unwrap();
+        let request = forever
+            .preload_request(later, None, FROZEN)
+            .unwrap()
+            .unwrap();
+        assert_eq!(request["keep_alive"], -1);
+        assert_eq!(request["model"], "fixture:latest:local");
+        assert_eq!(forever.frozen_residency(FROZEN), None);
+        // The live 0.35.1 capability set of a tool/thinking completion model.
+        let mut details = completion_details();
+        details["capabilities"] = json!(["tools", "thinking", "completion"]);
+        assert!(capture_with(model("fixture:latest", 'a'), details, FROZEN).is_ok());
+    }
+
+    #[test]
+    fn unload_only_accepts_local_unreplayable_models_and_refuses_remote_or_changed() {
+        let wire = model("embed:latest", 'e');
+        let saved = inventory(vec![wire.clone()]);
+        let resident = &saved.0["embed:latest"];
+        let local = catalog(vec![wire.clone()]);
+        let mut details = show();
+        details["capabilities"] = json!(["embedding"]);
+        let identity = unload_only(resident, &local, details.to_string().as_bytes()).unwrap();
+        assert_eq!(
+            unload_request(&identity).unwrap(),
+            json!({"model":"embed:latest:local", "prompt":"", "stream":false, "keep_alive":0})
+        );
+        // Missing metadata is unknown, not remote: unloading stays possible.
+        assert!(unload_only(resident, &local, b"{}".as_slice()).is_ok());
+        let mut remote = details.clone();
+        remote["remote_host"] = json!("remote-fixture");
+        assert!(unload_only(resident, &local, remote.to_string().as_bytes()).is_err());
+        assert!(
+            unload_only(
+                resident,
+                &catalog(vec![model("embed:latest", 'f')]),
+                details.to_string().as_bytes()
+            )
+            .is_err()
+        );
+        assert!(unload_only(resident, &catalog(vec![]), details.to_string().as_bytes()).is_err());
+        let cloud = inventory(vec![model("fixture:cloud", 'a')]);
+        assert!(
+            unload_only(
+                &cloud.0["fixture:cloud"],
+                &catalog(vec![model("fixture:cloud", 'a')]),
+                details.to_string().as_bytes()
+            )
+            .is_err()
+        );
     }
 }

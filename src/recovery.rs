@@ -334,6 +334,7 @@ pub(crate) fn ollama_fixture() -> Entry {
         &catalog,
         show.as_bytes(),
         std::time::UNIX_EPOCH + std::time::Duration::from_secs(100),
+        crate::ollama_expiry::Policy::AbsoluteDeadline,
     )
     .unwrap();
     Entry {
@@ -353,6 +354,7 @@ pub(crate) fn ollama_fixture() -> Entry {
                 original,
                 stage: crate::ollama_session::Stage::Captured,
             }],
+            unload_only: vec![],
             pause_complete: false,
         }),
         restore_complete: false,

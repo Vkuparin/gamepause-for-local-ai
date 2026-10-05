@@ -1,5 +1,6 @@
-//! Absolute observed-deadline policy and validated persisted deadline evidence.
-//! The experimental adapter stores the policy/version; production routing is pending.
+//! Expiry policies and validated persisted deadline evidence.
+//! New captures freeze the remaining keep-alive; journals written under the
+//! earlier absolute-deadline policy keep their original meaning.
 use anyhow::{Result, bail};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use windows_sys::Win32::{
@@ -8,9 +9,36 @@ use windows_sys::Win32::{
 };
 
 pub const POLICY: &str = "absolute-observed-deadline-v1";
-/// Narrow experimental capture limit. Longer or indefinite residency is refused,
-/// never silently shortened or converted to an indefinite request.
+pub const FROZEN_POLICY: &str = "frozen-remaining-v1";
+/// Absolute-policy capture limit. Longer or indefinite residency is refused
+/// there, never silently shortened or converted to an indefinite request.
 pub const MAX_CAPTURED_RESIDENCY: Duration = Duration::from_secs(24 * 60 * 60);
+/// Ollama 0.35.1 reports `keep_alive: -1` as an expiry about 292 years ahead.
+/// A century or more of remaining residency is replayed as indefinite.
+pub const INDEFINITE_RESIDENCY: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Policy {
+    /// Time spent paused consumes residency; an elapsed deadline is not replayed.
+    AbsoluteDeadline,
+    /// The residency remaining at capture is replayed whole after the pause.
+    FrozenRemaining,
+}
+impl Policy {
+    pub fn parse(name: &str) -> Result<Self> {
+        match name {
+            POLICY => Ok(Self::AbsoluteDeadline),
+            FROZEN_POLICY => Ok(Self::FrozenRemaining),
+            _ => bail!("Unsupported Ollama expiry policy"),
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::AbsoluteDeadline => POLICY,
+            Self::FrozenRemaining => FROZEN_POLICY,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -24,15 +52,17 @@ pub struct Deadline {
 pub enum ResidencyPlan {
     Expired,
     KeepFor(Duration),
+    Indefinite,
 }
 
 impl Deadline {
-    pub fn validate(&self, raw: Option<&str>) -> Result<()> {
+    pub fn validate(&self, raw: Option<&str>, policy: Policy) -> Result<()> {
         let raw = raw.ok_or_else(|| anyhow::anyhow!("Ollama expiry evidence is missing"))?;
         if UNIX_EPOCH.checked_add(self.captured_at).is_none()
             || parse_timestamp(raw)? != self.expires_at
             || self.expires_at.saturating_sub(self.captured_at) != self.captured_remaining
-            || self.captured_remaining > MAX_CAPTURED_RESIDENCY
+            || (policy == Policy::AbsoluteDeadline
+                && self.captured_remaining > MAX_CAPTURED_RESIDENCY)
         {
             bail!("Ollama persisted expiry evidence is inconsistent");
         }
@@ -41,9 +71,10 @@ impl Deadline {
     pub fn captured_at(&self) -> Duration {
         self.captured_at
     }
-    /// Missing, zero, indefinite or malformed evidence cannot become a replay
-    /// obligation. An already-expired valid timestamp is a distinct outcome.
-    pub fn capture(raw: Option<&str>, now: SystemTime) -> Result<Self> {
+    /// Missing, zero or malformed evidence cannot become a replay obligation.
+    /// An already-expired valid timestamp is a distinct outcome. Only the
+    /// frozen policy accepts residency beyond the absolute capture limit.
+    pub fn capture(raw: Option<&str>, now: SystemTime, policy: Policy) -> Result<Self> {
         let Some(raw) = raw else {
             bail!("Ollama expiry evidence is missing")
         };
@@ -52,7 +83,7 @@ impl Deadline {
             .duration_since(UNIX_EPOCH)
             .map_err(|_| anyhow::anyhow!("Clock precedes Unix epoch; expiry capture is refused"))?;
         let remaining = expires_at.checked_sub(now).unwrap_or(Duration::ZERO);
-        if remaining > MAX_CAPTURED_RESIDENCY {
+        if policy == Policy::AbsoluteDeadline && remaining > MAX_CAPTURED_RESIDENCY {
             bail!("Ollama expiry exceeds the experimental residency limit");
         }
         Ok(Self {
@@ -62,10 +93,26 @@ impl Deadline {
         })
     }
 
-    /// Within a process, elapsed monotonic time caps the original budget even
-    /// after a wall-clock rollback. After restart only the persisted absolute
-    /// evidence is available; a clock earlier than capture refuses replay.
-    pub fn plan(&self, now: SystemTime, elapsed: Option<Duration>) -> Result<ResidencyPlan> {
+    /// The frozen policy replays the captured remaining residency whatever
+    /// the clocks say. Under the absolute policy, elapsed monotonic time caps
+    /// the original budget within a process even after a wall-clock rollback;
+    /// after restart only the persisted absolute evidence is available, and a
+    /// clock earlier than capture refuses replay.
+    pub fn plan(
+        &self,
+        now: SystemTime,
+        elapsed: Option<Duration>,
+        policy: Policy,
+    ) -> Result<ResidencyPlan> {
+        if policy == Policy::FrozenRemaining {
+            return Ok(if self.captured_remaining.is_zero() {
+                ResidencyPlan::Expired
+            } else if self.captured_remaining >= INDEFINITE_RESIDENCY {
+                ResidencyPlan::Indefinite
+            } else {
+                ResidencyPlan::KeepFor(self.captured_remaining)
+            });
+        }
         let now = now
             .duration_since(UNIX_EPOCH)
             .map_err(|_| anyhow::anyhow!("Clock precedes Unix epoch; replay is refused"))?;
@@ -178,6 +225,8 @@ fn parse_timestamp(raw: &str) -> Result<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    const ABSOLUTE: Policy = Policy::AbsoluteDeadline;
+    const FROZEN: Policy = Policy::FrozenRemaining;
     fn now() -> SystemTime {
         UNIX_EPOCH + parse_timestamp("2026-10-05T12:00:00Z").unwrap()
     }
@@ -215,7 +264,7 @@ mod tests {
 
     #[test]
     fn malformed_missing_and_indefinite_evidence_never_gets_a_default() {
-        assert!(Deadline::capture(None, now()).is_err());
+        assert!(Deadline::capture(None, now(), ABSOLUTE).is_err());
         for raw in [
             "",
             "unknown",
@@ -235,18 +284,22 @@ mod tests {
             "2026-10-05T12:00:00",
             "2026-10-05T12:00:00é",
         ] {
-            assert!(Deadline::capture(Some(raw), now()).is_err(), "{raw}");
+            assert!(
+                Deadline::capture(Some(raw), now(), ABSOLUTE).is_err(),
+                "{raw}"
+            );
         }
     }
 
     #[test]
     fn absolute_deadline_counts_pause_time_and_expires_separately() {
-        let deadline = Deadline::capture(Some("2026-10-05T12:05:00Z"), now()).unwrap();
+        let deadline = Deadline::capture(Some("2026-10-05T12:05:00Z"), now(), ABSOLUTE).unwrap();
         assert_eq!(
             deadline
                 .plan(
                     now() + Duration::from_secs(120),
-                    Some(Duration::from_secs(120))
+                    Some(Duration::from_secs(120)),
+                    ABSOLUTE
                 )
                 .unwrap(),
             ResidencyPlan::KeepFor(Duration::from_secs(180))
@@ -255,33 +308,40 @@ mod tests {
             deadline
                 .plan(
                     now() + Duration::from_secs(300),
-                    Some(Duration::from_secs(300))
+                    Some(Duration::from_secs(300)),
+                    ABSOLUTE
                 )
                 .unwrap(),
             ResidencyPlan::Expired
         );
         assert_eq!(
             deadline
-                .plan(now() + Duration::from_secs(600), None)
+                .plan(now() + Duration::from_secs(600), None, ABSOLUTE)
                 .unwrap(),
             ResidencyPlan::Expired
         );
-        let already_expired = Deadline::capture(Some("2026-10-05T11:59:59Z"), now()).unwrap();
+        let already_expired =
+            Deadline::capture(Some("2026-10-05T11:59:59Z"), now(), ABSOLUTE).unwrap();
         assert_eq!(
-            already_expired.plan(now(), None).unwrap(),
+            already_expired.plan(now(), None, ABSOLUTE).unwrap(),
             ResidencyPlan::Expired
         );
     }
 
     #[test]
     fn clock_changes_cannot_exceed_original_monotonic_budget() {
-        let deadline = Deadline::capture(Some("2026-10-05T12:05:00Z"), now()).unwrap();
-        assert!(deadline.plan(now() - Duration::from_secs(1), None).is_err());
+        let deadline = Deadline::capture(Some("2026-10-05T12:05:00Z"), now(), ABSOLUTE).unwrap();
+        assert!(
+            deadline
+                .plan(now() - Duration::from_secs(1), None, ABSOLUTE)
+                .is_err()
+        );
         assert_eq!(
             deadline
                 .plan(
                     now() + Duration::from_secs(10),
-                    Some(Duration::from_secs(200))
+                    Some(Duration::from_secs(200)),
+                    ABSOLUTE
                 )
                 .unwrap(),
             ResidencyPlan::KeepFor(Duration::from_secs(100))
@@ -290,18 +350,19 @@ mod tests {
             deadline
                 .plan(
                     now() + Duration::from_secs(250),
-                    Some(Duration::from_secs(200))
+                    Some(Duration::from_secs(200)),
+                    ABSOLUTE
                 )
                 .unwrap(),
             ResidencyPlan::KeepFor(Duration::from_secs(50))
         );
         assert_eq!(
-            deadline.plan(now(), Some(Duration::MAX)).unwrap(),
+            deadline.plan(now(), Some(Duration::MAX), ABSOLUTE).unwrap(),
             ResidencyPlan::Expired
         );
         assert_eq!(
             deadline
-                .plan(now() + Duration::from_secs(120), None)
+                .plan(now() + Duration::from_secs(120), None, ABSOLUTE)
                 .unwrap(),
             ResidencyPlan::KeepFor(Duration::from_secs(180))
         );
@@ -309,25 +370,86 @@ mod tests {
 
     #[test]
     fn captured_limit_and_subsecond_expiry_are_not_rounded_up() {
-        let deadline = Deadline::capture(Some("2026-10-06T12:00:00Z"), now()).unwrap();
+        let deadline = Deadline::capture(Some("2026-10-06T12:00:00Z"), now(), ABSOLUTE).unwrap();
         assert_eq!(
-            deadline.plan(now(), None).unwrap(),
+            deadline.plan(now(), None, ABSOLUTE).unwrap(),
             ResidencyPlan::KeepFor(MAX_CAPTURED_RESIDENCY)
         );
-        assert!(Deadline::capture(Some("2026-10-06T12:00:00.000000001Z"), now()).is_err());
-        let deadline = Deadline::capture(Some("2026-10-05T12:00:00.000000001Z"), now()).unwrap();
+        assert!(
+            Deadline::capture(Some("2026-10-06T12:00:00.000000001Z"), now(), ABSOLUTE).is_err()
+        );
+        let deadline =
+            Deadline::capture(Some("2026-10-05T12:00:00.000000001Z"), now(), ABSOLUTE).unwrap();
         assert_eq!(
-            deadline.plan(now(), None).unwrap(),
+            deadline.plan(now(), None, ABSOLUTE).unwrap(),
             ResidencyPlan::KeepFor(Duration::from_nanos(1))
         );
         assert_eq!(
             deadline
                 .plan(
                     now() + Duration::from_nanos(1),
-                    Some(Duration::from_nanos(1))
+                    Some(Duration::from_nanos(1)),
+                    ABSOLUTE
                 )
                 .unwrap(),
             ResidencyPlan::Expired
         );
+    }
+
+    #[test]
+    fn frozen_policy_replays_the_captured_remaining_time_whatever_elapsed() {
+        let deadline = Deadline::capture(Some("2026-10-05T12:05:00Z"), now(), FROZEN).unwrap();
+        deadline
+            .validate(Some("2026-10-05T12:05:00Z"), FROZEN)
+            .unwrap();
+        for (later, elapsed) in [
+            (Duration::ZERO, None),
+            (Duration::from_secs(3600), Some(Duration::from_secs(3600))),
+            (Duration::from_secs(86_400 * 30), Some(Duration::MAX)),
+        ] {
+            assert_eq!(
+                deadline.plan(now() + later, elapsed, FROZEN).unwrap(),
+                ResidencyPlan::KeepFor(Duration::from_secs(300))
+            );
+        }
+        // A rollback before capture changes nothing: no clock is consulted.
+        assert_eq!(
+            deadline
+                .plan(now() - Duration::from_secs(60), None, FROZEN)
+                .unwrap(),
+            ResidencyPlan::KeepFor(Duration::from_secs(300))
+        );
+        let expired = Deadline::capture(Some("2026-10-05T11:59:59Z"), now(), FROZEN).unwrap();
+        assert_eq!(
+            expired.plan(now(), None, FROZEN).unwrap(),
+            ResidencyPlan::Expired
+        );
+        assert!(Deadline::capture(None, now(), FROZEN).is_err());
+        assert!(Deadline::capture(Some("not-a-timestamp"), now(), FROZEN).is_err());
+    }
+
+    #[test]
+    fn frozen_policy_keeps_long_residency_and_replays_indefinite_as_indefinite() {
+        // 100 hours: beyond the absolute limit, replayed exactly when frozen.
+        let raw = "2026-10-09T16:00:00+00:00";
+        assert!(Deadline::capture(Some(raw), now(), ABSOLUTE).is_err());
+        let long = Deadline::capture(Some(raw), now(), FROZEN).unwrap();
+        assert!(long.validate(Some(raw), ABSOLUTE).is_err());
+        assert_eq!(
+            long.plan(now() + Duration::from_secs(7200), None, FROZEN)
+                .unwrap(),
+            ResidencyPlan::KeepFor(Duration::from_secs(360_000))
+        );
+        // The shape Ollama 0.35.1 reports for keep_alive -1.
+        let raw = "2319-01-16T01:01:52.618468107+02:00";
+        let forever = Deadline::capture(Some(raw), now(), FROZEN).unwrap();
+        forever.validate(Some(raw), FROZEN).unwrap();
+        assert_eq!(
+            forever.plan(now(), None, FROZEN).unwrap(),
+            ResidencyPlan::Indefinite
+        );
+        assert_eq!(Policy::parse(FROZEN_POLICY).unwrap(), FROZEN);
+        assert_eq!(Policy::parse(POLICY).unwrap().name(), POLICY);
+        assert!(Policy::parse("future-policy").is_err());
     }
 }

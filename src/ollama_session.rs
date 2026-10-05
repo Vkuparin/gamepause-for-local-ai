@@ -3,8 +3,8 @@ use crate::{
     config::normalized_endpoint,
     coordinator::{Outcome, Planned, Runtime},
     discovery::Game,
-    ollama_contract::{self as contract, ReplayCandidate, ResidentInventory},
-    ollama_expiry,
+    ollama_contract::{self as contract, Identity, ReplayCandidate, ResidentInventory},
+    ollama_expiry::Policy,
     provider::{Guarantee, InferenceBusy, Kind},
     recovery::{Binding, Entry, Intent},
 };
@@ -12,6 +12,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{
     cell::Cell,
+    collections::BTreeMap,
     io::Read,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -100,6 +101,14 @@ pub struct Model {
     pub original: ReplayCandidate,
     pub stage: Stage,
 }
+/// A resident local model outside the replay subset: unloaded with the rest,
+/// never reloaded. Its stage only ever reaches `UnloadAcknowledged`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnloadOnly {
+    pub identity: Identity,
+    pub stage: Stage,
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Snapshot {
@@ -107,6 +116,8 @@ pub struct Snapshot {
     pub source_revision: String,
     pub expiry_policy: String,
     pub models: Vec<Model>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unload_only: Vec<UnloadOnly>,
     pub pause_complete: bool,
 }
 impl Snapshot {
@@ -117,12 +128,45 @@ impl Snapshot {
                 model.stage = Stage::Captured;
             }
         }
+        for model in &mut self.unload_only {
+            model.stage = Stage::Captured;
+        }
+    }
+    /// Serial control units one pause can need; bounds the engine's drivers.
+    pub fn units(&self) -> usize {
+        self.models.len() + self.unload_only.len()
+    }
+    pub fn policy(&self) -> Result<Policy> {
+        Policy::parse(&self.expiry_policy)
+    }
+    /// Names the models this session unloads without a restore obligation.
+    pub fn note(&self) -> String {
+        if self.unload_only.is_empty() {
+            return String::new();
+        }
+        let mut names = self
+            .unload_only
+            .iter()
+            .take(3)
+            .map(|model| model.identity.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if self.unload_only.len() > 3 {
+            names.push_str(&format!(" and {} more", self.unload_only.len() - 3));
+        }
+        format!("Unloaded without reload (outside the restore subset): {names}.")
     }
     pub fn validate_transition(&self, new: &Self) -> Result<()> {
         if self.version != new.version
             || self.source_revision != new.source_revision
             || self.expiry_policy != new.expiry_policy
             || self.models.len() != new.models.len()
+            || self.unload_only.len() != new.unload_only.len()
+            || self
+                .unload_only
+                .iter()
+                .zip(&new.unload_only)
+                .any(|(old, new)| old.identity != new.identity)
             || self.models.iter().zip(&new.models).any(|(old, new)| {
                 old.original != new.original
                     || (old.stage == Stage::Expired && new.stage != Stage::Expired)
@@ -135,17 +179,31 @@ impl Snapshot {
         Ok(())
     }
     pub fn validate(&self) -> Result<()> {
+        let Ok(policy) = self.policy() else {
+            bail!("Unsupported Ollama recovery contract");
+        };
         if self.version != 1
             || self.source_revision != contract::SOURCE_REVISION
-            || self.expiry_policy != ollama_expiry::POLICY
-            || self.models.len() > 256
+            || self.units() > 256
         {
             bail!("Unsupported Ollama recovery contract");
         }
         let mut names = std::collections::BTreeSet::new();
+        for model in &self.unload_only {
+            contract::unload_request(&model.identity)?;
+            if !names.insert(&model.identity.name)
+                || !matches!(
+                    model.stage,
+                    Stage::Captured | Stage::Unloading | Stage::UnloadAcknowledged
+                )
+                || (self.pause_complete && model.stage != Stage::UnloadAcknowledged)
+            {
+                bail!("Inconsistent Ollama recovery progress");
+            }
+        }
         let mut captured_at = None;
         for model in &self.models {
-            model.original.validate()?;
+            model.original.validate(policy)?;
             if !names.insert(&model.original.resident().identity.name)
                 || captured_at.is_some_and(|time| time != model.original.captured_at())
                 || (self.pause_complete
@@ -169,10 +227,26 @@ impl Snapshot {
                 .collect(),
         )
     }
+    /// Every digest a pause promised to free, replayable or not.
+    fn unloaded(&self) -> ResidentInventory {
+        let mut inventory = self.inventory(true);
+        for model in &self.unload_only {
+            inventory.0.insert(
+                model.identity.name.clone(),
+                contract::Resident {
+                    identity: model.identity.clone(),
+                    context_length: None,
+                    expires_at: None,
+                },
+            );
+        }
+        inventory
+    }
 }
 #[derive(Clone, Copy)]
 enum Operation {
     Unload(usize),
+    Release(usize),
     Load(usize),
     ResolveExpiry(usize),
     VerifyPause,
@@ -189,6 +263,10 @@ pub struct Adapter<T, C = SystemClock> {
     started_wall: Duration,
     started_monotonic: Duration,
     retry_restore: Cell<bool>,
+    /// New captures freeze the remaining keep-alive; saved journals keep theirs.
+    capture_policy: Policy,
+    /// Process-local acknowledgement times of frozen loads, by model name.
+    loaded_at: BTreeMap<String, Duration>,
 }
 impl<T: Transport, C: Clock> Adapter<T, C> {
     pub fn new(transport: T, clock: C, binding: Binding) -> Result<Self> {
@@ -212,6 +290,8 @@ impl<T: Transport, C: Clock> Adapter<T, C> {
             started_wall,
             started_monotonic,
             retry_restore: Cell::new(false),
+            capture_policy: Policy::FrozenRemaining,
+            loaded_at: BTreeMap::new(),
         })
     }
     fn guard(&self, binding: &Binding) -> Result<()> {
@@ -232,8 +312,21 @@ impl<T: Transport, C: Clock> Adapter<T, C> {
                     .saturating_sub(self.started_monotonic),
             )
     }
-    fn preload(&self, original: &ReplayCandidate) -> Result<Option<serde_json::Value>> {
-        original.preload_request(self.clock.wall(), Some(self.elapsed(original)))
+    fn preload(
+        &self,
+        original: &ReplayCandidate,
+        policy: Policy,
+    ) -> Result<Option<serde_json::Value>> {
+        original.preload_request(self.clock.wall(), Some(self.elapsed(original)), policy)
+    }
+    fn metadata(&mut self, name: &str) -> Result<(contract::Catalog, Vec<u8>)> {
+        let catalog =
+            contract::parse_catalog(self.transport.request("/api/tags", None)?.as_slice())?;
+        let show = self.transport.request(
+            "/api/show",
+            Some(serde_json::json!({ "model": contract::local_reference(name)? })),
+        )?;
+        Ok((catalog, show))
     }
     fn expired_stage(&mut self, original: &ReplayCandidate) -> Result<Stage> {
         let observed = self.inventory()?;
@@ -250,15 +343,8 @@ impl<T: Transport, C: Clock> Adapter<T, C> {
         )
     }
     /// Recheck the pinned limited contract before each mutation. No tag substitution.
-    fn revalidate(&mut self, original: &ReplayCandidate) -> Result<()> {
-        let catalog =
-            contract::parse_catalog(self.transport.request("/api/tags", None)?.as_slice())?;
-        let show = self.transport.request(
-            "/api/show",
-            Some(serde_json::json!({
-                "model": contract::local_reference(&original.resident().identity.name)?,
-            })),
-        )?;
+    fn revalidate(&mut self, original: &ReplayCandidate, policy: Policy) -> Result<()> {
+        let (catalog, show) = self.metadata(&original.resident().identity.name)?;
         ReplayCandidate::capture(
             original.resident(),
             &catalog,
@@ -266,6 +352,7 @@ impl<T: Transport, C: Clock> Adapter<T, C> {
             UNIX_EPOCH
                 .checked_add(original.captured_at())
                 .context("Invalid persisted Ollama capture clock")?,
+            policy,
         )?;
         Ok(())
     }
@@ -282,10 +369,13 @@ impl<T: Transport, C: Clock> Runtime for Adapter<T, C> {
             .duration_since(UNIX_EPOCH)
             .context("Invalid Ollama capture clock")?;
         self.started_monotonic = self.clock.monotonic();
+        let policy = self.capture_policy;
+        self.loaded_at.clear();
         let inventory = self.inventory()?;
         let catalog =
             contract::parse_catalog(self.transport.request("/api/tags", None)?.as_slice())?;
         let mut models = Vec::new();
+        let mut unload_only = Vec::new();
         for resident in inventory.0.values() {
             let show = self.transport.request(
                 "/api/show",
@@ -293,10 +383,17 @@ impl<T: Transport, C: Clock> Runtime for Adapter<T, C> {
                     "model": contract::local_reference(&resident.identity.name)?,
                 })),
             )?;
-            models.push(Model {
-                original: ReplayCandidate::capture(resident, &catalog, show.as_slice(), now)?,
-                stage: Stage::Captured,
-            });
+            match ReplayCandidate::capture(resident, &catalog, show.as_slice(), now, policy) {
+                Ok(original) => models.push(Model {
+                    original,
+                    stage: Stage::Captured,
+                }),
+                // Local content outside the replay subset still frees memory.
+                Err(_) => unload_only.push(UnloadOnly {
+                    identity: contract::unload_only(resident, &catalog, show.as_slice())?,
+                    stage: Stage::Captured,
+                }),
+            }
         }
         if self.inventory()? != inventory {
             bail!("Ollama residency changed during capture; no control started");
@@ -304,8 +401,9 @@ impl<T: Transport, C: Clock> Runtime for Adapter<T, C> {
         let snapshot = Snapshot {
             version: 1,
             source_revision: contract::SOURCE_REVISION.into(),
-            expiry_policy: ollama_expiry::POLICY.into(),
+            expiry_policy: policy.name().into(),
             models,
+            unload_only,
             pause_complete: false,
         };
         snapshot.validate()?;
@@ -343,6 +441,9 @@ impl<T: Transport, C: Clock> Runtime for Adapter<T, C> {
     fn retry(&self, _: &Binding) {
         self.retry_restore.set(true);
     }
+    fn note(&self, payload: &Snapshot) -> String {
+        payload.note()
+    }
     fn plan(&mut self, entry: &Entry<Snapshot>, intent: Intent) -> Result<Planned<Snapshot, Work>> {
         self.validate(entry, &[])?;
         let mut snapshot = entry.payload.clone();
@@ -373,6 +474,13 @@ impl<T: Transport, C: Clock> Runtime for Adapter<T, C> {
                 }) {
                     snapshot.models[index].stage = Stage::Unloading;
                     Operation::Unload(index)
+                } else if let Some(index) = snapshot
+                    .unload_only
+                    .iter()
+                    .position(|model| model.stage != Stage::UnloadAcknowledged)
+                {
+                    snapshot.unload_only[index].stage = Stage::Unloading;
+                    Operation::Release(index)
                 } else {
                     Operation::VerifyPause
                 }
@@ -401,6 +509,7 @@ impl<T: Transport, C: Clock> Runtime for Adapter<T, C> {
         self.guard(binding)?;
         let mut snapshot = work.snapshot;
         snapshot.validate()?;
+        let policy = snapshot.policy()?;
         let mut complete = false;
         match work.operation {
             Operation::ResolveExpiry(index) => {
@@ -417,7 +526,7 @@ impl<T: Transport, C: Clock> Runtime for Adapter<T, C> {
             }
             Operation::Unload(index) => {
                 let model = &mut snapshot.models[index];
-                self.revalidate(&model.original)?;
+                self.revalidate(&model.original, policy)?;
                 let response = self
                     .transport
                     .request("/api/generate", Some(model.original.unload_request()?))?;
@@ -429,23 +538,47 @@ impl<T: Transport, C: Clock> Runtime for Adapter<T, C> {
                 // Only final inventory establishes unload completion.
                 model.stage = Stage::UnloadAcknowledged;
             }
+            Operation::Release(index) => {
+                let model = &mut snapshot.unload_only[index];
+                // The catalog entry must still be this local content.
+                let (catalog, show) = self.metadata(&model.identity.name)?;
+                let resident = contract::Resident {
+                    identity: model.identity.clone(),
+                    context_length: None,
+                    expires_at: None,
+                };
+                contract::unload_only(&resident, &catalog, show.as_slice())?;
+                let response = self.transport.request(
+                    "/api/generate",
+                    Some(contract::unload_request(&model.identity)?),
+                )?;
+                contract::verify_acknowledgement(
+                    response.as_slice(),
+                    &contract::local_reference(&model.identity.name)?,
+                    true,
+                )?;
+                model.stage = Stage::UnloadAcknowledged;
+            }
             Operation::Load(index) => {
                 let model = &mut snapshot.models[index];
-                if self.preload(&model.original)?.is_none() {
+                let name = model.original.resident().identity.name.clone();
+                self.loaded_at.remove(&name);
+                if self.preload(&model.original, policy)?.is_none() {
                     model.stage = self.expired_stage(&model.original)?;
                 } else {
-                    self.revalidate(&model.original)?;
+                    self.revalidate(&model.original, policy)?;
                     // Read time again after bounded catalog/show work.
-                    if let Some(body) = self.preload(&model.original)? {
+                    if let Some(body) = self.preload(&model.original, policy)? {
                         let response = self.transport.request("/api/generate", Some(body))?;
                         contract::verify_acknowledgement(
                             response.as_slice(),
                             &contract::local_reference(&model.original.resident().identity.name)?,
                             false,
                         )?;
-                        model.stage = if self.preload(&model.original)?.is_none() {
+                        model.stage = if self.preload(&model.original, policy)?.is_none() {
                             Stage::ExpiryPending
                         } else {
+                            self.loaded_at.insert(name, self.clock.monotonic());
                             Stage::LoadAcknowledged
                         };
                     } else {
@@ -455,7 +588,7 @@ impl<T: Transport, C: Clock> Runtime for Adapter<T, C> {
             }
             Operation::VerifyPause => {
                 let observed = self.inventory()?;
-                if !contract::captured_models_absent(&snapshot.inventory(true), &observed) {
+                if !contract::captured_models_absent(&snapshot.unloaded(), &observed) {
                     return Err(InferenceBusy.into());
                 }
                 if !observed.0.is_empty() {
@@ -465,11 +598,30 @@ impl<T: Transport, C: Clock> Runtime for Adapter<T, C> {
             }
             Operation::VerifyRestore => {
                 for model in &mut snapshot.models {
-                    if model.stage != Stage::Expired && self.preload(&model.original)?.is_none() {
+                    if model.stage != Stage::Expired
+                        && self.preload(&model.original, policy)?.is_none()
+                    {
                         model.stage = Stage::ExpiryPending;
                     }
                 }
                 let observed = self.inventory()?;
+                // A frozen residency shorter than the remaining restore work can
+                // run out before this check. That is the replayed timer ending,
+                // not an eviction to retry.
+                let now = self.clock.monotonic();
+                for model in &mut snapshot.models {
+                    let resident = model.original.resident();
+                    if model.stage == Stage::LoadAcknowledged
+                        && !observed.0.contains_key(&resident.identity.name)
+                        && model
+                            .original
+                            .frozen_residency(policy)
+                            .zip(self.loaded_at.get(&resident.identity.name))
+                            .is_some_and(|(kept, loaded)| now.saturating_sub(*loaded) >= kept)
+                    {
+                        model.stage = Stage::Expired;
+                    }
+                }
                 for model in &mut snapshot.models {
                     if model.stage == Stage::ExpiryPending
                         && !observed.0.values().any(|resident| {
@@ -578,9 +730,16 @@ pub(crate) mod tests {
                 }
                 "/api/tags" => json!({"models":self.catalog.values().collect::<Vec<_>>()}),
                 "/api/show" => {
-                    assert!(body.unwrap()["model"].as_str().unwrap().ends_with(":local"));
+                    assert!(
+                        body.as_ref().unwrap()["model"]
+                            .as_str()
+                            .unwrap()
+                            .ends_with(":local")
+                    );
+                    let name = body.unwrap()["model"].as_str().unwrap().to_string();
+                    let embedding = self.embedding || name.starts_with("fixture-embed");
                     json!({"details":{"format":"gguf"},
-                        "capabilities":[if self.embedding {"embedding"} else {"completion"}],
+                        "capabilities":[if embedding {"embedding"} else {"completion"}],
                         "model_info":{"general.architecture":"fixture", "fixture.context_length":8192}})
                 }
                 "/api/generate" => {
@@ -602,15 +761,21 @@ pub(crate) mod tests {
                             Intent::Restore
                         }
                     );
-                    assert!(journal.providers[0].payload.models.iter().any(|model| {
-                        model.original.resident().identity.name == name
-                            && model.stage
-                                == if unloading {
-                                    Stage::Unloading
-                                } else {
-                                    Stage::Loading
-                                }
-                    }));
+                    let payload = &journal.providers[0].payload;
+                    assert!(
+                        payload.models.iter().any(|model| {
+                            model.original.resident().identity.name == name
+                                && model.stage
+                                    == if unloading {
+                                        Stage::Unloading
+                                    } else {
+                                        Stage::Loading
+                                    }
+                        }) || (unloading
+                            && payload.unload_only.iter().any(|model| {
+                                model.identity.name == name && model.stage == Stage::Unloading
+                            }))
+                    );
                     self.posts.push(body.clone());
                     if self.fail == Some((unloading, false)) {
                         bail!("fixture pre-effect failure");
@@ -621,7 +786,10 @@ pub(crate) mod tests {
                         }
                     } else {
                         assert_eq!(body["options"]["num_ctx"], 4096);
-                        assert!(body["keep_alive"].as_str().unwrap().ends_with("ns"));
+                        assert!(
+                            body["keep_alive"] == -1
+                                || body["keep_alive"].as_str().unwrap().ends_with("ns")
+                        );
                         if self.evict {
                             self.resident.clear();
                         }
@@ -653,6 +821,19 @@ pub(crate) mod tests {
         }
     }
     type TestCoordinator = Coordinator<Adapter<Fake, TestClock>, Disk>;
+    /// Journals written before the frozen policy keep absolute-deadline replay.
+    fn legacy_fixture() -> TestCoordinator {
+        let (mut adapter, disk, _) = fixture().into_parts();
+        adapter.capture_policy = Policy::AbsoluteDeadline;
+        Coordinator::new(
+            adapter,
+            disk,
+            vec![binding()],
+            None,
+            Duration::from_secs(10),
+        )
+        .unwrap()
+    }
     fn fixture() -> TestCoordinator {
         let disk = Disk::default();
         let models = [
@@ -693,7 +874,7 @@ pub(crate) mod tests {
     }
     #[test]
     fn a_new_capture_starts_its_budget_after_previous_session_and_idle_time() {
-        let mut c = fixture();
+        let mut c = legacy_fixture();
         drive(&mut c, Intent::Pause, 0);
         drive(&mut c, Intent::Restore, 1);
         assert!(c.journal().is_none());
@@ -722,7 +903,7 @@ pub(crate) mod tests {
     }
     #[test]
     fn delayed_unload_needs_absence_and_restore_uses_remaining_budget() {
-        let mut c = fixture();
+        let mut c = legacy_fixture();
         c.runtime.transport.hold_unload = true;
         drive(&mut c, Intent::Pause, 0);
         assert_eq!(c.statuses()["ollama-main"].state, State::Deferred);
@@ -831,10 +1012,9 @@ pub(crate) mod tests {
     }
     #[test]
     fn unsupported_or_changed_capture_never_sends_control() {
-        for case in 0..4 {
-            let mut c = fixture();
+        for case in 1..4 {
+            let mut c = legacy_fixture();
             match case {
-                0 => c.runtime.transport.embedding = true,
                 1 => c.runtime.transport.changed_capture = true,
                 2 => {
                     c.runtime
@@ -846,9 +1026,9 @@ pub(crate) mod tests {
                 _ => {
                     c.runtime
                         .transport
-                        .resident
+                        .catalog
                         .get_mut("fixture-a:latest")
-                        .unwrap()["context_length"] = Value::Null
+                        .unwrap()["remote_host"] = json!("remote-fixture")
                 }
             }
             drive(&mut c, Intent::Pause, 0);
@@ -859,7 +1039,7 @@ pub(crate) mod tests {
     }
     #[test]
     fn expired_restart_resolves_without_load_and_cannot_resurrect() {
-        let mut c = fixture();
+        let mut c = legacy_fixture();
         drive(&mut c, Intent::Pause, 0);
         let saved = c.store.journal().unwrap();
         c.runtime.clock.0.set((301, 201));
@@ -960,7 +1140,7 @@ pub(crate) mod tests {
     #[test]
     fn load_past_expiry_retains_read_only_reconciliation_across_restart() {
         for response_lost in [false, true] {
-            let mut c = fixture();
+            let mut c = legacy_fixture();
             drive(&mut c, Intent::Pause, 0);
             c.runtime.transport.load_delay = 201;
             if response_lost {
@@ -999,7 +1179,7 @@ pub(crate) mod tests {
     }
     #[test]
     fn expiry_before_final_verification_cannot_clear_still_resident_content() {
-        let mut c = fixture();
+        let mut c = legacy_fixture();
         drive(&mut c, Intent::Pause, 0);
         for _ in 0..2 {
             c.advance(Intent::Restore, &[], Duration::from_secs(1), &mut || false)
@@ -1032,9 +1212,19 @@ pub(crate) mod tests {
             "source_revision",
             "deadline",
             "duplicate",
+            "unload_stage",
+            "unload_duplicate",
         ] {
             let mut value = serde_json::to_value(&original).unwrap();
             match path {
+                "unload_stage" => {
+                    value["unload_only"] = json!([{"identity":{"name":"fixture-x:latest",
+                        "digest":"d".repeat(64)}, "stage":"loading"}])
+                }
+                "unload_duplicate" => {
+                    value["unload_only"] = json!([{"identity":{"name":"fixture-a:latest",
+                        "digest":"d".repeat(64)}, "stage":"captured"}])
+                }
                 "version" => value["version"] = json!(999),
                 "expiry_policy" => value["expiry_policy"] = json!("future-policy"),
                 "source_revision" => value["source_revision"] = json!("unknown"),
@@ -1208,5 +1398,144 @@ pub(crate) mod tests {
         assert!(c.journal().is_none());
         assert!(c.store.journal().is_none());
         thread.join().unwrap();
+    }
+
+    #[test]
+    fn frozen_restore_replays_the_captured_remaining_time_after_a_long_pause() {
+        let mut c = fixture();
+        drive(&mut c, Intent::Pause, 0);
+        assert!(c.pause_complete());
+        assert_eq!(
+            c.journal().unwrap().providers[0].payload.expiry_policy,
+            crate::ollama_expiry::FROZEN_POLICY
+        );
+        // Three hours of gaming, far past the five-minute keep-alive.
+        c.runtime.clock.0.set((100 + 10_800, 10_800));
+        drive(&mut c, Intent::Restore, 10_800);
+        assert!(c.journal().is_none());
+        assert_eq!(c.runtime.transport.resident.len(), 2);
+        assert_eq!(c.runtime.transport.posts.len(), 4);
+        for body in c.runtime.transport.posts.iter().skip(2) {
+            assert_eq!(body["keep_alive"], "200000000000ns");
+        }
+    }
+    #[test]
+    fn frozen_restart_and_indefinite_residency_replay_without_a_clock_budget() {
+        let mut c = fixture();
+        for model in c.runtime.transport.resident.values_mut() {
+            model["expires_at"] = json!("2262-01-01T00:00:00Z");
+        }
+        drive(&mut c, Intent::Pause, 0);
+        let saved = c.store.journal().unwrap();
+        // Restart with a clock before capture: the frozen policy reads no clock.
+        c.runtime.clock.0.set((50, 0));
+        let adapter = Adapter::new(
+            c.runtime.transport.clone(),
+            c.runtime.clock.clone(),
+            binding(),
+        )
+        .unwrap();
+        let mut resumed = Coordinator::new(
+            adapter,
+            c.store.clone(),
+            vec![binding()],
+            Some(saved),
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        drive(&mut resumed, Intent::Restore, 1);
+        assert!(resumed.journal().is_none());
+        assert_eq!(resumed.runtime.transport.posts.len(), 4);
+        for body in resumed.runtime.transport.posts.iter().skip(2) {
+            assert_eq!(body["keep_alive"], -1);
+        }
+    }
+    #[test]
+    fn unsupported_local_models_are_unloaded_reported_and_never_reloaded() {
+        let mut c = fixture();
+        let embed = resident("fixture-embed:latest", 'e');
+        for map in [
+            &mut c.runtime.transport.resident,
+            &mut c.runtime.transport.catalog,
+        ] {
+            map.insert("fixture-embed:latest".into(), embed.clone());
+        }
+        // Unknown expiry also leaves only the unload half available.
+        c.runtime
+            .transport
+            .resident
+            .get_mut("fixture-b:latest")
+            .unwrap()["expires_at"] = Value::Null;
+        drive(&mut c, Intent::Pause, 0);
+        assert!(c.pause_complete());
+        assert!(c.runtime.transport.resident.is_empty());
+        let saved = c.journal().unwrap().providers[0].payload.clone();
+        assert_eq!(saved.models.len(), 1);
+        assert_eq!(saved.units(), 3);
+        assert_eq!(
+            saved
+                .unload_only
+                .iter()
+                .map(|model| model.identity.name.as_str())
+                .collect::<Vec<_>>(),
+            ["fixture-b:latest", "fixture-embed:latest"]
+        );
+        let mut tampered = saved.clone();
+        tampered.unload_only[0].identity.digest = "f".repeat(64);
+        assert!(saved.validate_transition(&tampered).is_err());
+        assert_eq!(c.runtime.transport.posts.len(), 3);
+        let note = "Unloaded without reload (outside the restore subset): \
+                    fixture-b:latest, fixture-embed:latest.";
+        assert_eq!(c.reports(Duration::ZERO)[0].note, note);
+        drive(&mut c, Intent::Restore, 1);
+        assert!(c.journal().is_none());
+        let report = &c.reports(Duration::from_secs(1))[0];
+        assert_eq!(
+            (report.state, report.note.as_str()),
+            (State::Restored, note)
+        );
+        assert_eq!(
+            c.runtime
+                .transport
+                .resident
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["fixture-a:latest"]
+        );
+        assert_eq!(c.runtime.transport.posts.len(), 4);
+    }
+    #[test]
+    fn held_unload_only_model_defers_pause_until_it_is_absent() {
+        let mut c = fixture();
+        c.runtime.transport.embedding = true;
+        c.runtime.transport.hold_unload = true;
+        drive(&mut c, Intent::Pause, 0);
+        assert_eq!(c.statuses()["ollama-main"].state, State::Deferred);
+        assert!(!c.pause_complete());
+        assert!(c.journal().unwrap().providers[0].payload.models.is_empty());
+        c.runtime.transport.resident.clear();
+        drive(&mut c, Intent::Pause, 10);
+        assert!(c.pause_complete());
+        assert_eq!(c.runtime.transport.posts.len(), 2);
+        drive(&mut c, Intent::Restore, 11);
+        assert!(c.journal().is_none());
+        assert!(c.runtime.transport.resident.is_empty());
+    }
+    #[test]
+    fn short_frozen_residency_ending_before_verification_is_expiry_not_eviction() {
+        let mut c = fixture();
+        drive(&mut c, Intent::Pause, 0);
+        // Load both, then let the replayed 200 seconds run out before the check.
+        for _ in 0..3 {
+            c.advance(Intent::Restore, &[], Duration::from_secs(1), &mut || false)
+                .unwrap();
+        }
+        assert_eq!(c.runtime.transport.resident.len(), 2);
+        c.runtime.clock.0.set((400, 300));
+        c.runtime.transport.resident.clear();
+        drive(&mut c, Intent::Restore, 1);
+        assert!(c.journal().is_none());
+        assert_eq!(c.runtime.transport.posts.len(), 4, "no reload fight");
     }
 }

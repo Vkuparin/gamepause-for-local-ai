@@ -249,10 +249,7 @@ fn provider_lines(shared: &Shared, fallback: &str) -> String {
             else {
                 return match provider.kind() {
                     Kind::LMStudio => format!("{}: {fallback}", provider.kind().name()),
-                    Kind::Ollama => {
-                        "Ollama: experimental, not live-tested; AI state unknown until capture."
-                            .into()
-                    }
+                    Kind::Ollama => "Ollama: experimental; AI state unknown until capture.".into(),
                 };
             };
             let state = match report.state {
@@ -274,7 +271,7 @@ fn provider_lines(shared: &Shared, fallback: &str) -> String {
             };
             let mut text = format!("{}: {state}", report.kind.name());
             if report.kind == Kind::Ollama {
-                text.push_str(" Experimental; not tested with a live Ollama installation.");
+                text.push_str(" Experimental; live-tested with Ollama 0.35.1 only.");
             }
             if !report.error.is_empty() {
                 // One bounded native menu row per provider; full detail stays in worker status.
@@ -288,6 +285,9 @@ fn provider_lines(shared: &Shared, fallback: &str) -> String {
                 if error.next().is_some() {
                     text.push_str("...");
                 }
+            }
+            if !report.note.is_empty() {
+                text.push_str(&format!(" {}", report.note));
             }
             if let Some(seconds) = report.retry_seconds {
                 text.push_str(&format!(" Retry backoff at last update: {seconds}s."));
@@ -345,6 +345,7 @@ mod tests {
                     String::new()
                 },
                 retry_seconds: (provider.kind() == Kind::Ollama).then_some(10),
+                note: String::new(),
             })
             .collect();
         let summary = summarize(&shared);

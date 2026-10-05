@@ -124,6 +124,12 @@ impl<L: Runtime, O: Runtime> Runtime for Router<L, O> {
             Kind::Ollama => self.ollama.retry(binding),
         }
     }
+    fn note(&self, payload: &Self::Payload) -> String {
+        match payload {
+            Routed::LMStudio(payload) => self.lm.note(payload),
+            Routed::Ollama(payload) => self.ollama.note(payload),
+        }
+    }
     fn plan(
         &mut self,
         entry: &Entry<Self::Payload>,
@@ -257,6 +263,9 @@ impl Runtime for OllamaRuntime {
             adapter.retry(binding);
         }
     }
+    fn note(&self, payload: &Self::Payload) -> String {
+        payload.note()
+    }
     fn plan(
         &mut self,
         entry: &Entry<Self::Payload>,
@@ -302,6 +311,9 @@ impl Runtime for OllamaRef<'_> {
     }
     fn retry(&self, binding: &Binding) {
         self.0.retry(binding);
+    }
+    fn note(&self, payload: &Self::Payload) -> String {
+        self.0.note(payload)
     }
     fn plan(
         &mut self,
@@ -465,6 +477,12 @@ impl<B: Backend> Runtime for Providers<'_, B> {
     }
     fn retry(&self, binding: &Binding) {
         self.router.retry(binding);
+    }
+    fn note(&self, payload: &Payload) -> String {
+        match payload {
+            Payload::LMStudio(_) => String::new(),
+            Payload::Ollama(snapshot) => snapshot.note(),
+        }
     }
     fn plan(
         &mut self,

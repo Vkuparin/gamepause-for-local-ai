@@ -1498,7 +1498,7 @@ impl Dashboard {
                     },
                     SettingsPage::Ollama=> {
                         ui.heading("Experimental Ollama");
-                        ui.colored_label(p.accent,"Not tested with a live Ollama installation.");
+                        ui.colored_label(p.accent,"Live-tested with Ollama 0.35.1 only.");
                         ui.label("Supports local GGUF completion models with verified identity, supported context and finite observed expiry. Full load options, parallelism, conversations and KV cache are not preserved. Embedding/cloud models and unknown settings are refused.");
                         ui.label("The user-owned service stays running. GamePause does not download models or fight later client reloads.");
                         let saved=s.config.providers.iter().find(|p|p.kind()==crate::provider::Kind::Ollama);
@@ -1690,8 +1690,8 @@ impl Dashboard {
                 Modal::Verify=> {ui.label("This live test captures settings, unloads models and restores them. It can interrupt current inference. Recovery safeguards and fresh game checks remain in force.");},
                 Modal::Ollama(provider)=> {
                     ui.label(format!("Saved endpoint: {}",provider.endpoint()));
-                    ui.colored_label(p.accent,"Experimental. Not tested with a live Ollama installation.");
-                    ui.label("Only supported local GGUF completion models with finite expiry are eligible. Restoration verifies identity, context and remaining observed residency deadline. Full load settings, parallelism, conversations and KV cache are not preserved. Embedding/cloud models and unknown settings are refused.");
+                    ui.colored_label(p.accent,"Experimental. Live-tested with Ollama 0.35.1 only.");
+                    ui.label("Local GGUF completion models are unloaded for gaming and restored with their identity, context and the keep-alive time left when the pause began. Other local models, such as embedding models, are unloaded and not reloaded. Full load settings, parallelism, conversations and KV cache are not preserved. Cloud models are refused.");
                     ui.label("The user-owned service stays running. No model downloads or repeated unloading of later client reloads.");
                 },
                 Modal::Help=> {ui.label("Tab / Shift+Tab moves focus. Enter / Space activates controls. Arrow keys select table rows. Escape closes this dialog or returns to Games. F1 opens this help. Closing the dashboard keeps the tray watcher running. Quit uses the existing safe shutdown path.");},
@@ -1897,7 +1897,12 @@ impl Dashboard {
                             .show(ui, palette)
                             .clicked()
                         {
-                            self.set_page(Page::Activity);
+                            // A second click closes the log, like its Back button.
+                            self.set_page(if self.page == Page::Activity {
+                                Page::Games
+                            } else {
+                                Page::Activity
+                            });
                         }
                     });
                 });
@@ -2116,6 +2121,7 @@ mod tests {
             pending: true,
             error: String::new(),
             retry_seconds: None,
+            note: String::new(),
         }];
         s.running_apps = vec![
             crate::processes::RunningApp {

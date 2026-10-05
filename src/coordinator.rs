@@ -40,6 +40,11 @@ pub trait Runtime {
     }
     /// A provider retry starts a fresh attempt with new verification evidence.
     fn retry(&self, _binding: &Binding) {}
+    /// Factual limits of a successful operation, such as models that were
+    /// unloaded but are outside the restore guarantee. Never an error.
+    fn note(&self, _payload: &Self::Payload) -> String {
+        String::new()
+    }
     /// Plans must be replayable from their checkpoint after a crash/write error.
     fn plan(
         &mut self,
@@ -78,12 +83,16 @@ pub struct Report {
     pub pending: bool,
     pub error: String,
     pub retry_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub note: String,
 }
 #[derive(Clone, Debug)]
 pub struct Status {
     pub state: State,
     pub error: String,
     pub retry_at: Duration,
+    /// Kept after the journal clears so a finished restore still reports it.
+    pub note: String,
 }
 impl Default for Status {
     fn default() -> Self {
@@ -91,6 +100,7 @@ impl Default for Status {
             state: State::Uncaptured,
             error: String::new(),
             retry_at: Duration::ZERO,
+            note: String::new(),
         }
     }
 }
@@ -292,6 +302,10 @@ impl<R: Runtime, S: Store<R::Payload>> Coordinator<R, S> {
                             .as_secs()
                             .saturating_add(u64::from(remaining.subsec_nanos() > 0))
                     }),
+                    note: entry.map_or_else(
+                        || status.note.clone(),
+                        |entry| self.runtime.note(&entry.payload),
+                    ),
                 })
             })
             .collect()
@@ -359,6 +373,7 @@ impl<R: Runtime, S: Store<R::Payload>> Coordinator<R, S> {
                 },
                 error: format!("{error:#}"),
                 retry_at: now.saturating_add(self.retry),
+                note: String::new(),
             },
         );
     }
@@ -483,6 +498,7 @@ impl<R: Runtime, S: Store<R::Payload>> Coordinator<R, S> {
                         entry.binding.id.clone(),
                         Status {
                             state: State::Restored,
+                            note: self.runtime.note(&entry.payload),
                             ..Default::default()
                         },
                     );

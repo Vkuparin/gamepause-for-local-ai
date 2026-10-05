@@ -69,7 +69,7 @@ pub fn ollama(transport: &mut impl Transport) -> Value {
     }));
     json!({"version":version,"inventory":inventory,
         "compatibility":"unverified",
-        "detail":"Experimental, not live-tested. Recovery additionally requires supported local GGUF completion models, unchanged identity/context and observed finite residency. Full load settings and conversations are not preserved."})
+        "detail":"Experimental, live-tested with Ollama 0.35.1 only. Restoration additionally requires local GGUF completion models with unchanged identity/context; other local models are unloaded without reload. Full load settings and conversations are not preserved."})
 }
 fn untested_lm(folder: &Path, error: Option<String>) -> Value {
     let version = match error {

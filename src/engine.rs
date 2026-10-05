@@ -170,6 +170,21 @@ impl<B: Backend> Engine<B> {
                 },
             )
     }
+    /// Enabled provider names for status text; LM Studio when none is enabled.
+    fn provider_names(&self) -> String {
+        let names = self
+            .config
+            .providers
+            .iter()
+            .filter(|provider| provider.enabled())
+            .map(|provider| provider.kind().name())
+            .collect::<Vec<_>>();
+        if names.is_empty() {
+            crate::provider::Kind::LMStudio.name().into()
+        } else {
+            names.join(" and ")
+        }
+    }
     pub fn validate_recovery_edit(&self, updated: &Config) -> Result<()> {
         let Some(journal) = &self.recovery else {
             return self.config.validate_recovery_edit(updated);
@@ -467,7 +482,10 @@ impl<B: Backend> Engine<B> {
                 observer(&self.provider_statuses);
             }
             self.retry_at = 0.;
-            self.message = "Watching games; LM Studio state has not been probed".into();
+            self.message = format!(
+                "Watching games; {} state has not been probed",
+                self.provider_names()
+            );
         }
     }
     /// The explicit gameplay path is the only caller that can use transient
@@ -506,7 +524,10 @@ impl<B: Backend> Engine<B> {
         self.gameplay = policy;
         if self.gameplay.active() && !self.pending() && result.is_ok() {
             self.set_activity(Activity::Coexistence);
-            self.message = "LM Studio: AI restored during gameplay by your choice; automatic pausing is temporarily overridden. Pause AI ends the override.".into();
+            self.message = format!(
+                "{}: AI restored during gameplay by your choice; automatic pausing is temporarily overridden. Pause AI ends the override.",
+                self.provider_names()
+            );
         }
         result
     }
@@ -556,7 +577,10 @@ impl<B: Backend> Engine<B> {
             self.resume_grace = false;
             if !self.pending() {
                 self.set_activity(Activity::Coexistence);
-                self.message = "LM Studio: AI restored during gameplay by your choice; automatic pausing is temporarily overridden. Pause AI ends the override.".into();
+                self.message = format!(
+                    "{}: AI restored during gameplay by your choice; automatic pausing is temporarily overridden. Pause AI ends the override.",
+                    self.provider_names()
+                );
             } else if self.provider_work_ready(Intent::Restore, now) {
                 let result = self.restore_gameplay_checked(scan, false);
                 self.restore_failed = true;
@@ -588,8 +612,10 @@ impl<B: Backend> Engine<B> {
                 });
                 self.last_error = format!("{e:#}");
                 self.message = if busy {
-                    "LM Studio: waiting for active inference to finish; AI has not been paused"
-                        .into()
+                    format!(
+                        "{}: waiting for active inference to finish; AI has not been paused",
+                        self.provider_names()
+                    )
                 } else if was_restore {
                     format!("Restore failed — AI not restored: {}", self.last_error)
                 } else {
@@ -773,9 +799,7 @@ impl<B: Backend> Engine<B> {
                                     crate::recovery::Payload::LMStudio(snapshot) => {
                                         snapshot.models.len()
                                     }
-                                    crate::recovery::Payload::Ollama(snapshot) => {
-                                        snapshot.models.len()
-                                    }
+                                    crate::recovery::Payload::Ollama(snapshot) => snapshot.units(),
                                 })
                                 .sum::<usize>()
                         })
@@ -865,7 +889,7 @@ impl<B: Backend> Engine<B> {
                     .iter()
                     .map(|entry| match &entry.payload {
                         crate::recovery::Payload::LMStudio(snapshot) => snapshot.models.len(),
-                        crate::recovery::Payload::Ollama(snapshot) => snapshot.models.len(),
+                        crate::recovery::Payload::Ollama(snapshot) => snapshot.units(),
                     })
                     .sum::<usize>()
                     .saturating_mul(2)

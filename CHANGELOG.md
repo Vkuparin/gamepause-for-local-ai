@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Finish experimental Ollama control against a live Ollama 0.35.1 installation. It stays off by default behind the same opt-in; other Ollama versions are untested.
+- Accept local GGUF models that advertise `completion` together with other capabilities such as tools, thinking or vision. The earlier completion-only rule refused common models and unloaded nothing.
+- Freeze the keep-alive timer while paused: models come back with the time they had left when the game started, and indefinitely loaded models come back indefinite. Earlier journals keep the previous rule.
+- Unload every local Ollama model for gaming. Models outside the restore subset, such as embedding models, are unloaded without reload and named in the provider status.
+- Status messages name the enabled provider instead of always saying LM Studio.
+- Clicking **Activity** a second time closes the Activity log.
+
 ## 1.7.0 — 2026-10-06
 
 - Slim the tray menu to quick controls: a two-row state header using the dashboard's short wording, the automatic-pausing toggle, **Pause AI**, **Resume AI**, **Open GamePause** and **Quit**. The menu no longer grows when Advanced is shown.

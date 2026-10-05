@@ -38,7 +38,7 @@ fn experimental_ollama_opt_in_is_disclosed_without_control_in_observation() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("experimental, not tested with a live installation"));
+    assert!(stderr.contains("experimental, live-tested with Ollama 0.35.1 only"));
     assert!(stderr.contains("full load settings and conversations are not preserved"));
     assert_eq!(std::fs::read(path).unwrap(), before);
     assert_eq!(
