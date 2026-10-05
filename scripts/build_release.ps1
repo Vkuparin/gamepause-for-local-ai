@@ -31,6 +31,7 @@ try {
         foreach ($taskInternalDoc in $taskInternalDocs) { Remove-Item -LiteralPath $taskInternalDoc.FullName -Force }
     }
     foreach ($taskDoc in $taskUserDocs) { Copy-Item -LiteralPath $taskDoc.FullName -Destination (Join-Path $taskBundle 'docs') -Force }
+    if (Test-Path -LiteralPath 'docs\images') { Copy-Item -LiteralPath 'docs\images' -Destination (Join-Path $taskBundle 'docs') -Recurse -Force }
     $taskNotices = @()
     foreach ($taskPackage in ($taskMetadata.packages | Sort-Object name,version)) {
         if ($taskPackage.name -eq 'gamepause-lmstudio') { continue }
@@ -41,6 +42,17 @@ try {
         New-Item -ItemType Directory -Path $taskLicenseTarget -Force | Out-Null
         foreach ($taskLicense in $taskLicenseFiles) { Copy-Item -LiteralPath $taskLicense.FullName -Destination $taskLicenseTarget -Force }
         if ($taskPackage.license_file) { $taskExplicitLicense = Join-Path $taskPackageRoot $taskPackage.license_file; if (Test-Path -LiteralPath $taskExplicitLicense) { Copy-Item -LiteralPath $taskExplicitLicense -Destination $taskLicenseTarget -Force } }
+        $taskLicenseFamily = switch -Regex ($taskPackage.name) {
+            '^accesskit($|_)' { 'accesskit'; break }
+            '^(ecolor|eframe|egui($|[-_])|emath|epaint($|_))' { 'egui'; break }
+            '^enum-map($|-)' { 'enum-map'; break }
+            default { $taskPackage.name }
+        }
+        $taskSupplement = Join-Path $taskRoot ('assets\third-party-licenses\' + $taskLicenseFamily)
+        if (Test-Path -LiteralPath $taskSupplement) { Copy-Item -Path (Join-Path $taskSupplement '*') -Destination $taskLicenseTarget -Force }
+        if ($taskPackage.name -eq 'epaint_default_fonts') {
+            Copy-Item -Path (Join-Path $taskPackageRoot 'fonts\*.txt') -Destination $taskLicenseTarget -Force
+        }
     }
     $taskNotices | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $taskBundle 'THIRD_PARTY_NOTICES.json') -Encoding utf8
     $taskArchive = Join-Path $taskRoot "dist\GamePause-$taskVersion-windows-x64.zip"

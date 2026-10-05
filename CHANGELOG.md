@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.5.0 — 2026-10-05
+
+- Replace the dashboard with Rust-native eframe/egui, matching the charcoal/orange mockup with a concise status hero, searchable game/application tables and selected-entry cards.
+- Group Advanced settings and use themed Add, Rename, Remove, gameplay Resume, live verification and experimental Ollama dialogs. Preserve worker commands, saved settings and recovery safety checks.
+- Add bounded Activity history, detailed status/diagnostics and five-second success feedback. Retain actionable failures. Use shared vector icons, Windows/bundled fonts, responsive layouts and DPI scaling.
+- Keep the native tray and CLI. Closing the dashboard releases its renderer; Quit retains pending recovery. The owner confirmed the app works and approved publication; no new live provider compatibility or physical accessibility coverage is claimed.
+
 ## 1.0.0 — 2026-10-05
 
 - Add state accents, colored game pausing words, feedback below help and a version footer. Add a saved Appearance choice for the dashboard and tray menu. Fix dark button hover, Advanced scrolling and stale group backgrounds after switching to Light; clarify the gameplay Resume warning.

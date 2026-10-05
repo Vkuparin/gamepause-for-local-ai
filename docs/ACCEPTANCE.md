@@ -1,5 +1,11 @@
 # Candidate acceptance
 
+## v1.5.0 owner acceptance - 2026-10-05
+
+The owner reported "OK, commit and publish, it seems to work now" after checking the redesigned app. This authorizes committing and publishing v1.5.0. Automated checks passed: 257 library tests and 10 CLI integration tests, formatting, Clippy and the release build. The isolated rendering and dashboard lifecycle fixtures also passed individually.
+
+This feedback does not establish new live LM Studio/Ollama, installer-upgrade, startup, sleep/wake, multi-monitor or screen-reader coverage. Ollama remains experimental and off by default. Published SHA256SUMS.txt and BUILD-INFO.json identify the packaged artifacts; the release acceptance asset records approval separately from build-time review status. The v1.0.0 records below are historical.
+
 ## Owner acceptance - 2026-10-05
 
 The owner reported "Human tests passed" and explicitly authorized pushing and publishing v1.0.0. This approval applies to the final appearance review build below. The installer and ZIP are published unchanged. Later versions will focus on further UI and UX improvements.

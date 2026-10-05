@@ -9,3 +9,5 @@ inventory.json
 *.log*
 .env*
 !config.example.json
+
+/scratch/

@@ -8,7 +8,9 @@
 
 GamePause is a small native Rust app for Windows. It notices when a game starts, saves the models currently loaded in LM Studio, unloads them, and restores them afterward. Experimental Ollama control is available by explicit opt-in and is off by default. The model name can change: there is no fixed model list to maintain.
 
-GamePause **1.0.0** passed owner-reported human tests and was approved for publication on 2026-10-05. Download the installer or portable ZIP from [Releases](https://github.com/Vkuparin/gamepause-lmstudio/releases/tag/v1.0.0). See [Acceptance](docs/ACCEPTANCE.md) for the approved build and evidence limits.
+GamePause **1.5.0** was approved for publication on 2026-10-05 after the owner confirmed the app works. Download the installer or portable ZIP from [Releases](https://github.com/Vkuparin/gamepause-lmstudio/releases/tag/v1.5.0). See [Acceptance](docs/ACCEPTANCE.md) for the approval and evidence limits.
+
+The **v1.5.0 UI redesign** uses a Rust-native eframe dashboard and keeps the Win32 tray and existing control/recovery engine. See the [implementation journal](docs/UI_V1.5.0_JOURNAL.md) for validation and remaining acceptance limits.
 
 ## Features
 
@@ -33,7 +35,7 @@ No Python runtime, administrator service, telemetry, recursive game scans, or pe
 2. Keep LM Studio open with the models you want available. Its `lms` CLI must be installed; GamePause finds it automatically. See [Installation](docs/INSTALLATION.md).
 3. Launch games normally. **Automatic pausing is on by default.** GamePause discovers supported launcher installations, saves and unloads your currently loaded models, and restores them after gaming.
 
-Left-click the tray icon or open GamePause from Start to see its dashboard. The **Games** list shows what was discovered and what is running. Newly installed games become available automatically; no observation-mode trial, tooltip inspection, JSON edit, restart, or fixed model list is needed. If a game is missed, use **Running apps → Add selected as game**, or **Add game…** to select its executable.
+Left-click the tray icon or open GamePause from Start to see its dashboard. The **Games** list shows what was discovered and what is running. Newly installed games become available automatically; no observation-mode trial, tooltip inspection, JSON edit, restart, or fixed model list is needed. If a game is missed, use **Running apps → Add as game**, or **Add game…** to select its executable.
 
 You do not need to start LM Studio's HTTP server manually. GamePause uses an already-running server's port, or temporarily opens the local server to capture loaded model settings, then returns it to its original state. Automatic-pausing, startup, exclusions, and optional connection/delay settings are controlled in the app.
 

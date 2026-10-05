@@ -1,1432 +1,2207 @@
-//! Native, on-demand dashboard. Win32 calls never retain state borrows.
+//! Rust-native dashboard. Engine work stays on the existing worker channel.
+use crate::dashboard_theme::{self as design, Checkbox, CheckboxUi, Icon, Palette};
 use crate::{
     app::{Action, Shared, SharedState},
     commands::Outcome,
     config::{Config, ExtraGame},
     control::CoreCommand,
     discovery::canonical,
-    tray,
-    ui_commands::Command,
-    wide,
+    tray, wide,
 };
+use eframe::egui::{self, *};
+use egui_extras::{Column, TableBuilder};
 use std::{
-    cell::RefCell,
-    collections::HashSet,
-    path::PathBuf,
-    ptr::{null, null_mut},
+    collections::{HashSet, VecDeque},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
-        mpsc::Sender,
+        mpsc::{self, Sender},
     },
+    time::{Duration, Instant},
 };
-use windows_sys::Win32::{
-    Foundation::*,
-    Graphics::Gdi::*,
-    System::{LibraryLoader::GetModuleHandleW, SystemServices::SS_OWNERDRAW},
-    UI::{
-        Controls::Dialogs::*, Controls::*, HiDpi::*, Input::KeyboardAndMouse::*,
-        WindowsAndMessaging::*,
-    },
-};
+use std::{path::PathBuf, ptr::null_mut};
+use windows_sys::Win32::{Foundation::HWND, UI::Controls::Dialogs::*};
+use winit::platform::windows::EventLoopBuilderExtWindows;
 
-const STATUS: i32 = 100;
 static RUNNING_REQUESTED: AtomicBool = AtomicBool::new(false);
+static UI_VISIBLE: AtomicBool = AtomicBool::new(false);
+static UI_STOP: AtomicBool = AtomicBool::new(false);
+static BRIDGE: Mutex<Option<Bridge>> = Mutex::new(None);
+struct Bridge {
+    tx: Sender<UiRequest>,
+    ctx: Option<Context>,
+    shared: SharedState,
+    fingerprint: String,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+enum UiRequest {
+    Show,
+    Resume,
+    Verify,
+    Theme,
+    Stop,
+}
+
 pub fn needs_running_apps() -> bool {
     RUNNING_REQUESTED.load(Ordering::Relaxed)
 }
-const AUTO: i32 = Command::Automation as i32;
-const STARTUP: i32 = Command::Startup as i32;
-const NAVIGATION: i32 = 103;
-const RUNNING_GAMES: i32 = 132;
-const HELP: i32 = 133;
-const REFRESH: i32 = Command::Refresh as i32;
-const ADD: i32 = 107;
-const SEARCH: i32 = 108;
-const LIST: i32 = 109;
-const DETAILS: i32 = 110;
-const TOGGLE: i32 = 111;
-const REMOVE: i32 = 112;
-const RESUME: i32 = Command::Resume as i32;
-const PAUSE: i32 = Command::Pause as i32;
-const DELAY: i32 = 115;
-const ADDRESS: i32 = 116;
-const SAVE: i32 = 117;
-const CLI: i32 = 118;
-const FEEDBACK: i32 = 119;
-const SETTINGS: i32 = 120;
-const RENAME: i32 = 121;
-const VERIFY: i32 = Command::Verify as i32;
-const OPEN_FOLDER: i32 = Command::OpenFolder as i32;
-const QUIT: i32 = Command::Quit as i32;
-const PROVIDER_DETAIL: i32 = 137;
-const LM_ENABLED: i32 = 138;
-const NOTIFICATIONS: i32 = 144;
-const SOUND: i32 = 145;
-const OLLAMA_ENABLED: i32 = 146;
-const OLLAMA_ADDRESS: i32 = 147;
-const OLLAMA_ADDRESS_LABEL: i32 = 148;
-const OLLAMA_SAVE: i32 = 149;
-const CONTRIBUTE: i32 = 150;
-const DOCTOR: i32 = Command::Doctor as i32;
-const OLLAMA_DISCLOSURE: &str = "Experimental. Not tested with a live Ollama installation.\r\n\r\nOnly local GGUF completion models with supported context and finite expiry are eligible. GamePause restores verified identity/context and the remaining observed residency deadline. It cannot preserve all load options, parallelism, conversations or KV cache. Embedding/cloud models and unknown settings are refused.\r\n\r\nThe user-owned service stays running. GamePause does not download models or fight later client reloads.\r\n\r\nEnable experimental Ollama control?";
-const DELAY_LABEL: i32 = 122;
-const ADDRESS_LABEL: i32 = 123;
-const TITLE: i32 = 130;
-const SEARCH_LABEL: i32 = 131;
-const OPTIONS_BOX: i32 = 140;
-const GAMES_BOX: i32 = 141;
-const ACTIONS_BOX: i32 = 142;
-const SETTINGS_BOX: i32 = 143;
-const WINDOW_STYLE: u32 = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
-fn dashboard_font(dpi: i32) -> HFONT {
-    unsafe {
-        CreateFontW(
-            -scale(16, dpi),
-            0,
-            0,
-            0,
-            400,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET as u32,
-            0,
-            0,
-            CLEARTYPE_QUALITY as u32,
-            0,
-            wide("Segoe UI").as_ptr(),
-        )
-    }
-}
-fn outer_size(settings_visible: bool, dpi: i32) -> (i32, i32) {
-    let mut rect = RECT {
-        left: 0,
-        top: 0,
-        right: scale(884, dpi),
-        bottom: window_height(settings_visible, dpi),
-    };
-    unsafe {
-        AdjustWindowRectExForDpi(&mut rect, WINDOW_STYLE, 0, 0, dpi as u32);
-    }
-    (rect.right - rect.left, rect.bottom - rect.top)
-}
-/// Scale a 96-DPI design coordinate to the target DPI.
-#[must_use]
 pub fn scale(value: i32, dpi: i32) -> i32 {
     value * dpi / 96
 }
-
-/// Dashboard height for the settings-panel visibility state, at the target DPI.
-/// Client height; native nonclient margins are added separately.
-#[must_use]
-pub fn window_height(settings_visible: bool, dpi: i32) -> i32 {
-    scale(if settings_visible { 1244 } else { 804 }, dpi)
+pub fn is_dialog_message(_: &windows_sys::Win32::UI::WindowsAndMessaging::MSG) -> bool {
+    false
 }
-
-/// Feedback-line geometry `(x, y, w, h)` for the settings-panel visibility state.
-#[must_use]
-pub fn footer_position(settings_visible: bool, dpi: i32) -> (i32, i32, i32, i32) {
-    (
-        scale(24, dpi),
-        scale(if settings_visible { 1174 } else { 734 }, dpi),
-        scale(836, dpi),
-        scale(26, dpi),
-    )
+pub fn theme_changed() {
+    dispatch(UiRequest::Theme);
 }
-
-/// Classic system/contrast colors. This does not opt native client controls into app dark mode.
-#[must_use]
-pub fn ctlcolor_index(message: u32) -> SYS_COLOR_INDEX {
-    if matches!(
-        message,
-        WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX
-    ) {
-        COLOR_WINDOW
-    } else {
-        COLOR_BTNFACE
-    }
-}
-
-/// Base (96-DPI) geometry AND creation attributes of one control. The single
-/// source of truth: used to create the control, to relayout it on DPI change,
-/// and by the group-box bounds test (P1-3).
-#[derive(Clone, Copy)]
-struct Layout {
-    id: i32,
-    class: &'static str,
-    label: &'static str,
-    style: u32,
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
-}
-
-/// One section frame: its box id plus the ids of the controls it contains.
-#[derive(Clone, Copy)]
-#[cfg(test)]
-struct GroupBox {
-    id: i32,
-    members: &'static [i32],
-}
-
-/// The four section frames and their contents. Test-only bookkeeping: the
-/// runtime creates controls straight from `LAYOUT`.
-#[cfg(test)]
-const GROUPBOXES: [GroupBox; 4] = [
-    GroupBox {
-        id: OPTIONS_BOX,
-        members: &[AUTO, SETTINGS],
-    },
-    GroupBox {
-        id: GAMES_BOX,
-        members: &[
-            NAVIGATION,
-            REFRESH,
-            ADD,
-            SEARCH_LABEL,
-            SEARCH,
-            LIST,
-            DETAILS,
-        ],
-    },
-    GroupBox {
-        id: ACTIONS_BOX,
-        members: &[TOGGLE, REMOVE, PAUSE, RESUME, QUIT, RENAME],
-    },
-    GroupBox {
-        id: SETTINGS_BOX,
-        members: &[
-            DELAY_LABEL,
-            DELAY,
-            ADDRESS_LABEL,
-            ADDRESS,
-            SAVE,
-            CLI,
-            STARTUP,
-            VERIFY,
-            OPEN_FOLDER,
-            PROVIDER_DETAIL,
-            LM_ENABLED,
-            NOTIFICATIONS,
-            SOUND,
-            OLLAMA_ENABLED,
-            OLLAMA_ADDRESS,
-            OLLAMA_ADDRESS_LABEL,
-            OLLAMA_SAVE,
-            CONTRIBUTE,
-            DOCTOR,
-        ],
-    },
-];
-
-/// A `LAYOUT` entry by control id (test helper; `Layout` is `Copy`).
-#[cfg(test)]
-fn by_id(id: i32) -> Layout {
-    LAYOUT
-        .iter()
-        .find(|e| e.id == id)
-        .copied()
-        .expect("control id missing from LAYOUT")
-}
-
-/// Every dashboard control, in 96-DPI design units. Order: section boxes first,
-/// then header, then top-to-bottom. Coordinates are the single source of truth
-/// shared by creation, DPI relayout, and the group-box bounds test (P1-3).
-const fn control(
-    id: i32,
-    class: &'static str,
-    label: &'static str,
-    style: u32,
-    rect: [i32; 4],
-) -> Layout {
-    Layout {
-        id,
-        class,
-        label,
-        style,
-        x: rect[0],
-        y: rect[1],
-        w: rect[2],
-        h: rect[3],
-    }
-}
-const READABLE: u32 = ES_MULTILINE as u32 | ES_READONLY as u32 | ES_AUTOVSCROLL as u32 | WS_TABSTOP;
-const ACTION_BUTTON: u32 = WS_TABSTOP | BS_NOTIFY as u32;
-const STATE_ACCENT: i32 = 152;
-const APPEARANCE: i32 = 153;
-const APPEARANCE_LABEL: i32 = 154;
-const LAYOUT: [Layout; 46] = [
-    control(
-        OPTIONS_BOX,
-        "BUTTON",
-        "Automatic pausing",
-        BS_GROUPBOX as u32,
-        [16, 262, 852, 54],
-    ),
-    control(
-        GAMES_BOX,
-        "BUTTON",
-        "Game recognition",
-        BS_GROUPBOX as u32,
-        [16, 322, 852, 298],
-    ),
-    control(
-        ACTIONS_BOX,
-        "BUTTON",
-        "Actions",
-        BS_GROUPBOX as u32,
-        [16, 628, 852, 98],
-    ),
-    control(
-        SETTINGS_BOX,
-        "BUTTON",
-        "Advanced settings",
-        BS_GROUPBOX as u32,
-        [16, 734, 852, 432],
-    ),
-    control(
-        APPEARANCE_LABEL,
-        "STATIC",
-        "Appearance",
-        0,
-        [24, 1116, 332, 28],
-    ),
-    control(
-        APPEARANCE,
-        "COMBOBOX",
-        "",
-        WS_TABSTOP | CBS_DROPDOWNLIST as u32,
-        [376, 1114, 218, 28],
-    ),
-    control(STATE_ACCENT, "STATIC", "", SS_OWNERDRAW, [16, 4, 852, 3]),
-    control(TITLE, "STATIC", "GamePause", 0, [24, 734, 836, 26]),
-    control(
-        RUNNING_GAMES,
-        "EDIT",
-        "Games: waiting for detection.",
-        READABLE,
-        [24, 16, 836, 54],
-    ),
-    control(
-        STATUS,
-        "EDIT",
-        "LM Studio: waiting for detection.",
-        READABLE,
-        [24, 78, 836, 102],
-    ),
-    control(
-        HELP,
-        "EDIT",
-        "Tab moves between controls. Focus an action for its description.",
-        READABLE,
-        [24, 186, 836, 34],
-    ),
-    control(
-        AUTO,
-        "BUTTON",
-        "Automatically pause AI while gaming",
-        BS_AUTOCHECKBOX as u32 | WS_TABSTOP | BS_NOTIFY as u32,
-        [24, 282, 430, 32],
-    ),
-    control(
-        STARTUP,
-        "BUTTON",
-        "Start when I sign in to Windows",
-        BS_AUTOCHECKBOX as u32 | WS_TABSTOP | BS_NOTIFY as u32,
-        [24, 874, 430, 32],
-    ),
-    control(
-        NAVIGATION,
-        "SysTabControl32",
-        "",
-        WS_TABSTOP,
-        [24, 346, 380, 34],
-    ),
-    control(
-        SETTINGS,
-        "BUTTON",
-        "Advanced settings",
-        BS_AUTOCHECKBOX as u32 | WS_TABSTOP | BS_NOTIFY as u32,
-        [478, 282, 382, 32],
-    ),
-    control(
-        REFRESH,
-        "BUTTON",
-        "Refresh games",
-        ACTION_BUTTON,
-        [600, 346, 132, 32],
-    ),
-    control(
-        ADD,
-        "BUTTON",
-        "Add game...",
-        ACTION_BUTTON,
-        [740, 346, 120, 32],
-    ),
-    control(SEARCH_LABEL, "STATIC", "Search", 0, [24, 388, 62, 25]),
-    control(
-        SEARCH,
-        "EDIT",
-        "",
-        WS_TABSTOP | ES_AUTOHSCROLL as u32,
-        [90, 386, 770, 28],
-    ),
-    control(
-        LIST,
-        "LISTBOX",
-        "",
-        WS_TABSTOP
-            | WS_VSCROLL
-            | WS_HSCROLL
-            | LBS_NOTIFY as u32
-            | LBS_OWNERDRAWFIXED as u32
-            | LBS_HASSTRINGS as u32,
-        [24, 422, 836, 108],
-    ),
-    control(DETAILS, "RICHEDIT50W", "", READABLE, [24, 540, 836, 70]),
-    control(
-        TOGGLE,
-        "BUTTON",
-        "Ignore selected",
-        ACTION_BUTTON,
-        [24, 650, 184, 32],
-    ),
-    control(
-        REMOVE,
-        "BUTTON",
-        "Remove selected",
-        ACTION_BUTTON,
-        [218, 650, 152, 32],
-    ),
-    control(
-        RENAME,
-        "BUTTON",
-        "Rename",
-        ACTION_BUTTON,
-        [380, 650, 100, 32],
-    ),
-    control(
-        PAUSE,
-        "BUTTON",
-        "Pause AI",
-        ACTION_BUTTON,
-        [490, 650, 150, 32],
-    ),
-    control(
-        RESUME,
-        "BUTTON",
-        "Resume AI",
-        ACTION_BUTTON,
-        [650, 650, 210, 32],
-    ),
-    control(
-        VERIFY,
-        "BUTTON",
-        "Test round-trip",
-        ACTION_BUTTON,
-        [24, 914, 176, 32],
-    ),
-    control(
-        DELAY_LABEL,
-        "STATIC",
-        "Restore after (seconds)",
-        0,
-        [24, 756, 180, 25],
-    ),
-    control(
-        DELAY,
-        "EDIT",
-        "30",
-        WS_TABSTOP | ES_AUTOHSCROLL as u32,
-        [206, 754, 65, 28],
-    ),
-    control(ADDRESS_LABEL, "STATIC", "Local API", 0, [292, 756, 80, 25]),
-    control(
-        ADDRESS,
-        "EDIT",
-        "127.0.0.1:1234",
-        WS_TABSTOP | ES_AUTOHSCROLL as u32,
-        [376, 754, 218, 28],
-    ),
-    control(
-        SAVE,
-        "BUTTON",
-        "Save settings",
-        ACTION_BUTTON,
-        [604, 754, 128, 32],
-    ),
-    control(
-        CLI,
-        "BUTTON",
-        "Locate lms...",
-        ACTION_BUTTON,
-        [742, 754, 118, 32],
-    ),
-    control(
-        OPEN_FOLDER,
-        "BUTTON",
-        "Open logs and status folder",
-        ACTION_BUTTON,
-        [210, 914, 282, 32],
-    ),
-    control(QUIT, "BUTTON", "Quit", ACTION_BUTTON, [742, 690, 118, 32]),
-    control(PROVIDER_DETAIL, "EDIT", "", READABLE, [24, 794, 836, 70]),
-    control(
-        LM_ENABLED,
-        "BUTTON",
-        "Enable LM Studio control",
-        BS_AUTOCHECKBOX as u32 | WS_TABSTOP | BS_NOTIFY as u32,
-        [478, 874, 382, 32],
-    ),
-    control(
-        NOTIFICATIONS,
-        "BUTTON",
-        "Windows notifications",
-        BS_AUTOCHECKBOX as u32 | WS_TABSTOP | BS_NOTIFY as u32,
-        [24, 954, 430, 32],
-    ),
-    control(
-        SOUND,
-        "BUTTON",
-        "Sound for notifications",
-        BS_AUTOCHECKBOX as u32 | WS_TABSTOP | BS_NOTIFY as u32,
-        [478, 954, 382, 32],
-    ),
-    control(FEEDBACK, "EDIT", "", READABLE, [24, 222, 836, 34]),
-    control(
-        OLLAMA_ENABLED,
-        "BUTTON",
-        "Enable experimental Ollama (not live-tested)",
-        BS_AUTOCHECKBOX as u32 | WS_TABSTOP | BS_NOTIFY as u32,
-        [24, 994, 836, 32],
-    ),
-    control(
-        OLLAMA_ADDRESS_LABEL,
-        "STATIC",
-        "Ollama loopback endpoint",
-        0,
-        [24, 1034, 332, 28],
-    ),
-    control(
-        OLLAMA_ADDRESS,
-        "EDIT",
-        "127.0.0.1:11434",
-        WS_TABSTOP | ES_AUTOHSCROLL as u32,
-        [376, 1034, 218, 28],
-    ),
-    control(
-        OLLAMA_SAVE,
-        "BUTTON",
-        "Save Ollama endpoint",
-        ACTION_BUTTON,
-        [604, 1034, 256, 32],
-    ),
-    control(
-        CONTRIBUTE,
-        "BUTTON",
-        "Contribute Ollama fixes or live evidence",
-        ACTION_BUTTON,
-        [24, 1074, 570, 32],
-    ),
-    control(
-        DOCTOR,
-        "BUTTON",
-        "Read-only diagnostics",
-        ACTION_BUTTON,
-        [604, 1074, 256, 32],
-    ),
-];
-#[cfg(test)]
-pub(crate) fn shared_command_ids(advanced: bool) -> Vec<i32> {
-    LAYOUT
-        .iter()
-        .filter_map(|control| {
-            Command::from_id(control.id)
-                .filter(|command| command.visible(advanced))
-                .map(|command| command as i32)
+fn dispatch(request: UiRequest) {
+    let ctx = BRIDGE
+        .lock()
+        .ok()
+        .and_then(|bridge| {
+            bridge.as_ref().map(|b| {
+                let _ = b.tx.send(request);
+                b.ctx.clone()
+            })
         })
-        .collect()
-}
-
-/// Settings-row control ids, toggled together and repositioned by `relayout`.
-const SETTINGS_ROW: [i32; 22] = [
-    APPEARANCE,
-    APPEARANCE_LABEL,
-    DOCTOR,
-    OLLAMA_ENABLED,
-    OLLAMA_ADDRESS,
-    OLLAMA_ADDRESS_LABEL,
-    OLLAMA_SAVE,
-    CONTRIBUTE,
-    NOTIFICATIONS,
-    SOUND,
-    STARTUP,
-    VERIFY,
-    OPEN_FOLDER,
-    PROVIDER_DETAIL,
-    LM_ENABLED,
-    DELAY,
-    ADDRESS,
-    SAVE,
-    CLI,
-    DELAY_LABEL,
-    ADDRESS_LABEL,
-    SETTINGS_BOX,
-];
-
-#[cfg(test)]
-fn is_settings_row(id: i32) -> bool {
-    SETTINGS_ROW.contains(&id)
-}
-
-/// Show/hide settings controls. Positioning uses the current viewport separately.
-fn apply_settings_visibility(hwnd: HWND, visible: bool) {
-    unsafe {
-        for id in SETTINGS_ROW {
-            let child = GetDlgItem(hwnd, id);
-            if !child.is_null() {
-                ShowWindow(child, if visible { SW_SHOW } else { SW_HIDE });
-            }
-        }
+        .flatten();
+    if let Some(ctx) = ctx {
+        ctx.request_repaint();
     }
 }
-
-/// Pixel offsets into the fixed logical canvas. Controls keep their measured
-/// captions even when a work area cannot fit the whole canvas.
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
-struct Viewport {
-    x: i32,
-    y: i32,
-}
-impl Viewport {
-    fn bounded(self, content: (i32, i32), client: (i32, i32)) -> Self {
-        Self {
-            x: self.x.clamp(0, (content.0 - client.0).max(0)),
-            y: self.y.clamp(0, (content.1 - client.1).max(0)),
+pub fn close() {
+    UI_STOP.store(true, Ordering::Relaxed);
+    let bridge = BRIDGE.lock().ok().and_then(|mut b| b.take());
+    if let Some(mut bridge) = bridge {
+        let _ = bridge.tx.send(UiRequest::Stop);
+        if let Some(ctx) = bridge.ctx {
+            ctx.request_repaint();
+        }
+        if let Some(thread) = bridge.thread.take() {
+            let _ = thread.join();
         }
     }
-    fn reveal(self, rect: (i32, i32, i32, i32), client: (i32, i32)) -> Self {
-        fn axis(offset: i32, start: i32, size: i32, page: i32) -> i32 {
-            if start < offset || size > page {
-                start
-            } else if start + size > offset + page {
-                start + size - page
-            } else {
-                offset
-            }
-        }
-        Self {
-            x: axis(self.x, rect.0, rect.2, client.0),
-            y: axis(self.y, rect.1, rect.3, client.1),
-        }
-    }
+    RUNNING_REQUESTED.store(false, Ordering::Relaxed);
+    UI_VISIBLE.store(false, Ordering::Relaxed);
 }
-
-fn needed_scrollbars(content: (i32, i32), available: (i32, i32), bar: (i32, i32)) -> (bool, bool) {
-    let mut horizontal = content.0 > available.0;
-    let mut vertical = content.1 > available.1;
-    // One required bar can make the other axis overflow.
-    for _ in 0..2 {
-        horizontal |= content.0 > available.0 - if vertical { bar.0 } else { 0 };
-        vertical |= content.1 > available.1 - if horizontal { bar.1 } else { 0 };
-    }
-    (horizontal, vertical)
-}
-
-// Native EDIT retains wrapping, keyboard scrolling and selection. Show a bar
-// only when its fully wrapped text exceeds the available height.
-fn update_text_scrollbar(hwnd: HWND) {
-    unsafe {
-        if hwnd.is_null() || GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & ES_READONLY as u32 == 0 {
-            return;
-        }
-        ShowScrollBar(hwnd, SB_VERT, 0);
-        let mut rect: RECT = std::mem::zeroed();
-        SendMessageW(hwnd, EM_GETRECT, 0, &mut rect as *mut RECT as isize);
-        let dc = GetDC(hwnd);
-        if dc.is_null() {
-            return;
-        }
-        let font = SendMessageW(hwnd, WM_GETFONT, 0, 0) as HGDIOBJ;
-        let old = SelectObject(dc, font);
-        let mut metrics: TEXTMETRICW = std::mem::zeroed();
-        let measured = GetTextMetricsW(dc, &mut metrics) != 0;
-        SelectObject(dc, old);
-        ReleaseDC(hwnd, dc);
-        let lines = SendMessageW(hwnd, EM_GETLINECOUNT, 0, 0) as i32;
-        if measured && lines * metrics.tmHeight > rect.bottom - rect.top {
-            ShowScrollBar(hwnd, SB_VERT, 1);
-        }
-    }
-}
-
-fn position_controls() {
-    let Some(state) = snapshot() else { return };
-    if state.positioning {
+/// Called by the existing tray timer. Unchanged state does not redraw the GPU window.
+pub fn refresh() {
+    if !UI_VISIBLE.load(Ordering::Relaxed) {
         return;
     }
-    STATE.with(|s| {
-        if let Some(s) = s.borrow_mut().as_mut() {
-            s.positioning = true;
-        }
+    let shared = BRIDGE
+        .lock()
+        .ok()
+        .and_then(|b| b.as_ref().map(|b| b.shared.clone()));
+    let Some(shared) = shared else { return };
+    let Ok(s) = shared.lock().map(|s| s.clone()) else {
+        return;
+    };
+    let summary = crate::presentation::summarize(&s);
+    let fingerprint = format!(
+        "{}|{}|{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{}|{:?}",
+        summary.games,
+        summary.ai_text(),
+        s.revision,
+        s.commands.latest,
+        s.running_apps,
+        s.settings_error,
+        s.restore_offer,
+        s.verify_report,
+        s.doctor_report,
+        s.provider_statuses,
+        s.commands.settings_pending,
+        s.doctor_pending,
+        s.verifying,
+        s.discovery_ready,
+        s.games
+    );
+    let ctx = BRIDGE.lock().ok().and_then(|mut b| {
+        b.as_mut().and_then(|b| {
+            if b.fingerprint == fingerprint {
+                return None;
+            }
+            b.fingerprint = fingerprint;
+            b.ctx.clone()
+        })
     });
-    unsafe {
-        let dpi = GetDpiForWindow(state.hwnd) as i32;
-        let content = (scale(884, dpi), window_height(state.settings_visible, dpi));
-        // Measure the space without bars, then solve both axes together.
-        // Changing nonclient bars can dispatch WM_SIZE; positioning guards reentry.
-        let mut client: RECT = std::mem::zeroed();
-        GetClientRect(state.hwnd, &mut client);
-        let style = GetWindowLongPtrW(state.hwnd, GWL_STYLE) as u32;
-        let bar = (
-            GetSystemMetricsForDpi(SM_CXVSCROLL, dpi as u32),
-            GetSystemMetricsForDpi(SM_CYHSCROLL, dpi as u32),
-        );
-        let available = (
-            client.right + if style & WS_VSCROLL != 0 { bar.0 } else { 0 },
-            client.bottom + if style & WS_HSCROLL != 0 { bar.1 } else { 0 },
-        );
-        let (horizontal, vertical) = needed_scrollbars(content, available, bar);
-        ShowScrollBar(state.hwnd, SB_HORZ, i32::from(horizontal));
-        ShowScrollBar(state.hwnd, SB_VERT, i32::from(vertical));
-        GetClientRect(state.hwnd, &mut client);
-        let page = (client.right.max(0), client.bottom.max(0));
-        let viewport = state.viewport.bounded(content, page);
-        STATE.with(|s| {
-            if let Some(s) = s.borrow_mut().as_mut() {
-                s.viewport = viewport;
-            }
-        });
-        for (bar, extent, size, pos) in [
-            (SB_HORZ, content.0, page.0, viewport.x),
-            (SB_VERT, content.1, page.1, viewport.y),
-        ] {
-            let info = SCROLLINFO {
-                cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
-                fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
-                nMin: 0,
-                nMax: extent - 1,
-                nPage: size as u32,
-                nPos: pos,
-                nTrackPos: 0,
-            };
-            SetScrollInfo(state.hwnd, bar, &info, 1);
-        }
-        let mut positions = Vec::with_capacity(LAYOUT.len());
-        let mut resized_text = Vec::new();
-        for e in LAYOUT {
-            let (x, y, w, h) = if e.id == TITLE {
-                footer_position(state.settings_visible, dpi)
-            } else {
-                (
-                    scale(e.x, dpi),
-                    scale(e.y, dpi),
-                    scale(e.w, dpi),
-                    scale(e.h, dpi),
-                )
-            };
-            let child = GetDlgItem(state.hwnd, e.id);
-            if child.is_null() {
-                continue;
-            }
-            let mut old: RECT = std::mem::zeroed();
-            GetWindowRect(child, &mut old);
-            if matches!(e.class, "EDIT" | "RICHEDIT50W")
-                && e.style & ES_READONLY as u32 != 0
-                && (old.right - old.left != w || old.bottom - old.top != h)
-            {
-                resized_text.push(child);
-            }
-            positions.push((child, x - viewport.x, y - viewport.y, w, h));
-        }
-        let mut batch = BeginDeferWindowPos(positions.len() as i32);
-        for &(child, x, y, w, h) in &positions {
-            if batch.is_null() {
-                break;
-            }
-            batch = DeferWindowPos(
-                batch,
-                child,
-                null_mut(),
-                x,
-                y,
-                w,
-                h,
-                SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW,
-            );
-        }
-        if batch.is_null() || EndDeferWindowPos(batch) == 0 {
-            // A failed batch discards earlier deferred moves. Apply all moves.
-            for &(child, x, y, w, h) in &positions {
-                SetWindowPos(
-                    child,
-                    null_mut(),
-                    x,
-                    y,
-                    w,
-                    h,
-                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW,
+    if let Some(ctx) = ctx {
+        ctx.request_repaint();
+    }
+}
+pub fn show(shared: SharedState, tx: Sender<Action>, folder: PathBuf) {
+    if BRIDGE.lock().is_ok_and(|b| {
+        b.as_ref()
+            .is_some_and(|b| b.thread.as_ref().is_some_and(|t| t.is_finished()))
+    }) {
+        close();
+    }
+    if BRIDGE.lock().is_ok_and(|b| b.is_some()) {
+        dispatch(UiRequest::Show);
+        return;
+    }
+    let (ui_tx, rx) = mpsc::channel();
+    UI_STOP.store(false, Ordering::Relaxed);
+    let rx = Arc::new(Mutex::new(rx));
+    let Ok(mut bridge) = BRIDGE.lock() else {
+        return;
+    };
+    *bridge = Some(Bridge {
+        tx: ui_tx,
+        ctx: None,
+        shared: shared.clone(),
+        fingerprint: String::new(),
+        thread: None,
+    });
+    let thread = std::thread::Builder::new()
+        .name("gamepause-ui".into())
+        .spawn(move || {
+            let mut initial = Some(UiRequest::Show);
+            loop {
+                let request = initial
+                    .take()
+                    .or_else(|| rx.lock().ok().and_then(|rx| rx.recv().ok()));
+                let Some(request) = request else { break };
+                if matches!(request, UiRequest::Stop) {
+                    break;
+                }
+                if matches!(request, UiRequest::Theme) {
+                    continue;
+                }
+                let error_state = shared.clone();
+                let app_shared = shared.clone();
+                let app_tx = tx.clone();
+                let app_folder = folder.clone();
+                let app_rx = rx.clone();
+                let result = eframe::run_native(
+                    "GamePause for LM Studio",
+                    native_options(),
+                    Box::new(move |cc| {
+                        design::fonts(&cc.egui_ctx);
+                        if let Ok(mut b) = BRIDGE.lock()
+                            && let Some(b) = b.as_mut()
+                        {
+                            b.ctx = Some(cc.egui_ctx.clone());
+                        }
+                        let mut app = Dashboard::new(app_shared, app_tx, app_folder, app_rx);
+                        let s = app.shared.lock().map(|s| s.clone()).unwrap_or_default();
+                        match request {
+                            UiRequest::Resume => app.resume(&s),
+                            UiRequest::Verify if crate::ui_commands::verify_available(&s) => {
+                                app.modal = Some(Modal::Verify)
+                            }
+                            _ => (),
+                        }
+                        Ok(Box::new(app))
+                    }),
                 );
-            }
-        }
-        for child in resized_text {
-            update_text_scrollbar(child);
-        }
-        RedrawWindow(
-            state.hwnd,
-            null(),
-            null_mut(),
-            RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN,
-        );
-    }
-    STATE.with(|s| {
-        if let Some(s) = s.borrow_mut().as_mut() {
-            s.positioning = false;
-        }
-    });
-}
-
-fn reveal_focus() {
-    let Some(state) = snapshot() else { return };
-    unsafe {
-        let focus = GetFocus();
-        if IsChild(state.hwnd, focus) == 0 {
-            return;
-        }
-        let mut rect: RECT = std::mem::zeroed();
-        GetWindowRect(focus, &mut rect);
-        MapWindowPoints(
-            null_mut(),
-            state.hwnd,
-            &mut rect as *mut RECT as *mut POINT,
-            2,
-        );
-        let mut client: RECT = std::mem::zeroed();
-        GetClientRect(state.hwnd, &mut client);
-        let viewport = state.viewport.reveal(
-            (
-                rect.left + state.viewport.x,
-                rect.top + state.viewport.y,
-                rect.right - rect.left,
-                rect.bottom - rect.top,
-            ),
-            (client.right, client.bottom),
-        );
-        if viewport != state.viewport {
-            STATE.with(|s| {
-                if let Some(s) = s.borrow_mut().as_mut() {
-                    s.viewport = viewport;
+                if let Ok(mut b) = BRIDGE.lock()
+                    && let Some(b) = b.as_mut()
+                {
+                    b.ctx = None;
                 }
-            });
-            position_controls();
-        }
-    }
-}
-
-fn scroll_viewport(horizontal: bool, request: i32) {
-    let Some(state) = snapshot() else { return };
-    unsafe {
-        let bar = if horizontal { SB_HORZ } else { SB_VERT };
-        let mut info = SCROLLINFO {
-            cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
-            fMask: SIF_ALL,
-            ..std::mem::zeroed()
-        };
-        if GetScrollInfo(state.hwnd, bar, &mut info) == 0 {
-            return;
-        }
-        let line = scale(24, GetDpiForWindow(state.hwnd) as i32);
-        let pos = match request {
-            SB_LINEUP => info.nPos - line,
-            SB_LINEDOWN => info.nPos + line,
-            SB_PAGEUP => info.nPos - info.nPage as i32,
-            SB_PAGEDOWN => info.nPos + info.nPage as i32,
-            SB_THUMBTRACK | SB_THUMBPOSITION => info.nTrackPos,
-            SB_TOP => 0,
-            SB_BOTTOM => info.nMax,
-            _ => return,
-        };
-        STATE.with(|s| {
-            if let Some(s) = s.borrow_mut().as_mut() {
-                if horizontal {
-                    s.viewport.x = pos;
-                } else {
-                    s.viewport.y = pos;
+                UI_VISIBLE.store(false, Ordering::Relaxed);
+                RUNNING_REQUESTED.store(false, Ordering::Relaxed);
+                if let Err(error) = result {
+                    crate::app::local_result(
+                        &error_state,
+                        Outcome::Failed,
+                        format!("Could not open dashboard: {error}"),
+                    );
+                    crate::app::log(&folder, &format!("Dashboard renderer failed: {error}"));
                 }
+                if UI_STOP.load(Ordering::Relaxed) {
+                    break;
+                }
+                // The same thread reuses eframe's thread-local Windows event loop.
+                // A closed dashboard has no window or renderer and blocks on the mailbox.
             }
         });
-        position_controls();
-    }
-}
-
-/// Update cached fonts and control geometry without changing the user's window
-/// dimensions or overriding the rectangle supplied with WM_DPICHANGED.
-fn relayout(hwnd: HWND, dpi: i32, settings_visible: bool) {
-    unsafe {
-        let cached = snapshot().and_then(|s| s.fonts.get(&dpi).copied());
-        let font = cached.unwrap_or_else(|| dashboard_font(dpi));
-        if font.is_null() {
-            return;
-        }
-        STATE.with(|state| {
-            if let Some(s) = state.borrow_mut().as_mut() {
-                s.font = font;
-                s.fonts.insert(dpi, font);
+    match thread {
+        Ok(thread) => {
+            if let Some(b) = bridge.as_mut() {
+                b.thread = Some(thread);
             }
-        });
-        // Controls may retain selected fonts in cached DCs until destruction.
-        // Keep one owned font per DPI and release them after all children die.
-        for e in LAYOUT {
-            SendMessageW(GetDlgItem(hwnd, e.id), WM_SETFONT, font as usize, 1);
         }
-        SendMessageW(
-            GetDlgItem(hwnd, LIST),
-            LB_SETITEMHEIGHT,
-            0,
-            row_height(dpi) as isize,
-        );
-        apply_settings_visibility(hwnd, settings_visible);
-        position_controls();
-        if let Some(state) = snapshot() {
-            SendMessageW(
-                state.tooltips.hwnd,
-                TTM_SETMAXTIPWIDTH,
-                0,
-                scale(480, dpi) as isize,
-            );
-            SendMessageW(state.tooltips.hwnd, WM_SETFONT, font as usize, 1);
+        Err(error) => {
+            *bridge = None;
+            drop(bridge);
+            tray::error(&format!("Could not start dashboard: {error}"));
         }
     }
 }
+fn native_options() -> eframe::NativeOptions {
+    eframe::NativeOptions {
+        viewport: ViewportBuilder::default()
+            .with_inner_size([1120.0, 920.0])
+            .with_min_inner_size([620.0, 580.0])
+            .with_icon(app_icon()),
+        renderer: eframe::Renderer::Glow,
+        event_loop_builder: Some(Box::new(|builder| {
+            builder.with_any_thread(true);
+        })),
+        ..Default::default()
+    }
+}
+fn app_icon() -> IconData {
+    let mut rgba = vec![0; 32 * 32 * 4];
+    for y in 4..28 {
+        for x in (7..13).chain(19..25) {
+            let i = (y * 32 + x) * 4;
+            rgba[i..i + 4].copy_from_slice(&[255, 133, 48, 255]);
+        }
+    }
+    IconData {
+        rgba,
+        width: 32,
+        height: 32,
+    }
+}
+/// The native tray routes gameplay confirmation into the same themed modal.
+pub fn request_resume(shared: SharedState, tx: Sender<Action>) {
+    let folder = crate::config::data_directory();
+    show(shared, tx, folder);
+    dispatch(UiRequest::Resume);
+}
+pub fn request_verify_modal(shared: SharedState, tx: Sender<Action>, folder: PathBuf) {
+    show(shared, tx, folder);
+    dispatch(UiRequest::Verify);
+}
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Page {
     Games,
     Running,
     Ignored,
+    Activity,
 }
-impl Page {
-    fn tab(self) -> usize {
-        match self {
-            Self::Games => 0,
-            Self::Running => 1,
-            Self::Ignored => 2,
-        }
-    }
-    fn from_tab(index: isize) -> Option<Self> {
-        match index {
-            0 => Some(Self::Games),
-            1 => Some(Self::Running),
-            2 => Some(Self::Ignored),
-            _ => None,
-        }
-    }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsPage {
+    General,
+    Detection,
+    LMStudio,
+    Ollama,
+    Recovery,
+    Diagnostics,
 }
-fn select_page(index: isize) {
-    let Some(page) = Page::from_tab(index) else {
-        return;
-    };
-    let Some(state) = snapshot() else { return };
-    RUNNING_REQUESTED.store(page == Page::Running, Ordering::Relaxed);
-    STATE.with(|s| {
-        if let Some(s) = s.borrow_mut().as_mut() {
-            s.page = page;
-        }
-    });
-    set(unsafe { GetDlgItem(state.hwnd, SEARCH) }, "");
-    refresh();
-}
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Row {
-    label: String,
-    path: String,
     name: String,
+    path: String,
+    platform: String,
     custom: bool,
     ignored: bool,
     running: bool,
+    pid: Option<u32>,
 }
-fn selected_index(rows: &[Row], path: &str) -> Option<usize> {
-    rows.iter()
-        .position(|row| canonical(&row.path) == canonical(path))
+fn ignored(config: &Config, path: &str) -> bool {
+    config
+        .ignored_games
+        .iter()
+        .chain(&config.excluded_paths)
+        .any(|p| canonical(p) == canonical(path))
 }
-#[derive(Clone)]
-struct WindowState {
-    hwnd: HWND,
+fn rows(shared: &Shared, page: Page, query: &str) -> Vec<Row> {
+    let status = |path: &str| {
+        shared.active_games.iter().find(|g| {
+            canonical(&g.path) == canonical(path) || canonical(&g.executable) == canonical(path)
+        })
+    };
+    let mut rows: Vec<Row> = match page {
+        Page::Games => shared
+            .games
+            .iter()
+            .map(|g| Row {
+                name: g.name.clone(),
+                path: g.path.clone(),
+                platform: g.launcher.clone(),
+                custom: g.launcher == "Custom",
+                ignored: ignored(&shared.config, &g.path),
+                running: status(&g.path).is_some(),
+                pid: status(&g.path).map(|g| g.pid),
+            })
+            .collect(),
+        Page::Running => shared
+            .running_apps
+            .iter()
+            .map(|a| {
+                let recognized = shared
+                    .games
+                    .iter()
+                    .find(|g| crate::discovery::inside(&a.path, &g.path));
+                Row {
+                    name: a.name.clone(),
+                    path: a.path.clone(),
+                    platform: recognized
+                        .map_or("Unrecognized", |g| g.launcher.as_str())
+                        .into(),
+                    custom: false,
+                    ignored: ignored(&shared.config, &a.path),
+                    running: true,
+                    pid: status(&a.path).map(|g| g.pid),
+                }
+            })
+            .collect(),
+        Page::Ignored => shared
+            .config
+            .ignored_games
+            .iter()
+            .chain(&shared.config.excluded_paths)
+            .map(|path| {
+                let game = shared
+                    .games
+                    .iter()
+                    .find(|g| canonical(&g.path) == canonical(path));
+                Row {
+                    name: game.map_or_else(
+                        || path.rsplit(['\\', '/']).next().unwrap_or(path).into(),
+                        |g| g.name.clone(),
+                    ),
+                    path: path.clone(),
+                    platform: game
+                        .map_or("Custom exclusion", |g| g.launcher.as_str())
+                        .into(),
+                    custom: game.is_some_and(|g| g.launcher == "Custom"),
+                    ignored: true,
+                    running: status(path).is_some(),
+                    pid: status(path).map(|g| g.pid),
+                }
+            })
+            .collect(),
+        Page::Activity => vec![],
+    };
+    let query = query.to_lowercase();
+    let mut seen = HashSet::new();
+    rows.retain(|r| {
+        (format!("{} {} {}", r.name, r.path, r.platform)
+            .to_lowercase()
+            .contains(&query))
+            && seen.insert(canonical(&r.path))
+    });
+    rows.sort_by_cached_key(|r| r.name.to_lowercase());
+    rows
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tone {
+    Neutral,
+    Paused,
+    Success,
+    Error,
+}
+struct Hero {
+    title: &'static str,
+    reason: String,
+    hint: &'static str,
+    tone: Tone,
+    paused: bool,
+}
+fn hero(s: &Shared) -> Hero {
+    use crate::control::Activity::*;
+    let activity = if s.verifying { Verifying } else { s.activity };
+    let (title, hint, tone, paused) = match activity {
+        Unknown => (
+            "CHECKING GAMES",
+            "Waiting for reliable detection before controlling AI.",
+            Tone::Neutral,
+            false,
+        ),
+        Watching => (
+            if s.config.automation_enabled {
+                "READY FOR GAMING"
+            } else {
+                "AUTO PAUSE OFF"
+            },
+            "AI is unchanged. Current model residency is not polled.",
+            Tone::Neutral,
+            false,
+        ),
+        Observation => (
+            "OBSERVATION MODE",
+            "Detection only. AI and saved recovery are unchanged.",
+            Tone::Neutral,
+            false,
+        ),
+        Unavailable => (
+            "AI UNAVAILABLE",
+            "Open your AI provider or check its connection in Advanced.",
+            Tone::Error,
+            false,
+        ),
+        DetectionUnavailable => (
+            "DETECTION UNAVAILABLE",
+            "AI control is held until game detection succeeds.",
+            Tone::Error,
+            false,
+        ),
+        Capturing => (
+            "PAUSING AI",
+            "Saving original model settings before unloading.",
+            Tone::Paused,
+            false,
+        ),
+        WaitingForInference => (
+            "WAITING TO PAUSE",
+            "Waiting for inference to finish. Pause is not complete.",
+            Tone::Paused,
+            false,
+        ),
+        Unloading => (
+            "UNLOADING AI",
+            "Removing captured models. Waiting for verification.",
+            Tone::Paused,
+            false,
+        ),
+        Paused => (
+            "AI PAUSED",
+            "AI paused for gaming. Resume to restore captured models.",
+            Tone::Paused,
+            true,
+        ),
+        ManualHold => (
+            "AI PAUSED",
+            "You paused AI manually. Resume to release the hold.",
+            Tone::Paused,
+            true,
+        ),
+        Countdown => (
+            "RESUME SCHEDULED",
+            "Waiting for the configured delay before restoring AI.",
+            Tone::Paused,
+            true,
+        ),
+        Restoring => (
+            "RESTORING AI",
+            "Reloading captured models and verifying restoration.",
+            Tone::Paused,
+            false,
+        ),
+        Recovery => (
+            "RECOVERY PENDING",
+            "Saved recovery is retained. Resume to retry when available.",
+            Tone::Error,
+            false,
+        ),
+        PartialFailure => (
+            "AI NEEDS ATTENTION",
+            "An operation failed or is incomplete. Open Activity for details.",
+            Tone::Error,
+            false,
+        ),
+        Verifying => (
+            "TESTING RECOVERY",
+            "Testing capture, unload and restoration. Please wait.",
+            Tone::Paused,
+            false,
+        ),
+        Coexistence => (
+            "AI RESUMED",
+            "Restoration verified during gameplay. Pause AI to end approval.",
+            Tone::Success,
+            false,
+        ),
+    };
+    let reliable =
+        s.discovery_ready && s.detection_ok && !s.disabled && s.discovery_errors.is_empty();
+    let reason = if !reliable {
+        "Running games are not yet confirmed".into()
+    } else if let Some(first) = s.active_games.first() {
+        if s.active_games.len() == 1 {
+            format!("{} is running", first.game)
+        } else {
+            format!(
+                "{} and {} other games are running",
+                first.game,
+                s.active_games.len() - 1
+            )
+        }
+    } else if s.manual_pause {
+        "Manual pause is in effect".into()
+    } else {
+        "No recognized game is running".into()
+    };
+    Hero {
+        title,
+        reason,
+        hint,
+        tone,
+        paused,
+    }
+}
+fn provider_status(s: &Shared) -> Vec<(String, Tone)> {
+    use crate::coordinator::State;
+    s.config
+        .providers
+        .iter()
+        .filter(|p| p.enabled())
+        .map(|p| {
+            let report = s
+                .provider_statuses
+                .iter()
+                .find(|r| r.id == p.id() && r.kind == p.kind());
+            let (text, tone) = match report.map(|r| r.state) {
+                Some(State::Paused) => ("Captured-model unload verified", Tone::Success),
+                Some(State::Restored) => (
+                    "Restoration verified; current residency unpolled",
+                    Tone::Success,
+                ),
+                Some(State::Pausing) => ("Unloading captured models", Tone::Paused),
+                Some(State::Restoring) => ("Restoring captured models", Tone::Paused),
+                Some(State::Failed) => ("Operation failed; check Activity", Tone::Error),
+                Some(State::Deferred) => ("Waiting; operation incomplete", Tone::Paused),
+                _ if s.activity == crate::control::Activity::Unavailable => {
+                    ("Unavailable or connection refused", Tone::Error)
+                }
+                _ => ("Current model state unpolled", Tone::Neutral),
+            };
+            (
+                format!(
+                    "{}: {text}{}",
+                    p.kind().name(),
+                    if p.kind() == crate::provider::Kind::Ollama {
+                        " (experimental)"
+                    } else {
+                        ""
+                    }
+                ),
+                tone,
+            )
+        })
+        .collect()
+}
+
+struct ActivityLog {
+    entries: VecDeque<String>,
+    last: String,
+}
+impl ActivityLog {
+    fn new() -> Self {
+        Self {
+            entries: VecDeque::new(),
+            last: String::new(),
+        }
+    }
+    fn record(&mut self, detail: String) {
+        if self.last == detail {
+            return;
+        }
+        self.last = detail.clone();
+        let mut local: windows_sys::Win32::Foundation::SYSTEMTIME = unsafe { std::mem::zeroed() };
+        unsafe {
+            windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut local);
+        }
+        let detail = detail.chars().take(8000).collect::<String>();
+        self.entries.push_front(format!(
+            "{:02}:{:02}:{:02}  {}",
+            local.wHour, local.wMinute, local.wSecond, detail
+        ));
+        self.entries.truncate(160);
+    }
+}
+struct Toast {
+    key: Option<(u64, Outcome, String)>,
+    since: Instant,
+}
+impl Toast {
+    fn new() -> Self {
+        Self {
+            key: None,
+            since: Instant::now(),
+        }
+    }
+    fn message<'a>(&mut self, s: &'a Shared, now: Instant) -> Option<(&'a str, bool)> {
+        if !s.settings_error.is_empty() {
+            return Some((&s.settings_error, true));
+        }
+        let result = s.commands.latest.as_ref()?;
+        let key = (result.id, result.outcome, result.message.clone());
+        if self.key.as_ref() != Some(&key) {
+            self.key = Some(key);
+            self.since = now;
+        }
+        let persistent = matches!(
+            result.outcome,
+            Outcome::Failed | Outcome::Requested | Outcome::Working
+        );
+        (persistent || now.duration_since(self.since) < Duration::from_secs(5))
+            .then_some((&result.message, result.outcome == Outcome::Failed))
+    }
+}
+
+enum Modal {
+    Add {
+        name: String,
+        path: String,
+        auto: bool,
+    },
+    Rename(Row, String),
+    Remove(Row),
+    Resume(crate::gameplay::RestoreOffer, Vec<bool>),
+    Verify,
+    Ollama(crate::config::Provider),
+    Help,
+}
+struct Dashboard {
     shared: SharedState,
     tx: Sender<Action>,
     folder: PathBuf,
+    rx: Arc<Mutex<mpsc::Receiver<UiRequest>>>,
     page: Page,
-    rows: Vec<Row>,
-    last_status: String,
-    revision: u64,
-    font: HFONT,
-    fonts: std::collections::BTreeMap<i32, HFONT>,
-    theme: Option<std::rc::Rc<crate::theme::Theme>>,
-    settings_visible: bool,
-    viewport: Viewport,
-    positioning: bool,
-    tooltips: Tooltips,
+    settings_page: SettingsPage,
+    query: String,
+    selected: Option<String>,
+    modal: Option<Modal>,
+    modal_active: bool,
+    owner: HWND,
+    edit_config: Config,
+    edit_revision: u64,
+    dirty: bool,
+    validation: String,
+    log: ActivityLog,
+    toast: Toast,
+    visible: bool,
+    stopping: bool,
+    theme: Option<(bool, bool)>,
+    worker_log: Option<String>,
 }
-#[derive(Clone)]
-struct Tooltips {
-    hwnd: HWND,
-    // Native tooltip controls retain these pointers until destruction.
-    _texts: Arc<Vec<Vec<u16>>>,
-}
-const DESCRIPTIONS: &[(i32, &str)] = &[
-    (
-        APPEARANCE,
-        "Choose Follow Windows, Light or Dark. The saved choice applies to the dashboard and tray menu. High contrast always uses Windows colors.",
-    ),
-    (
-        DOCTOR,
-        "Probe enabled providers without starting services or loading/unloading models. Results are cached observations; repeat after changing settings or provider state.",
-    ),
-    (OLLAMA_ENABLED, OLLAMA_DISCLOSURE),
-    (
-        OLLAMA_ADDRESS,
-        "Configured loopback endpoint only. Saving does not start or discover a service. Its unfinished recovery must finish before this route can change.",
-    ),
-    (
-        OLLAMA_SAVE,
-        "Save the Ollama endpoint independently of LM Studio settings. This does not enable Ollama control.",
-    ),
-    (
-        CONTRIBUTE,
-        "Open the project contribution page in your browser. Include exact versions and sanitized evidence; never share private journals or prompts.",
-    ),
-    (
-        NOTIFICATIONS,
-        "Save whether Windows displays completion/failure notifications. Persistent AI state remains in the dashboard and tray; fullscreen delivery is not guaranteed.",
-    ),
-    (
-        SOUND,
-        "Use one sound source: Windows notification sound when visuals are enabled, or one standalone system sound when visuals are disabled. Windows settings still apply.",
-    ),
-    (
-        OPEN_FOLDER,
-        "Open local logs and status files. This does not change AI.",
-    ),
-    (
-        QUIT,
-        "Quit GamePause. Pending recovery is retained for the next launch; restore it before uninstalling.",
-    ),
-    (
-        LM_ENABLED,
-        "Enable LM Studio control. Disabling is blocked while its own recovery is unfinished; restore its saved AI first.",
-    ),
-    (
-        NAVIGATION,
-        "Games, Running apps and Ignored are pages. Use Left/Right arrows on these tabs.",
-    ),
-    (
-        AUTO,
-        "Save whether recognized games automatically pause AI. Existing recovery is retained.",
-    ),
-    (
-        STARTUP,
-        "Save whether GamePause starts in the tray when you sign in to Windows.",
-    ),
-    (
-        SETTINGS,
-        "Save Advanced tool visibility in the dashboard and tray. Hiding tools leaves AI control and recovery unchanged.",
-    ),
-    (
-        REFRESH,
-        "Refresh launcher metadata. Completion is reported after discovery returns; repeated requests coalesce.",
-    ),
-    (
-        ADD,
-        "Choose the actual game executable to add a missed standalone game. Cancel leaves settings unchanged.",
-    ),
-    (
-        SEARCH,
-        "Filter the current page by name or path. This does not change game recognition.",
-    ),
-    (
-        LIST,
-        "Select an entry to read its path and recognition details. Arrow keys move between entries.",
-    ),
-    (
-        TOGGLE,
-        "Add a selected running app, ignore a recognized game or enable an ignored entry, depending on the page. Ignore never restores AI.",
-    ),
-    (
-        REMOVE,
-        "Remove only the selected game you added yourself, after confirmation. Launcher games use Ignore.",
-    ),
-    (
-        RENAME,
-        "Rename the selected custom game. Its executable path remains unchanged.",
-    ),
-    (
-        PAUSE,
-        "Pause AI creates a manual hold until you choose Resume AI.",
-    ),
-    (
-        RESUME,
-        "Resume captured AI immediately and release the manual hold. During gameplay, confirmation is required because models can compete for VRAM.",
-    ),
-    (
-        VERIFY,
-        "Test LM Studio capture, unload and restore on purpose. Ollama is left unchanged. Requires confirmation, no running games and no pending recovery.",
-    ),
-    (
-        DELAY,
-        "Seconds to wait after the last recognized game exits before restoring saved AI. Save settings applies the value.",
-    ),
-    (
-        ADDRESS,
-        "LM Studio's local API address. Save settings validates and applies it.",
-    ),
-    (
-        SAVE,
-        "Validate and save connection and delay settings. A failed save leaves previous settings intact.",
-    ),
-    (
-        CLI,
-        "Locate the installed lms executable. This saves a path; it does not download or install anything.",
-    ),
-];
-fn description(id: i32, page: Page, shared: &Shared) -> String {
-    let availability = shared.controls().availability();
-    match id {
-        PAUSE => {
-            let available = if shared.manual_pause { availability.resume } else { availability.pause };
-            if !available { return availability.reason.into(); }
+impl Dashboard {
+    fn new(
+        shared: SharedState,
+        tx: Sender<Action>,
+        folder: PathBuf,
+        rx: Arc<Mutex<mpsc::Receiver<UiRequest>>>,
+    ) -> Self {
+        let s = shared.lock().map(|s| s.clone()).unwrap_or_default();
+        Self {
+            shared,
+            tx,
+            folder,
+            rx,
+            page: Page::Games,
+            settings_page: SettingsPage::General,
+            query: String::new(),
+            selected: None,
+            modal: None,
+            modal_active: false,
+            owner: null_mut(),
+            edit_config: s.config,
+            edit_revision: s.revision,
+            dirty: false,
+            validation: String::new(),
+            log: ActivityLog::new(),
+            toast: Toast::new(),
+            visible: true,
+            stopping: false,
+            theme: None,
+            worker_log: None,
         }
-        RESUME if !availability.restore => return availability.reason.into(),
-        TOGGLE => return match page {
-            Page::Running => "Add the selected executable as a custom game. Choose the game, not its launcher.",
-            Page::Ignored => "Enable the selected ignored entry. This changes future pause triggers; it does not restore AI.",
-            Page::Games => "Ignore or enable the selected game for future automatic pausing. Pending recovery still remembers it.",
-        }.into(),
-        _ => (),
     }
-    DESCRIPTIONS.iter().find(|(control, _)| *control == id).map(|(_, description)| (*description).into())
-        .unwrap_or_else(|| "Tab moves between controls. Focus an action for its description; F1 moves to this help text.".into())
-}
-fn update_help(id: i32) {
-    let Some(state) = snapshot() else { return };
-    let Ok(shared) = state.shared.lock().map(|s| s.clone()) else {
-        return;
-    };
-    let help = unsafe { GetDlgItem(state.hwnd, HELP) };
-    let description = description(id, state.page, &shared);
-    if text(help) != description {
-        set(help, &description);
+    fn action(&self, action: Action, label: &str) {
+        crate::app::request_action(&self.shared, &self.tx, action, label);
     }
-}
-fn create_tooltips(parent: HWND, instance: HINSTANCE, dpi: i32) -> Tooltips {
-    let texts = Arc::new(
-        DESCRIPTIONS
-            .iter()
-            .map(|(_, description)| wide(description))
-            .collect::<Vec<_>>(),
-    );
-    unsafe {
-        let hwnd = CreateWindowExW(
-            WS_EX_TOPMOST,
-            wide("tooltips_class32").as_ptr(),
-            null(),
-            WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
-            0,
-            0,
-            0,
-            0,
-            parent,
-            null_mut(),
-            instance,
-            null(),
-        );
-        if !hwnd.is_null() {
-            // Native classic tooltip drawing honors explicit palette colors.
-            // Set its visual style once, before assigning the owned DPI font.
-            let empty = wide("");
-            SetWindowTheme(hwnd, empty.as_ptr(), empty.as_ptr());
-            SendMessageW(hwnd, TTM_SETMAXTIPWIDTH, 0, scale(480, dpi) as isize);
-            for ((id, _), description) in DESCRIPTIONS.iter().zip(texts.iter()) {
-                let mut tool: TTTOOLINFOW = std::mem::zeroed();
-                tool.cbSize = std::mem::size_of::<TTTOOLINFOW>() as u32;
-                tool.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
-                tool.hwnd = parent;
-                tool.uId = GetDlgItem(parent, *id) as usize;
-                tool.lpszText = description.as_ptr() as *mut u16;
-                SendMessageW(hwnd, TTM_ADDTOOLW, 0, &tool as *const _ as isize);
+    fn save(&mut self, config: Config, advanced: bool) {
+        match config.validate() {
+            Ok(()) => {
+                self.validation.clear();
+                self.action(
+                    if advanced {
+                        Action::AdvancedSettings(Box::new(config))
+                    } else {
+                        Action::Settings(Box::new(config))
+                    },
+                    "Save settings",
+                );
             }
-        }
-        Tooltips {
-            hwnd,
-            _texts: texts,
+            Err(e) => self.validation = format!("Check these settings: {e:#}"),
         }
     }
-}
-thread_local! {static STATE:RefCell<Option<WindowState>>=const {RefCell::new(None)};}
-fn snapshot() -> Option<WindowState> {
-    STATE.with(|s| s.borrow().clone())
-}
-fn text(hwnd: HWND) -> String {
-    unsafe {
-        let n = GetWindowTextLengthW(hwnd);
-        let mut buffer = vec![0u16; n as usize + 1];
-        let count = GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32);
-        String::from_utf16_lossy(&buffer[..count as usize])
+    fn resume(&mut self, s: &Shared) {
+        let a = s.controls().availability();
+        if !s.pending && a.resume {
+            crate::app::request_core(&self.shared, &self.tx, CoreCommand::Resume);
+        } else if !a.restore {
+            crate::app::local_result(&self.shared, Outcome::Failed, a.reason);
+        } else if s.coexistence {
+            self.action(Action::RetryGameplayRestore, "Resume AI retry");
+        } else if s.active_games.is_empty() {
+            crate::app::request_core(&self.shared, &self.tx, CoreCommand::Restore);
+        } else if let Some(offer) = s.restore_offer.clone() {
+            let count = offer.games.len();
+            self.modal = Some(Modal::Resume(offer, vec![false; count]));
+        }
     }
-}
-fn set(hwnd: HWND, value: &str) {
-    unsafe {
-        SetWindowTextW(hwnd, wide(value).as_ptr());
+    fn set_page(&mut self, page: Page) {
+        self.page = page;
+        self.query.clear();
+        self.selected = None;
+        RUNNING_REQUESTED.store(self.visible && page == Page::Running, Ordering::Relaxed);
     }
-    update_text_scrollbar(hwnd);
-    if unsafe { GetDlgCtrlID(hwnd) } == DETAILS {
-        format_details(hwnd, value);
+    fn tone(p: Palette, t: Tone) -> Color32 {
+        match t {
+            Tone::Neutral => p.muted,
+            Tone::Paused => p.accent,
+            Tone::Success => p.success,
+            Tone::Error => p.error,
+        }
     }
-}
-fn format_details(hwnd: HWND, value: &str) {
-    let palette = snapshot()
-        .and_then(|s| s.theme)
-        .map(|t| t.palette)
-        .unwrap_or_else(|| crate::theme::Palette::for_mode(false));
-    crate::rich_text::format(hwnd, value, palette);
-}
-fn set_if_changed(hwnd: HWND, value: &str) {
-    let current = text(hwnd);
-    let unchanged = if unsafe { GetDlgCtrlID(hwnd) } == DETAILS {
-        current.replace("\r\n", "\n").replace('\r', "\n")
-            == value.replace("\r\n", "\n").replace('\r', "\n")
-    } else {
-        current == value
-    };
-    if !unchanged {
-        set(hwnd, value);
+    fn hero(&mut self, ui: &mut Ui, s: &Shared, p: Palette) {
+        let h = hero(s);
+        let accent = Self::tone(p, h.tone);
+        p.card().inner_margin(18).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 4.0;
+            ui.set_min_width(ui.available_width());
+            let narrow = ui.available_width() < 780.0;
+            ui.horizontal(|ui| {
+                if ui.available_width() > 650.0 {
+                    let (rect, _) = ui.allocate_exact_size(vec2(108.0, 108.0), Sense::hover());
+                    ui.painter()
+                        .circle_stroke(rect.center(), 47.0, Stroke::new(5.0_f32, accent));
+                    design::icon(
+                        ui.painter(),
+                        rect.shrink(23.0),
+                        if h.paused { Icon::Pause } else { Icon::Play },
+                        accent,
+                    );
+                    ui.add_space(10.0);
+                }
+                let right = if narrow { 0.0 } else { 190.0 };
+                let width = (ui.available_width() - right - design::GAP).max(220.0);
+                ui.allocate_ui_with_layout(
+                    vec2(width, 110.0),
+                    Layout::top_down(Align::Min),
+                    |ui| {
+                        ui.set_min_width(width);
+                        ui.label(
+                            RichText::new(h.title)
+                                .size(design::HERO_FONT)
+                                .family(FontFamily::Name("heading".into()))
+                                .color(accent),
+                        );
+                        ui.add(Label::new(RichText::new(&h.reason).size(23.0)).truncate())
+                            .on_hover_text(&h.reason);
+                        for (text, tone) in provider_status(s) {
+                            ui.horizontal(|ui| {
+                                let (dot, _) =
+                                    ui.allocate_exact_size(vec2(12.0, 18.0), Sense::hover());
+                                ui.painter()
+                                    .circle_filled(dot.center(), 4.0, Self::tone(p, tone));
+                                ui.add(Label::new(text).truncate());
+                            });
+                        }
+                        if !s.config.any_provider_enabled() {
+                            ui.colored_label(p.muted, "No AI provider is enabled");
+                        }
+                        ui.add(Label::new(RichText::new(h.hint).size(15.0).color(p.muted)).wrap());
+                    },
+                );
+                if !narrow {
+                    self.primary(ui, s, p);
+                }
+            });
+            if narrow {
+                ui.add_space(10.0);
+                self.primary(ui, s, p);
+            }
+        });
     }
-}
-fn checked(hwnd: HWND) -> bool {
-    unsafe { SendMessageW(hwnd, BM_GETCHECK, 0, 0) == 1 }
-}
-fn selection(state: &WindowState) -> Option<Row> {
-    unsafe {
-        let i = SendMessageW(GetDlgItem(state.hwnd, LIST), LB_GETCURSEL, 0, 0);
-        state.rows.get(i as usize).cloned()
-    }
-}
-fn send_settings(state: &WindowState, config: Config) {
-    crate::app::request_action(
-        &state.shared,
-        &state.tx,
-        Action::Settings(Box::new(config)),
-        "Save settings",
-    );
-}
-fn send_advanced_settings(state: &WindowState, config: Config) {
-    crate::app::request_action(
-        &state.shared,
-        &state.tx,
-        Action::AdvancedSettings(Box::new(config)),
-        "Advanced settings",
-    );
-}
-
-/// Show a message on the FEEDBACK line (control FEEDBACK), not a modal.
-/// P1-7: settings-validation and rename errors are user-correctable, so they
-/// belong inline next to the field that produced them; modals are reserved
-/// for hard failures (missing data dir, startup write, ...).
-fn set_feedback(state: &WindowState, message: &str) {
-    crate::app::local_result(&state.shared, Outcome::Failed, message);
-    set(unsafe { GetDlgItem(state.hwnd, FEEDBACK) }, message);
-}
-
-thread_local! {
-    static ASK_NAME_RESULT: RefCell<Option<String>> = const { RefCell::new(None) };
-}
-
-/// Modal text-input dialog for the Rename affordance. Returns the entered text
-/// or `None` if the user cancelled. Native failures return an error.
-/// Mirrors the dashboard's own WNDCLASSW + message-loop pattern, so it compiles
-/// against the same windows-sys surface without new dependencies.
-fn ask_name(parent: HWND, current: &str) -> anyhow::Result<Option<String>> {
-    const NAME_EDIT: i32 = 1001;
-    const OK_BTN: i32 = 1;
-    unsafe {
-        let instance = GetModuleHandleW(null());
-        let class = wide("GamePauseAskName");
-        let wc = WNDCLASSW {
-            lpfnWndProc: Some(name_proc),
-            hInstance: instance,
-            lpszClassName: class.as_ptr(),
-            hCursor: LoadCursorW(null_mut(), IDC_ARROW),
-            hbrBackground: (COLOR_WINDOW + 1) as HBRUSH,
-            ..std::mem::zeroed()
+    fn primary(&mut self, ui: &mut Ui, s: &Shared, p: Palette) {
+        let a = s.controls().availability();
+        let resume = s.pending || s.manual_pause;
+        let enabled = if resume {
+            a.restore || a.resume
+        } else {
+            a.pause
         };
-        // Ignore "class already registered" (1410); a repeated Rename reuses it.
-        if RegisterClassW(&wc) == 0 && GetLastError() != 1410 {
-            anyhow::bail!("Could not register rename dialog");
-        }
-        let dpi = GetDpiForSystem() as i32;
-        let scale = |v: i32| v * dpi / 96;
-        let width = scale(420);
-        let height = scale(150);
-        let hwnd = CreateWindowExW(
-            0,
-            class.as_ptr(),
-            wide("Rename game").as_ptr(),
-            WS_POPUP | WS_CAPTION | WS_SYSMENU,
-            (GetSystemMetrics(SM_CXSCREEN) - width) / 2,
-            (GetSystemMetrics(SM_CYSCREEN) - height) / 2,
-            width,
-            height,
-            parent,
-            null_mut(),
-            instance,
-            null(),
-        );
-        if hwnd.is_null() {
-            anyhow::bail!("Could not create rename dialog");
-        }
-        let font = CreateFontW(
-            -scale(14),
-            0,
-            0,
-            0,
-            400,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET as u32,
-            0,
-            0,
-            CLEARTYPE_QUALITY as u32,
-            0,
-            wide("Segoe UI").as_ptr(),
-        );
-        let edit = CreateWindowExW(
-            WS_EX_CLIENTEDGE,
-            wide("EDIT").as_ptr(),
-            wide(current).as_ptr(),
-            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL as u32,
-            scale(16),
-            scale(30),
-            width - scale(32),
-            scale(26),
-            hwnd,
-            null_mut(),
-            instance,
-            null(),
-        );
-        let ok = CreateWindowExW(
-            0,
-            wide("BUTTON").as_ptr(),
-            wide("Rename").as_ptr(),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-            width - scale(150),
-            scale(86),
-            scale(60),
-            scale(26),
-            hwnd,
-            null_mut(),
-            instance,
-            null(),
-        );
-        let cancel = CreateWindowExW(
-            0,
-            wide("BUTTON").as_ptr(),
-            wide("Cancel").as_ptr(),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-            width - scale(84),
-            scale(86),
-            scale(60),
-            scale(26),
-            hwnd,
-            null_mut(),
-            instance,
-            null(),
-        );
-        SetWindowLongPtrW(edit, GWLP_ID, NAME_EDIT as isize);
-        SetWindowLongPtrW(ok, GWLP_ID, OK_BTN as isize);
-        SetWindowLongPtrW(cancel, GWLP_ID, 2);
-        SendMessageW(edit, WM_SETFONT, font as usize, 0);
-        SendMessageW(ok, WM_SETFONT, font as usize, 0);
-        SendMessageW(cancel, WM_SETFONT, font as usize, 0);
-        if [edit, ok, cancel].iter().any(|control| control.is_null()) {
-            DestroyWindow(hwnd);
-            if !font.is_null() {
-                DeleteObject(font);
-            }
-            anyhow::bail!("Could not create rename controls");
-        }
-        ASK_NAME_RESULT.with(|c| *c.borrow_mut() = None);
-        let parent_enabled = IsWindowEnabled(parent) != 0;
-        if parent_enabled {
-            EnableWindow(parent, 0);
-        }
-        SetFocus(edit);
-        ShowWindow(hwnd, SW_SHOW);
-        let mut msg: MSG = std::mem::zeroed();
-        let mut failure = None;
-        while IsWindow(hwnd) != 0 {
-            let status = GetMessageW(&mut msg, null_mut(), 0, 0);
-            if status <= 0 {
-                if status == 0 {
-                    PostQuitMessage(msg.wParam as i32);
+        ui.add_enabled_ui(enabled, |ui| {
+            let label = if resume {
+                crate::restore_dialog::resume_label(
+                    !s.active_games.is_empty(),
+                    s.coexistence,
+                    s.pending,
+                )
+            } else {
+                "Pause AI"
+            };
+            let response = ui.add(
+                Button::new(
+                    RichText::new(format!("     {label}"))
+                        .color(if crate::theme::high_contrast() {
+                            p.selected_text
+                        } else {
+                            p.text
+                        })
+                        .size(20.0)
+                        .family(FontFamily::Name("heading".into())),
+                )
+                .min_size(design::HERO_ACTION)
+                .fill(if ui.visuals().dark_mode {
+                    design::PRIMARY_FILL
                 } else {
-                    failure = Some(std::io::Error::last_os_error());
+                    p.selected
+                })
+                .stroke(Stroke::new(1.0_f32, p.accent)),
+            );
+            design::icon(
+                ui.painter(),
+                Rect::from_center_size(
+                    pos2(response.rect.left() + 24.0, response.rect.center().y),
+                    vec2(23.0, 23.0),
+                ),
+                if resume { Icon::Play } else { Icon::Pause },
+                p.text,
+            );
+            if response.on_hover_text(a.reason).clicked() {
+                if resume {
+                    self.resume(s);
+                } else {
+                    crate::app::request_core(&self.shared, &self.tx, CoreCommand::Pause);
                 }
-                ASK_NAME_RESULT.with(|c| *c.borrow_mut() = None);
-                break;
             }
-            if IsDialogMessageW(hwnd, &msg) == 0 {
-                TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
-        }
-        if IsWindow(hwnd) != 0 {
-            DestroyWindow(hwnd);
-        }
-        if !font.is_null() {
-            DeleteObject(font);
-        }
-        if parent_enabled && IsWindow(parent) != 0 {
-            EnableWindow(parent, 1);
-            SetForegroundWindow(parent);
-        }
-        if let Some(error) = failure {
-            return Err(error.into());
-        }
+        });
     }
-    Ok(ASK_NAME_RESULT.with(|c| c.borrow().clone()))
+    fn settings_strip(&mut self, ui: &mut Ui, s: &Shared, p: Palette) {
+        p.card().inner_margin(12).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                let (rect, _) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
+                design::icon(ui.painter(), rect, Icon::Settings, p.muted);
+                ui.strong("Settings");
+                ui.separator();
+                let mut auto = s.config.automation_enabled;
+                if ui
+                    .add_enabled(
+                        !s.commands.settings_pending,
+                        Checkbox::new(&mut auto, "Automatically pause AI while gaming"),
+                    )
+                    .changed()
+                {
+                    let mut c = s.config.clone();
+                    c.automation_enabled = auto;
+                    self.save(c, false);
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .add_enabled(
+                            !s.commands.settings_pending,
+                            Button::new(if s.config.advanced_settings_visible {
+                                "Back to games"
+                            } else {
+                                "Advanced  >"
+                            }),
+                        )
+                        .clicked()
+                    {
+                        self.action(
+                            Action::AdvancedVisibility(!s.config.advanced_settings_visible),
+                            "Advanced visibility",
+                        );
+                    }
+                });
+            });
+        });
+    }
+    fn navigation(&mut self, ui: &mut Ui, p: Palette) {
+        ui.horizontal(|ui| {
+            for (page, label, icon) in [
+                (Page::Games, "Games", Icon::Game),
+                (Page::Running, "Running apps", Icon::Apps),
+                (Page::Ignored, "Ignored", Icon::Ignore),
+            ] {
+                if design::button(ui, label, icon, self.page == page, p).clicked() {
+                    self.set_page(page);
+                }
+            }
+        });
+    }
+    fn games(&mut self, ui: &mut Ui, s: &Shared, p: Palette) {
+        self.navigation(ui, p);
+        ui.add_space(6.0);
+        p.card().inner_margin(12).show(ui,|ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let (rect,_)=ui.allocate_exact_size(vec2(20.0,20.0),Sense::hover());design::icon(ui.painter(),rect,Icon::Search,p.muted);
+                let width=(ui.available_width()-260.0).max(130.0);
+                ui.add_sized([width,design::CONTROL],TextEdit::singleline(&mut self.query).hint_text(match self.page {Page::Games=>"Search games...",Page::Running=>"Search applications...",_=>"Search ignored..."}));
+                if design::button(ui,"Refresh",Icon::Apps,false,p).clicked(){self.action(Action::Refresh,"Discovery refresh");}
+                if design::button(ui,"Add game...",Icon::Add,true,p).clicked(){self.modal=Some(Modal::Add{name:String::new(),path:String::new(),auto:true});}
+            });
+            ui.add_space(8.0);
+            let entries=rows(s,self.page,&self.query);
+            let height=(ui.available_height()-162.0).clamp(140.0,470.0);
+            let table_top=ui.cursor().top();
+            let table_right=ui.max_rect().right();
+            let row_painter=ui.painter().with_clip_rect(Rect::from_min_max(pos2(ui.max_rect().left(),table_top+34.0),pos2(table_right,table_top+34.0+height)));
+            let original_spacing=ui.spacing().item_spacing.y;
+            ui.spacing_mut().item_spacing.y=0.0;
+            let wide=ui.available_width()>740.0;
+            let page=self.page;
+            let mut selected=self.selected.clone();
+            let mut toggled=None;
+            let mut table=TableBuilder::new(ui).id_salt(("game-table",format!("{page:?}"))).striped(true).resizable(true).sense(Sense::click()).cell_layout(Layout::left_to_right(Align::Center)).min_scrolled_height(height.min(entries.len() as f32*design::ROW).max(96.0)).max_scroll_height(height)
+                .column(Column::remainder().at_least(180.0).resizable(false).clip(true));
+            if wide {table=table.column(Column::initial(145.0).at_least(100.0));}
+            table=table.column(Column::initial(if page==Page::Running {90.0}else{110.0}).at_least(80.0)).column(Column::initial(160.0).at_least(110.0));
+            table.header(34.0,|mut header| {
+                header.col(|ui| {ui.strong(if page==Page::Running {"Application"}else{"Game"});});
+                if wide {header.col(|ui|{ui.strong(if page==Page::Running {"Recognition"}else{"Platform"});});}
+                header.col(|ui|{ui.strong(if page==Page::Running {"PID"}else{"Auto pause"});});
+                header.col(|ui|{ui.strong(if page==Page::Ignored {"Source"}else{"Status"});});
+            }).body(|body| {
+                body.rows(design::ROW,entries.len(),|mut row| {
+                    let index=row.index();
+                    let entry=&entries[index];
+                    row.set_selected(selected.as_ref().is_some_and(|path|canonical(path)==canonical(&entry.path)));
+                    row.col(|ui| {
+                        let (rect,_)=ui.allocate_exact_size(vec2(30.0,30.0),Sense::hover());
+                        ui.painter().rect_filled(rect,5,p.elevated);design::icon(ui.painter(),rect.shrink(4.0),if page==Page::Running {Icon::Apps}else{Icon::Game},p.accent);
+                        ui.add(Label::new(&entry.name).truncate()).on_hover_text(format!("{}\n{}",entry.name,entry.path));
+                    });
+                    if wide {row.col(|ui| {ui.add(Label::new(RichText::new(&entry.platform).color(p.muted)).truncate());});}
+                    row.col(|ui| {
+                        if page==Page::Running {ui.label(entry.pid.map_or_else(||"—".into(),|pid|pid.to_string())).on_hover_text("PID is available for recognized games. Other process IDs are not collected by this inventory.");}
+                        else {let mut on=!entry.ignored;if ui.add_enabled(!s.commands.settings_pending,Checkbox::new(&mut on,if entry.ignored {"Off"}else{"On"})).changed(){toggled=Some((entry.path.clone(),on));}}
+                    });
+                    row.col(|ui| {
+                        if page==Page::Ignored {ui.add(Label::new("Saved exclusion").truncate());}
+                        else {let reliable=s.discovery_ready&&s.detection_ok&&s.discovery_errors.is_empty();let (label,color)=if !reliable {("Unknown",p.muted)} else if entry.running {("Running",p.success)}else{("Not running",p.muted)};
+                            let (dot,_)=ui.allocate_exact_size(vec2(10.0,16.0),Sense::hover());ui.painter().circle_filled(dot.center(),4.0,color);ui.colored_label(color,label);}
+                    });
+                    if row.response().clicked() {selected=Some(entry.path.clone());}
+                    let response=row.response();
+                    let selected_row=selected.as_ref().is_some_and(|path|canonical(path)==canonical(&entry.path));
+                    if selected_row {let mut rect=response.rect.shrink(1.0);rect.max.x=rect.max.x.min(table_right-1.0);row_painter.rect_stroke(rect,4,Stroke::new(1.0_f32,p.accent),StrokeKind::Inside);}
+                    if response.has_focus() {
+                        let step=response.ctx.input(|i|if i.key_pressed(Key::ArrowDown){1}else if i.key_pressed(Key::ArrowUp){-1}else{0});
+                        if step!=0 {let current=selected.as_ref().and_then(|path|entries.iter().position(|r|canonical(&r.path)==canonical(path))).unwrap_or(index);let next=(current as isize+step).clamp(0,entries.len().saturating_sub(1) as isize) as usize;selected=Some(entries[next].path.clone());}
+                        if ui_input_arrow(&response) {selected=Some(entry.path.clone());}
+                    }
+                });
+            });
+            ui.spacing_mut().item_spacing.y=original_spacing;
+            self.selected=selected;
+            if let Some((path,on))=toggled {let mut c=s.config.clone();set_ignored(&mut c,&path,!on);self.save(c,false);}
+            if entries.is_empty() {
+                ui.colored_label(p.muted,if !self.query.is_empty(){"No matching entries. Try a different search."}else{match page {Page::Games=>"No games found. Refresh discovery or add a game executable.",Page::Running=>"No relevant applications are running. This inventory refreshes while the tab is open.",_=>"No ignored applications. Games you ignore will appear here."}});
+            }
+            ui.add_space(10.0);
+            let entry=self.selected.as_ref().and_then(|path|entries.iter().find(|r|canonical(&r.path)==canonical(path)));
+            self.details(ui,s,entry,p);
+        });
+    }
+    fn details(&mut self, ui: &mut Ui, s: &Shared, row: Option<&Row>, p: Palette) {
+        p.card().show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            if let Some(row) = row {
+                let wide = ui.available_width() > 740.0;
+                ui.horizontal(|ui| {
+                    let (rect, _) = ui.allocate_exact_size(vec2(64.0, 64.0), Sense::hover());
+                    ui.painter().rect_filled(rect, 7, p.elevated);
+                    design::icon(ui.painter(), rect.shrink(14.0), Icon::Game, p.accent);
+                    let text_width =
+                        (ui.available_width() - if wide { 220.0 } else { 0.0 }).max(180.0);
+                    ui.allocate_ui_with_layout(
+                        vec2(text_width, 80.0),
+                        Layout::top_down(Align::Min),
+                        |ui| {
+                            ui.set_min_width(text_width);
+                            ui.add(
+                                Label::new(
+                                    RichText::new(&row.name)
+                                        .size(21.0)
+                                        .family(FontFamily::Name("heading".into())),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(&row.name);
+                            ui.add(Label::new(RichText::new(&row.path).color(p.muted)).truncate())
+                                .on_hover_text(&row.path);
+                            ui.colored_label(p.muted, format!("Recognized from {}", row.platform));
+                        },
+                    );
+                    if wide {
+                        self.row_actions(ui, s, row, p);
+                    }
+                });
+                if !wide {
+                    self.row_actions(ui, s, row, p);
+                }
+            } else {
+                ui.colored_label(
+                    p.muted,
+                    "Select an entry to see its path, source and available actions.",
+                );
+            }
+        });
+    }
+    fn row_actions(&mut self, ui: &mut Ui, s: &Shared, row: &Row, p: Palette) {
+        ui.horizontal_wrapped(|ui| {
+            ui.add_enabled_ui(!s.commands.settings_pending, |ui| {
+                if design::button(
+                    ui,
+                    if self.page == Page::Running {
+                        "Add as game"
+                    } else if row.ignored {
+                        "Unignore"
+                    } else {
+                        "Ignore"
+                    },
+                    if self.page == Page::Running {
+                        Icon::Add
+                    } else {
+                        Icon::Ignore
+                    },
+                    false,
+                    p,
+                )
+                .clicked()
+                {
+                    if self.page == Page::Running {
+                        self.modal = Some(Modal::Add {
+                            name: row.name.trim_end_matches(".exe").into(),
+                            path: row.path.clone(),
+                            auto: true,
+                        });
+                    } else {
+                        let mut c = s.config.clone();
+                        set_ignored(&mut c, &row.path, !row.ignored);
+                        self.save(c, false);
+                    }
+                }
+                ui.menu_button("More...", |ui| {
+                    if self.page == Page::Running && ui.button("Ignore executable").clicked() {
+                        let mut c = s.config.clone();
+                        set_ignored(&mut c, &row.path, true);
+                        self.save(c, false);
+                        ui.close();
+                    }
+                    if row.custom {
+                        if ui.button("Rename...").clicked() {
+                            self.modal = Some(Modal::Rename(row.clone(), row.name.clone()));
+                            ui.close();
+                        }
+                        if ui.button("Remove...").clicked() {
+                            self.modal = Some(Modal::Remove(row.clone()));
+                            ui.close();
+                        }
+                    }
+                    if ui.button("Copy path").clicked() {
+                        ui.ctx().copy_text(row.path.clone());
+                        ui.close();
+                    }
+                });
+            });
+        });
+    }
 }
 
-unsafe extern "system" fn name_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
-    match message {
-        WM_COMMAND => {
-            let id = (w & 0xffff) as i32;
-            unsafe {
-                if id == 1 {
-                    let edit = GetDlgItem(hwnd, 1001);
-                    ASK_NAME_RESULT.with(|c| *c.borrow_mut() = Some(text(edit)));
-                } else {
-                    ASK_NAME_RESULT.with(|c| *c.borrow_mut() = None);
+fn ui_input_arrow(response: &Response) -> bool {
+    response
+        .ctx
+        .input(|i| i.key_pressed(Key::Enter) || i.key_pressed(Key::Space))
+}
+fn set_ignored(config: &mut Config, path: &str, off: bool) {
+    config
+        .ignored_games
+        .retain(|p| canonical(p) != canonical(path));
+    config
+        .excluded_paths
+        .retain(|p| canonical(p) != canonical(path));
+    if off {
+        config.ignored_games.push(path.into());
+    }
+}
+fn confirmed_resume(
+    s: &Shared,
+    offer: &crate::gameplay::RestoreOffer,
+    checked: &[bool],
+) -> Result<Action, String> {
+    if !s.controls().availability().restore
+        || s.commands.settings_pending
+        || checked.len() != offer.games.len()
+        || s.restore_offer
+            .as_ref()
+            .is_none_or(|current| current.id != offer.id)
+    {
+        return Err(
+            "Running games or control availability changed. Cancel and request Resume again."
+                .into(),
+        );
+    }
+    let mut seen = HashSet::new();
+    let ignored = offer
+        .games
+        .iter()
+        .zip(checked)
+        .filter(|(_, on)| **on)
+        .map(|(game, _)| game.executable.clone())
+        .filter(|path| seen.insert(canonical(path)))
+        .collect();
+    Ok(Action::ConfirmedRestore {
+        offer_id: offer.id,
+        ignored,
+    })
+}
+
+impl Dashboard {
+    fn advanced(&mut self, ui: &mut Ui, s: &Shared, p: Palette) {
+        ui.heading("Advanced settings");
+        ui.colored_label(
+            p.muted,
+            "Settings are saved atomically. Recovery keeps its original provider routes.",
+        );
+        ui.add_space(design::GAP);
+        p.card().show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                for (page, label) in [
+                    (SettingsPage::General, "General"),
+                    (SettingsPage::Detection, "Detection"),
+                    (SettingsPage::LMStudio, "LM Studio"),
+                    (SettingsPage::Ollama, "Ollama"),
+                    (SettingsPage::Recovery, "Recovery"),
+                    (SettingsPage::Diagnostics, "Diagnostics"),
+                ] {
+                    if ui
+                        .selectable_label(self.settings_page == page, label)
+                        .clicked()
+                    {
+                        self.settings_page = page;
+                        self.validation.clear();
+                    }
                 }
-                DestroyWindow(hwnd);
+            });
+        });
+        ui.add_space(design::GAP);
+        p.card().show(ui,|ui| {
+            ui.set_min_width(ui.available_width());
+            ui.add_enabled_ui(!s.commands.settings_pending,|ui| {
+                match self.settings_page {
+                    SettingsPage::General=> {
+                        ui.heading("General");
+                        let mut startup=tray::startup_enabled();
+                        if ui.styled_checkbox(&mut startup,"Start when I sign in to Windows").changed(){tray::request_startup(&self.shared,startup,&self.folder);}
+                        let mut visual=s.config.notifications_enabled;let mut sound=s.config.sound_enabled;
+                        let changed=ui.styled_checkbox(&mut visual,"Windows notifications").changed() | ui.styled_checkbox(&mut sound,"Sound for notifications").changed();
+                        if changed {self.action(Action::NotificationPreferences{visual,sound},"Notification preferences");}
+                        ui.add_space(8.0);ui.label("Appearance");
+                        let mut appearance=s.config.appearance;
+                        ComboBox::from_id_salt("appearance").selected_text(match appearance {crate::config::Appearance::System=>"Follow Windows",crate::config::Appearance::Light=>"Light",crate::config::Appearance::Dark=>"Dark"}).show_ui(ui,|ui| {
+                            for (value,label) in [(crate::config::Appearance::System,"Follow Windows"),(crate::config::Appearance::Light,"Light"),(crate::config::Appearance::Dark,"Dark")] {ui.selectable_value(&mut appearance,value,label);}
+                        });
+                        if appearance!=s.config.appearance {self.action(Action::Appearance(appearance),"Appearance");}
+                        ui.colored_label(p.muted,"High contrast follows Windows colors. Closing the window keeps GamePause in the tray.");
+                        if ui.button("Keyboard help").clicked(){self.modal=Some(Modal::Help);}
+                    },
+                    SettingsPage::Detection=> {
+                        ui.heading("Game detection");
+                        ui.colored_label(p.muted,"Launcher metadata and registered paths identify games. Running apps helps you add missed executables.");
+                        numeric(ui,"Process poll interval (seconds)",&mut self.edit_config.poll_seconds,&mut self.dirty);
+                        numeric(ui,"Discovery interval (seconds)",&mut self.edit_config.discovery_seconds,&mut self.dirty);
+                        string_list(ui,"Additional game folders",&mut self.edit_config.game_roots,&mut self.dirty);
+                        string_list(ui,"Steam roots",&mut self.edit_config.steam_roots,&mut self.dirty);
+                        string_list(ui,"Epic manifest folders",&mut self.edit_config.epic_manifest_dirs,&mut self.dirty);
+                        string_list(ui,"Excluded executable names",&mut self.edit_config.excluded_executables,&mut self.dirty);
+                        self.save_bar(ui,s,p);
+                    },
+                    SettingsPage::LMStudio=> {
+                        ui.heading("LM Studio");
+                        let editable=!s.provider_pending(crate::provider::Kind::LMStudio);
+                        if !editable {ui.colored_label(p.accent,"Restore pending LM Studio recovery before editing its connection.");}
+                        ui.add_enabled_ui(editable,|ui| {
+                            if let Some(crate::config::Provider::LMStudio{enabled,connection,..})=self.edit_config.providers.iter_mut().find(|p|p.kind()==crate::provider::Kind::LMStudio) {
+                                self.dirty |= ui.styled_checkbox(enabled,"Enable LM Studio control").changed();
+                                ui.label("Loopback API address");self.dirty |= ui.text_edit_singleline(&mut connection.endpoint).changed();
+                                ui.label("lms executable");
+                                ui.horizontal(|ui| {self.dirty|=ui.text_edit_singleline(&mut connection.lms_path).changed();if ui.button("Browse...").clicked(){match browse(self.owner){Ok(Some(path))=>{connection.lms_path=path;self.dirty=true;},Ok(None)=>(),Err(e)=>self.validation=format!("File picker: {e:#}")}}});
+                                self.dirty |= ui.styled_checkbox(&mut connection.stop_server_during_gaming,"Stop the captured server during gaming").changed();
+                            } else {ui.label("No LM Studio entry is configured.");}
+                        });
+                        ui.colored_label(p.muted,"Restores captured load settings and verifies the original server state. No automatic downloads.");
+                        self.save_bar(ui,s,p);
+                    },
+                    SettingsPage::Ollama=> {
+                        ui.heading("Experimental Ollama");
+                        ui.colored_label(p.accent,"Not tested with a live Ollama installation.");
+                        ui.label("Supports local GGUF completion models with verified identity, supported context and finite observed expiry. Full load options, parallelism, conversations and KV cache are not preserved. Embedding/cloud models and unknown settings are refused.");
+                        ui.label("The user-owned service stays running. GamePause does not download models or fight later client reloads.");
+                        let saved=s.config.providers.iter().find(|p|p.kind()==crate::provider::Kind::Ollama);
+                        let editable=!s.provider_pending(crate::provider::Kind::Ollama);
+                        ui.add_enabled_ui(editable,|ui| {
+                            if let Some(saved)=saved {
+                                let mut enabled=saved.enabled();
+                                if ui.styled_checkbox(&mut enabled,"Enable experimental Ollama control").changed(){
+                                    if enabled {self.modal=Some(Modal::Ollama(saved.clone()));}
+                                    else {let mut c=s.config.clone();if let Some(crate::config::Provider::Ollama{enabled,..})=c.providers.iter_mut().find(|p|p.kind()==crate::provider::Kind::Ollama){*enabled=false;}self.save(c,true);}
+                                }
+                                if let Some(crate::config::Provider::Ollama{endpoint,..})=self.edit_config.providers.iter_mut().find(|p|p.kind()==crate::provider::Kind::Ollama) {
+                                    ui.label("Loopback endpoint");self.dirty |= ui.text_edit_singleline(endpoint).changed();
+                                }
+                                if ui.button("Save Ollama endpoint").clicked(){
+                                    let mut c=s.config.clone();
+                                    let value=self.edit_config.providers.iter().find(|p|p.kind()==crate::provider::Kind::Ollama).map(|p|p.endpoint().to_owned());
+                                    if let (Some(value),Some(crate::config::Provider::Ollama{endpoint,..}))=(value,c.providers.iter_mut().find(|p|p.kind()==crate::provider::Kind::Ollama)){*endpoint=value;self.save(c,true);self.dirty=false;}
+                                }
+                            } else {ui.label("No Ollama entry is configured.");}
+                        });
+                        if !editable {ui.colored_label(p.accent,"Finish pending Ollama recovery before changing its enrollment or endpoint.");}
+                        ui.hyperlink_to("Contribute Ollama fixes or live evidence",concat!(env!("CARGO_PKG_REPOSITORY"),"/blob/main/CONTRIBUTING.md"));
+                    },
+                    SettingsPage::Recovery=> {
+                        ui.heading("Pause and recovery");
+                        numeric(ui,"Restore after games exit (seconds)",&mut self.edit_config.restore_delay_seconds,&mut self.dirty);
+                        numeric(ui,"Retry interval (seconds)",&mut self.edit_config.retry_seconds,&mut self.dirty);
+                        ui.label("Original model settings are saved before unloading. Partial failures retain recovery until verification succeeds. Ignoring a game does not erase pending recovery checks.");
+                        ui.colored_label(if s.pending {p.accent}else{p.muted},if s.pending {"Recovery is pending"}else{"No saved recovery is pending"});
+                        self.save_bar(ui,s,p);
+                        ui.add_space(design::GAP);
+                        if ui.add_enabled(crate::ui_commands::verify_available(s),Button::new("Test LM Studio round-trip...")).clicked(){self.modal=Some(Modal::Verify);}
+                        ui.colored_label(p.muted,"The test captures, unloads and reloads your live LM Studio models. It requires no running games or pending recovery.");
+                    },
+                    SettingsPage::Diagnostics=> {
+                        ui.heading("Read-only diagnostics");
+                        if ui.add_enabled(!s.doctor_pending,Button::new(if s.doctor_pending {"Checking..."}else{"Check enabled providers"})).clicked(){self.action(Action::Doctor,"Read-only diagnostics");}
+                        ui.colored_label(p.muted,"Uses saved connections. Does not start services or load/unload models.");
+                        let report=crate::diagnostics::render(s);
+                        ui.add(Label::new(report).wrap());
+                        if design::button(ui,"Open logs and status folder",Icon::Folder,false,p).clicked(){tray::request_folder(&self.shared,&self.folder);}
+                    },
+                }
+            });
+            if !self.validation.is_empty(){ui.colored_label(p.error,&self.validation);}
+            if !s.settings_error.is_empty(){ui.colored_label(p.error,&s.settings_error);}
+        });
+    }
+    fn save_bar(&mut self, ui: &mut Ui, s: &Shared, p: Palette) {
+        ui.add_space(design::GAP);
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    self.dirty && !s.commands.settings_pending,
+                    Button::new("Save settings").fill(p.selected),
+                )
+                .clicked()
+            {
+                self.save(self.edit_config.clone(), true);
+                if self.validation.is_empty() {
+                    self.dirty = false;
+                }
             }
-            0
-        }
-        WM_CLOSE => {
-            ASK_NAME_RESULT.with(|c| *c.borrow_mut() = None);
-            unsafe {
-                DestroyWindow(hwnd);
+            if ui
+                .add_enabled(self.dirty, Button::new("Discard edits"))
+                .clicked()
+            {
+                self.edit_config = s.config.clone();
+                self.dirty = false;
+                self.validation.clear();
             }
-            0
+            if self.dirty {
+                ui.colored_label(p.muted, "Unsaved changes");
+            }
+        });
+    }
+    fn activity(&mut self, ui: &mut Ui, s: &Shared, p: Palette) {
+        ui.horizontal(|ui| {
+            ui.heading("Activity");
+            if ui.button("Back to games").clicked() {
+                self.set_page(Page::Games);
+            }
+            if ui.button("Open logs folder").clicked() {
+                tray::request_folder(&self.shared, &self.folder);
+            }
+            if ui.button("Load recent worker log").clicked() {
+                self.worker_log = Some(
+                    read_worker_log(&self.folder)
+                        .unwrap_or_else(|error| format!("Could not read worker log: {error}")),
+                );
+            }
+        });
+        ui.colored_label(p.muted,"Recent observed status changes while this dashboard is open. Detailed worker logs remain in the data folder.");
+        p.card().show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.strong("Current state");
+            let summary = crate::presentation::summarize(s);
+            ui.label(&summary.games);
+            ui.label(summary.ai_text());
+            if let Some(result) = &s.commands.latest {
+                ui.label(format!(
+                    "Command #{}: {:?}\n{}",
+                    result.id, result.outcome, result.message
+                ));
+            }
+            if let Some(feedback) = &s.restore_feedback {
+                ui.label(feedback.text());
+            }
+            if let Some(report) = &s.verify_report {
+                ui.label(render_verify_report(report));
+            }
+            for (source, error) in &s.discovery_errors {
+                ui.colored_label(p.error, format!("{source}: {error}"));
+            }
+        });
+        ui.add_space(design::GAP);
+        p.card().show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.strong("Recent events");
+            for entry in &self.log.entries {
+                ui.separator();
+                ui.add(Label::new(entry).wrap());
+            }
+        });
+        if let Some(text) = self.worker_log.as_mut() {
+            ui.add_space(design::GAP);
+            p.card().show(ui, |ui| {
+                ui.strong("Recent worker log (timestamps are Unix seconds)");
+                ui.colored_label(
+                    p.muted,
+                    "Loaded on request. Up to 64 KiB from the current local log.",
+                );
+                ui.add(
+                    TextEdit::multiline(text)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(12)
+                        .interactive(false),
+                );
+            });
         }
-        _ => unsafe { DefWindowProcW(hwnd, message, w, l) },
+    }
+    fn modal(&mut self, ctx: &Context, s: &Shared, p: Palette) {
+        let Some(mut modal) = self.modal.take() else {
+            self.modal_active = false;
+            return;
+        };
+        let first = !self.modal_active;
+        self.modal_active = true;
+        let mut cancel = false;
+        let mut accepted = false;
+        let title = match &modal {
+            Modal::Add { .. } => "Add game",
+            Modal::Rename(..) => "Rename game",
+            Modal::Remove(..) => "Remove custom game?",
+            Modal::Resume(..) => "Resume AI while a game is running?",
+            Modal::Verify => "Test live LM Studio recovery?",
+            Modal::Ollama(..) => "Enable experimental Ollama?",
+            Modal::Help => "Keyboard and controls",
+        };
+        let response=egui::Modal::new(Id::new("gamepause-modal")).frame(p.card().inner_margin(20)).show(ctx,|ui| {
+            ui.set_width(510.0_f32.min(ctx.content_rect().width()-64.0));
+            ui.heading(title);ui.add_space(design::GAP);
+            match &mut modal {
+                Modal::Add{name,path,auto}=> {
+                    ui.label("Choose the game executable. Its name is filled from the filename.");
+                    ui.label("Game name");ui.text_edit_singleline(name);
+                    ui.label("Executable");ui.horizontal(|ui| {
+                        ui.add_sized([ui.available_width()-112.0,design::CONTROL],TextEdit::singleline(path));
+                        if ui.button("Browse...").clicked(){match browse(self.owner){Ok(Some(value))=>{*path=value;if name.trim().is_empty(){*name=std::path::Path::new(path).file_stem().unwrap_or_default().to_string_lossy().into_owned();}},Ok(None)=>(),Err(e)=>self.validation=format!("Could not choose executable: {e:#}")}}
+                    });
+                    ui.label("Source: Custom registration");ui.styled_checkbox(auto,"Automatically pause AI for this game");
+                },
+                Modal::Rename(row,name)=> {ui.label(&row.path);ui.label("Game name");ui.text_edit_singleline(name);},
+                Modal::Remove(row)=> {ui.label(&row.name);ui.add(Label::new(&row.path).wrap());ui.label("Removes only this custom registration. Pending recovery keeps its original game checks.");},
+                Modal::Resume(offer,checked)=> {
+                    ui.colored_label(p.accent,"Resuming AI may consume GPU memory and affect game performance.");
+                    ui.label("This approval ends when a listed game exits/restarts, another nonignored game starts, you pause AI, or GamePause restarts.");
+                    ui.add_space(8.0);
+                    ScrollArea::vertical().max_height(220.0).show(ui,|ui| {
+                        for (game,ignore) in offer.games.iter().zip(checked.iter_mut()) {
+                            ui.strong(format!("{} (PID {})",game.game,game.pid));
+                            ui.add(Label::new(RichText::new(&game.executable).small().color(p.muted)).wrap());
+                            ui.styled_checkbox(ignore,"Also ignore this executable for future pauses");ui.separator();
+                        }
+                    });
+                    ui.colored_label(p.muted,"Ignore selections are optional. Resume works without selecting any games.");
+                },
+                Modal::Verify=> {ui.label("This live test captures settings, unloads models and restores them. It can interrupt current inference. Recovery safeguards and fresh game checks remain in force.");},
+                Modal::Ollama(provider)=> {
+                    ui.label(format!("Saved endpoint: {}",provider.endpoint()));
+                    ui.colored_label(p.accent,"Experimental. Not tested with a live Ollama installation.");
+                    ui.label("Only supported local GGUF completion models with finite expiry are eligible. Restoration verifies identity, context and remaining observed residency deadline. Full load settings, parallelism, conversations and KV cache are not preserved. Embedding/cloud models and unknown settings are refused.");
+                    ui.label("The user-owned service stays running. No model downloads or repeated unloading of later client reloads.");
+                },
+                Modal::Help=> {ui.label("Tab / Shift+Tab moves focus. Enter / Space activates controls. Arrow keys select table rows. Escape closes this dialog or returns to Games. F1 opens this help. Closing the dashboard keeps the tray watcher running. Quit uses the existing safe shutdown path.");},
+            }
+            if !self.validation.is_empty(){ui.colored_label(p.error,&self.validation);}
+            ui.add_space(design::GAP);
+            ui.horizontal(|ui| {
+                let cancel_button=ui.button(if matches!(modal,Modal::Help){"Close"}else{"Cancel"});
+                // Cancel is first in keyboard order. Dangerous actions require explicit activation.
+                if first {cancel_button.request_focus();}
+                cancel=cancel_button.clicked();
+                let label=match modal {Modal::Add{..}=>"Add game",Modal::Rename(..)=>"Rename",Modal::Remove(..)=>"Remove",Modal::Resume(..)=>"Resume AI",Modal::Verify=>"Test round-trip",Modal::Ollama(..)=>"Enable Ollama",Modal::Help=>""};
+                if !label.is_empty(){accepted=ui.add_enabled(!s.commands.settings_pending,Button::new(label).fill(p.selected).stroke(Stroke::new(1.0_f32,p.accent))).clicked();}
+            });
+        });
+        cancel |= response.should_close();
+        if cancel {
+            self.modal_active = false;
+            self.validation.clear();
+            crate::app::local_result(
+                &self.shared,
+                Outcome::Cancelled,
+                "Dialog cancelled; AI and preferences unchanged.",
+            );
+            return;
+        }
+        if accepted {
+            self.modal_active = false;
+            match &modal {
+                Modal::Add { name, path, auto } => {
+                    if name.trim().is_empty() {
+                        self.validation = "Enter a game name.".into();
+                    } else if !std::path::Path::new(path).is_absolute()
+                        || !path.to_lowercase().ends_with(".exe")
+                        || !std::path::Path::new(path).is_file()
+                    {
+                        self.validation =
+                            "Choose an existing executable with an absolute path.".into();
+                    } else {
+                        let mut c = s.config.clone();
+                        add_game(&mut c, path.clone(), name.trim().into());
+                        set_ignored(&mut c, path, !auto);
+                        self.save(c, false);
+                        if self.validation.is_empty() {
+                            return;
+                        }
+                    }
+                }
+                Modal::Rename(row, name) => match apply_rename(&s.config, &row.path, name) {
+                    Ok(c) => {
+                        self.save(c, false);
+                        if self.validation.is_empty() {
+                            return;
+                        }
+                    }
+                    Err(e) => self.validation = e,
+                },
+                Modal::Remove(row) => {
+                    // The worker validates exact custom path/name again before persisting.
+                    self.action(
+                        Action::RemoveCustom {
+                            path: row.path.clone(),
+                            name: row.name.clone(),
+                        },
+                        "Remove custom game",
+                    );
+                    return;
+                }
+                Modal::Resume(offer, checked) => match confirmed_resume(s, offer, checked) {
+                    Ok(action) => {
+                        self.action(action, "Resume AI during gameplay");
+                        return;
+                    }
+                    Err(error) => self.validation = error,
+                },
+                Modal::Verify => {
+                    if crate::ui_commands::verify_available(s) {
+                        crate::app::request_verify(&self.shared, &self.tx);
+                        return;
+                    }
+                    self.validation="The test is no longer available. Wait for games, recovery or current work to finish.".into();
+                }
+                Modal::Ollama(provider) => {
+                    if !s.config.advanced_settings_visible
+                        || s.provider_pending(crate::provider::Kind::Ollama)
+                        || s.config
+                            .providers
+                            .iter()
+                            .find(|p| p.kind() == crate::provider::Kind::Ollama)
+                            != Some(provider)
+                    {
+                        self.validation =
+                            "Ollama settings changed while confirming. Cancel and try again."
+                                .into();
+                    } else {
+                        let mut c = s.config.clone();
+                        if let Some(crate::config::Provider::Ollama { enabled, .. }) = c
+                            .providers
+                            .iter_mut()
+                            .find(|p| p.kind() == crate::provider::Kind::Ollama)
+                        {
+                            *enabled = true;
+                        }
+                        self.save(c, true);
+                        if self.validation.is_empty() {
+                            return;
+                        }
+                    }
+                }
+                Modal::Help => return,
+            }
+        }
+        self.modal = Some(modal);
+    }
+    fn draw(&mut self, ctx: &Context, s: &Shared) {
+        let contrast = crate::theme::high_contrast();
+        let dark = crate::theme::effective_dark(s.config.appearance);
+        let palette = Palette::for_mode(dark, contrast);
+        if self.theme != Some((dark, contrast)) {
+            palette.install(ctx, dark);
+            self.theme = Some((dark, contrast));
+        }
+        if !self.dirty && s.revision != self.edit_revision {
+            self.edit_config = s.config.clone();
+            self.edit_revision = s.revision;
+        }
+        if self.dirty && s.revision != self.edit_revision && !s.commands.settings_pending {
+            // Preserve edits only while their base settings have not changed.
+            self.edit_config = s.config.clone();
+            self.edit_revision = s.revision;
+            self.dirty = false;
+            self.validation = "Saved settings changed. Review them before editing again.".into();
+        }
+        let summary = crate::presentation::summarize(s);
+        let command = s
+            .commands
+            .latest
+            .as_ref()
+            .map_or_else(String::new, |result| {
+                format!(
+                    "\nCommand #{}: {:?}  {}",
+                    result.id, result.outcome, result.message
+                )
+            });
+        self.log.record(format!(
+            "{}\n{}{}",
+            summary.games,
+            summary.ai_text(),
+            command
+        ));
+        if ctx.input(|i| i.key_pressed(Key::F1)) {
+            self.modal = Some(Modal::Help);
+        }
+        if self.modal.is_none() && ctx.input(|i| i.key_pressed(Key::Escape)) {
+            if s.config.advanced_settings_visible {
+                self.action(Action::AdvancedVisibility(false), "Close Advanced");
+            } else {
+                self.set_page(Page::Games);
+            }
+        }
+        TopBottomPanel::bottom("footer")
+            .frame(
+                Frame::new()
+                    .fill(palette.background)
+                    .inner_margin(Margin::symmetric(22, 12)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.colored_label(
+                        palette.muted,
+                        format!("GamePause {}", env!("CARGO_PKG_VERSION")),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if design::button(ui, "Quit", Icon::Power, false, palette).clicked() {
+                            crate::app::request_quit(&self.shared, &self.tx);
+                        }
+                        if design::button(
+                            ui,
+                            "Activity",
+                            Icon::Activity,
+                            self.page == Page::Activity,
+                            palette,
+                        )
+                        .clicked()
+                        {
+                            self.set_page(Page::Activity);
+                        }
+                    });
+                });
+            });
+        CentralPanel::default()
+            .frame(Frame::new().fill(palette.background).inner_margin(18))
+            .show(ctx, |ui| {
+                ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        self.hero(ui, s, palette);
+                        ui.add_space(design::GAP);
+                        self.settings_strip(ui, s, palette);
+                        ui.add_space(design::GAP);
+                        if self.page == Page::Activity {
+                            self.activity(ui, s, palette);
+                        } else if s.config.advanced_settings_visible {
+                            self.advanced(ui, s, palette);
+                        } else {
+                            self.games(ui, s, palette);
+                        }
+                    });
+            });
+        if let Some((message, error)) = self.toast.message(s, Instant::now()) {
+            let message = message.to_owned();
+            Area::new(Id::new("toast"))
+                .anchor(Align2::CENTER_BOTTOM, [0.0, -76.0])
+                .order(Order::Foreground)
+                .show(ctx, |ui| {
+                    palette
+                        .card()
+                        .stroke(Stroke::new(
+                            1.0_f32,
+                            if error { palette.error } else { palette.border },
+                        ))
+                        .show(ui, |ui| {
+                            ui.set_max_width((ctx.content_rect().width() - 60.0).min(700.0));
+                            ui.add(Label::new(message).wrap());
+                        });
+                });
+            if !error
+                && s.commands
+                    .latest
+                    .as_ref()
+                    .is_some_and(|r| !matches!(r.outcome, Outcome::Working | Outcome::Requested))
+            {
+                ctx.request_repaint_after(
+                    Duration::from_secs(5).saturating_sub(self.toast.since.elapsed()),
+                );
+            }
+        }
+        self.modal(ctx, s, palette);
+    }
+}
+impl eframe::App for Dashboard {
+    fn update(&mut self, ctx: &Context, frame: &mut eframe::Frame) {
+        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        if let Ok(handle) = frame.window_handle()
+            && let RawWindowHandle::Win32(handle) = handle.as_raw()
+        {
+            self.owner = handle.hwnd.get() as HWND;
+        }
+        let Ok(s) = self.shared.lock().map(|s| s.clone()) else {
+            return;
+        };
+        while let Some(request) = self.rx.lock().ok().and_then(|rx| rx.try_recv().ok()) {
+            match request {
+                UiRequest::Stop => {
+                    self.stopping = true;
+                    ctx.send_viewport_cmd(ViewportCommand::Close);
+                }
+                UiRequest::Show => {
+                    self.visible = true;
+                    ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(ViewportCommand::Focus);
+                }
+                UiRequest::Resume => {
+                    self.visible = true;
+                    ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(ViewportCommand::Focus);
+                    self.resume(&s);
+                }
+                UiRequest::Verify => {
+                    self.visible = true;
+                    ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(ViewportCommand::Focus);
+                    if crate::ui_commands::verify_available(&s) {
+                        self.modal = Some(Modal::Verify);
+                    }
+                }
+                UiRequest::Theme => self.theme = None,
+            }
+        }
+        if ctx.input(|i| i.viewport().close_requested()) && !self.stopping {
+            self.visible = false;
+        }
+        RUNNING_REQUESTED.store(
+            self.visible && self.page == Page::Running && !s.config.advanced_settings_visible,
+            Ordering::Relaxed,
+        );
+        UI_VISIBLE.store(self.visible, Ordering::Relaxed);
+        if self.visible {
+            self.draw(ctx, &s);
+        }
     }
 }
 
-/// Pure: render a round-trip verify report (P2-1) for the FEEDBACK line:
-/// one `name: detail` per step, marked ok/FAIL, with the summary last.
-#[must_use]
+fn numeric(ui: &mut Ui, label: &str, value: &mut f64, dirty: &mut bool) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label(label);
+        *dirty |= ui.add(DragValue::new(value).speed(0.5)).changed();
+    });
+}
+fn string_list(ui: &mut Ui, label: &str, list: &mut Vec<String>, dirty: &mut bool) {
+    ui.collapsing(label, |ui| {
+        let mut remove = None;
+        for (index, value) in list.iter_mut().enumerate() {
+            ui.push_id((label, index), |ui| {
+                ui.horizontal(|ui| {
+                    *dirty |= ui.text_edit_singleline(value).changed();
+                    if ui.small_button("Remove").clicked() {
+                        remove = Some(index);
+                    }
+                });
+            });
+        }
+        if let Some(index) = remove {
+            list.remove(index);
+            *dirty = true;
+        }
+        if ui.button("Add entry").clicked() {
+            list.push(String::new());
+            *dirty = true;
+        }
+    });
+}
+fn read_worker_log(folder: &std::path::Path) -> std::io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(folder.join("gamepause.log"))?;
+    let len = file.metadata()?.len();
+    let skipped = len.saturating_sub(65536);
+    file.seek(SeekFrom::Start(skipped))?;
+    let mut bytes = Vec::new();
+    file.take(65536).read_to_end(&mut bytes)?;
+    let text = String::from_utf8_lossy(&bytes);
+    Ok(if skipped > 0 {
+        text.split_once('\n').map_or("", |(_, tail)| tail).into()
+    } else {
+        text.into_owned()
+    })
+}
+#[cfg(test)]
+pub(crate) fn shared_command_ids(advanced: bool) -> Vec<i32> {
+    crate::ui_commands::Command::ALL
+        .into_iter()
+        .filter(|c| *c != crate::ui_commands::Command::OpenDashboard && c.visible(advanced))
+        .map(|c| c as i32)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        control::Activity,
+        coordinator::{Report, State},
+        discovery::Game,
+        provider::{Guarantee, Kind},
+    };
+    use std::sync::Arc;
+    fn fixture() -> Shared {
+        let mut s = Shared {
+            activity: Activity::Paused,
+            active_mode: true,
+            pending: true,
+            discovery_ready: true,
+            detection_ok: true,
+            ..Default::default()
+        };
+        s.config.appearance = crate::config::Appearance::Dark;
+        for (name, platform) in [
+            ("Stardew Valley", "Steam"),
+            ("The Last of Us Part II", "Epic"),
+            ("The Witcher 3: Wild Hunt — Remastered", "Steam"),
+            ("Trine 4: The Nightmare Prince", "Steam"),
+        ] {
+            s.games.push(Game {
+                identity: name.into(),
+                name: name.into(),
+                launcher: platform.into(),
+                path: format!(r"D:\Fixture Games\{name}"),
+            });
+        }
+        let mut active = crate::gameplay::fixtures::game(10416, 11);
+        active.game = s.games[2].name.clone();
+        active.path = s.games[2].path.clone();
+        active.executable = format!(r"{}\game.exe", active.path);
+        active.launcher = "Steam".into();
+        s.active_games.push(active.clone());
+        s.restore_offer = Some(crate::gameplay::RestoreOffer {
+            id: 42,
+            games: vec![active],
+        });
+        s.provider_statuses = vec![Report {
+            id: s.config.providers[0].id().into(),
+            kind: Kind::LMStudio,
+            guarantee: Guarantee::CapturedConfiguration,
+            state: State::Paused,
+            pending: true,
+            error: String::new(),
+            retry_seconds: None,
+        }];
+        s.running_apps = vec![
+            crate::processes::RunningApp {
+                name: "game.exe".into(),
+                path: format!(r"{}\game.exe", s.games[2].path),
+            },
+            crate::processes::RunningApp {
+                name: "missing-game.exe".into(),
+                path: r"D:\Fixture Games\Unknown\missing-game.exe".into(),
+            },
+        ];
+        s
+    }
+    fn dashboard(s: Shared) -> Dashboard {
+        let (tx, _) = mpsc::channel();
+        let (_, rx) = mpsc::channel();
+        Dashboard::new(
+            Arc::new(Mutex::new(s)),
+            tx,
+            PathBuf::from("scratch/ui-fixture"),
+            Arc::new(Mutex::new(rx)),
+        )
+    }
+    #[test]
+    fn pending_recovery_and_idle_do_not_claim_verified_pause_or_current_residency() {
+        let mut s = fixture();
+        s.activity = Activity::Recovery;
+        assert!(!hero(&s).paused);
+        assert_eq!(hero(&s).tone, Tone::Error);
+        s.activity = Activity::Watching;
+        s.pending = false;
+        s.provider_statuses.clear();
+        assert!(hero(&s).hint.contains("not polled"));
+        assert!(!hero(&s).paused);
+        assert!(provider_status(&s)[0].0.contains("unpolled"));
+        s.provider_statuses = fixture().provider_statuses;
+        s.provider_statuses[0].state = State::Restored;
+        assert!(
+            provider_status(&s)[0]
+                .0
+                .contains("current residency unpolled")
+        );
+        s.config.automation_enabled = false;
+        assert_eq!(hero(&s).title, "AUTO PAUSE OFF");
+        s.detection_ok = false;
+        assert!(hero(&s).reason.contains("not yet confirmed"));
+    }
+    #[test]
+    fn game_tables_filter_dedupe_and_preserve_exclusions() {
+        let mut s = fixture();
+        s.games.push(s.games[0].clone());
+        assert_eq!(rows(&s, Page::Games, "").len(), 4);
+        assert_eq!(rows(&s, Page::Games, "witcher")[0].pid, Some(10416));
+        let path = s.games[0].path.clone();
+        set_ignored(&mut s.config, &path, true);
+        assert!(rows(&s, Page::Games, "stardew")[0].ignored);
+        assert_eq!(rows(&s, Page::Ignored, "").len(), 1);
+        set_ignored(&mut s.config, &path, false);
+        assert!(rows(&s, Page::Ignored, "").is_empty());
+        assert_eq!(
+            rows(&s, Page::Running, "missing")[0].platform,
+            "Unrecognized"
+        );
+    }
+    #[test]
+    fn success_toasts_expire_unchanged_results_and_errors_persist() {
+        let start = Instant::now();
+        let mut toast = Toast::new();
+        let mut s = Shared::default();
+        s.commands.local(Outcome::Completed, "Settings saved");
+        assert!(toast.message(&s, start).is_some());
+        assert!(toast.message(&s, start + Duration::from_secs(6)).is_none());
+        s.commands.local(Outcome::Failed, "Save refused");
+        assert!(
+            toast
+                .message(&s, start + Duration::from_secs(60))
+                .unwrap()
+                .1
+        );
+        assert!(
+            toast
+                .message(&s, start + Duration::from_secs(120))
+                .is_some()
+        );
+    }
+    #[test]
+    fn gameplay_resume_opens_unchecked_modal_and_does_not_send_restore() {
+        let s = fixture();
+        let (tx, rx) = mpsc::channel();
+        let (_, ui_rx) = mpsc::channel();
+        let mut d = Dashboard::new(
+            Arc::new(Mutex::new(s.clone())),
+            tx,
+            PathBuf::from("scratch"),
+            Arc::new(Mutex::new(ui_rx)),
+        );
+        d.resume(&s);
+        assert!(
+            matches!(d.modal,Some(Modal::Resume(_,ref choices)) if choices.iter().all(|on|!*on))
+        );
+        assert!(rx.try_recv().is_err());
+    }
+    #[test]
+    fn gameplay_confirmation_refuses_stale_offers_busy_control_and_unselected_exclusions() {
+        let mut s = fixture();
+        let offer = s.restore_offer.clone().unwrap();
+        assert!(
+            matches!(confirmed_resume(&s,&offer,&[false]),Ok(Action::ConfirmedRestore{ignored,..}) if ignored.is_empty())
+        );
+        assert!(
+            matches!(confirmed_resume(&s,&offer,&[true]),Ok(Action::ConfirmedRestore{ignored,..}) if ignored==vec![offer.games[0].executable.clone()])
+        );
+        s.restore_offer.as_mut().unwrap().id += 1;
+        assert!(confirmed_resume(&s, &offer, &[true]).is_err());
+        s.restore_offer = Some(offer.clone());
+        s.activity = Activity::Restoring;
+        assert!(confirmed_resume(&s, &offer, &[true]).is_err());
+        s.activity = Activity::Paused;
+        s.commands.settings_pending = true;
+        assert!(confirmed_resume(&s, &offer, &[true]).is_err());
+    }
+    #[test]
+    fn recent_worker_log_has_a_read_cap_and_discards_partial_first_line() {
+        let folder = PathBuf::from(format!("scratch/log-fixture-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let mut text = "x".repeat(70000);
+        text.push_str("\nlast complete event\n");
+        std::fs::write(folder.join("gamepause.log"), text).unwrap();
+        assert_eq!(read_worker_log(&folder).unwrap(), "last complete event\n");
+        std::fs::remove_file(folder.join("gamepause.log")).unwrap();
+        std::fs::remove_dir(folder).unwrap();
+    }
+    #[test]
+    #[ignore = "opens only a fictional-state dashboard to exercise UI-thread lifecycle"]
+    fn ui_bridge_hides_reopens_and_stops_without_backend() {
+        fn until(label: &str, mut ready: impl FnMut() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !ready() {
+                assert!(Instant::now() < deadline, "UI lifecycle timed out: {label}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        struct Cleanup;
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                close();
+            }
+        }
+        let _cleanup = Cleanup;
+        let s = Arc::new(Mutex::new(fixture()));
+        let (tx, rx) = mpsc::channel();
+        show(s, tx, PathBuf::from("scratch/ui-fixture"));
+        until("window open", || UI_VISIBLE.load(Ordering::Relaxed));
+        let ctx = BRIDGE
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .ctx
+            .clone()
+            .unwrap();
+        ctx.send_viewport_cmd(ViewportCommand::Close);
+        ctx.request_repaint();
+        until("window close", || !UI_VISIBLE.load(Ordering::Relaxed));
+        assert!(!needs_running_apps());
+        theme_changed();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !UI_VISIBLE.load(Ordering::Relaxed),
+            "A theme change must not reopen a closed dashboard"
+        );
+        let before = BRIDGE.lock().unwrap().as_ref().unwrap().fingerprint.clone();
+        refresh();
+        assert_eq!(before, BRIDGE.lock().unwrap().as_ref().unwrap().fingerprint);
+        dispatch(UiRequest::Show);
+        until("window open", || UI_VISIBLE.load(Ordering::Relaxed));
+        dispatch(UiRequest::Resume);
+        ctx.request_repaint();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            rx.try_recv().is_err(),
+            "Opening a warning must not send a restore action"
+        );
+        close();
+        assert!(BRIDGE.lock().unwrap().is_none());
+    }
+    #[test]
+    fn activity_is_bounded_and_unchanged_frames_add_no_events() {
+        let mut log = ActivityLog::new();
+        log.record("same".into());
+        log.record("same".into());
+        assert_eq!(log.entries.len(), 1);
+        for index in 0..300 {
+            log.record(format!("event {index}"));
+        }
+        assert_eq!(log.entries.len(), 160);
+    }
+    #[test]
+    fn all_pages_and_states_render_at_supported_sizes_and_dpi() {
+        for dpi in [1.0, 1.25, 1.5, 1.75, 2.0] {
+            for size in [vec2(620.0, 580.0), vec2(1120.0, 920.0), vec2(1500.0, 960.0)] {
+                let mut d = dashboard(fixture());
+                let ctx = Context::default();
+                design::fonts(&ctx);
+                for activity in [
+                    Activity::Unknown,
+                    Activity::Watching,
+                    Activity::Observation,
+                    Activity::Unavailable,
+                    Activity::DetectionUnavailable,
+                    Activity::Capturing,
+                    Activity::WaitingForInference,
+                    Activity::Unloading,
+                    Activity::Paused,
+                    Activity::ManualHold,
+                    Activity::Countdown,
+                    Activity::Restoring,
+                    Activity::Recovery,
+                    Activity::PartialFailure,
+                    Activity::Verifying,
+                    Activity::Coexistence,
+                ] {
+                    let mut s = fixture();
+                    s.activity = activity;
+                    let input = RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+                        ..Default::default()
+                    };
+                    ctx.set_pixels_per_point(dpi);
+                    let output = ctx.run(input, |ctx| d.draw(ctx, &s));
+                    assert!(!output.shapes.is_empty());
+                }
+                for page in [Page::Games, Page::Running, Page::Ignored, Page::Activity] {
+                    d.page = page;
+                    let output = ctx.run(
+                        RawInput {
+                            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+                            ..Default::default()
+                        },
+                        |ctx| d.draw(ctx, &fixture()),
+                    );
+                    assert!(!output.shapes.is_empty());
+                }
+                for page in [
+                    SettingsPage::General,
+                    SettingsPage::Detection,
+                    SettingsPage::LMStudio,
+                    SettingsPage::Ollama,
+                    SettingsPage::Recovery,
+                    SettingsPage::Diagnostics,
+                ] {
+                    d.page = Page::Games;
+                    d.settings_page = page;
+                    let mut s = fixture();
+                    s.config.advanced_settings_visible = true;
+                    let output = ctx.run(
+                        RawInput {
+                            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+                            ..Default::default()
+                        },
+                        |ctx| d.draw(ctx, &s),
+                    );
+                    assert!(!output.shapes.is_empty());
+                }
+            }
+        }
+    }
+    /// Render only fictional state. No watcher, provider, startup or config writes.
+    #[test]
+    #[ignore = "opens an isolated renderer window for visual review"]
+    fn ui_design_review_snapshots() {
+        struct Review {
+            d: Dashboard,
+            stage: usize,
+            frames: u32,
+            start: Instant,
+        }
+        impl eframe::App for Review {
+            fn update(&mut self, ctx: &Context, _: &mut eframe::Frame) {
+                assert!(
+                    self.start.elapsed() < Duration::from_secs(60),
+                    "Screenshot renderer timed out"
+                );
+                let mut image = None;
+                ctx.input(|i| {
+                    for e in &i.events {
+                        if let Event::Screenshot { image: shot, .. } = e {
+                            image = Some(shot.clone());
+                        }
+                    }
+                });
+                if let Some(image) = image {
+                    let bytes = image
+                        .pixels
+                        .iter()
+                        .flat_map(|pixel| pixel.to_array())
+                        .collect::<Vec<_>>();
+                    let path = format!("scratch/ui-review/{:02}.png", self.stage);
+                    image::save_buffer(
+                        &path,
+                        &bytes,
+                        image.size[0] as u32,
+                        image.size[1] as u32,
+                        image::ColorType::Rgba8,
+                    )
+                    .unwrap();
+                    self.stage += 1;
+                    self.frames = 0;
+                    if self.stage == 15 {
+                        ctx.send_viewport_cmd(ViewportCommand::Close);
+                        return;
+                    }
+                }
+                if self.stage >= 15 {
+                    return;
+                }
+                let mut s = fixture();
+                self.d.page = Page::Games;
+                self.d.modal = None;
+                let size = match self.stage {
+                    1 => vec2(620.0, 580.0),
+                    2 => vec2(1500.0, 960.0),
+                    _ => vec2(1120.0, 920.0),
+                };
+                ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
+                match self.stage {
+                    3 => self.d.page = Page::Running,
+                    4 => {
+                        self.d.page = Page::Ignored;
+                        let path = s.games[0].path.clone();
+                        set_ignored(&mut s.config, &path, true);
+                    }
+                    5..=10 => {
+                        s.config.advanced_settings_visible = true;
+                        self.d.settings_page = [
+                            SettingsPage::General,
+                            SettingsPage::Detection,
+                            SettingsPage::LMStudio,
+                            SettingsPage::Ollama,
+                            SettingsPage::Recovery,
+                            SettingsPage::Diagnostics,
+                        ][self.stage - 5];
+                    }
+                    11 => {
+                        self.d.modal =
+                            Some(Modal::Resume(s.restore_offer.clone().unwrap(), vec![false]))
+                    }
+                    12 => {
+                        self.d.modal = Some(Modal::Add {
+                            name: "Fixture game".into(),
+                            path: r"D:\Fixture Games\play.exe".into(),
+                            auto: true,
+                        })
+                    }
+                    13 => self.d.page = Page::Activity,
+                    14 => {
+                        s.activity = Activity::PartialFailure;
+                        s.config.appearance = crate::config::Appearance::Light;
+                    }
+                    _ => (),
+                }
+                self.d.draw(ctx, &s);
+                self.frames += 1;
+                if self.frames == 6 {
+                    ctx.send_viewport_cmd(ViewportCommand::Screenshot(Default::default()));
+                }
+                ctx.request_repaint_after(Duration::from_millis(40));
+            }
+        }
+        std::fs::create_dir_all("scratch/ui-review").unwrap();
+        eframe::run_native(
+            "GamePause isolated UI review",
+            native_options(),
+            Box::new(|cc| {
+                design::fonts(&cc.egui_ctx);
+                let mut d = dashboard(fixture());
+                d.selected = Some(fixture().games[3].path.clone());
+                Ok(Box::new(Review {
+                    d,
+                    stage: 0,
+                    frames: 0,
+                    start: Instant::now(),
+                }))
+            }),
+        )
+        .unwrap();
+        assert!(std::path::Path::new("scratch/ui-review/14.png").exists());
+    }
+}
+
 pub fn render_verify_report(report: &crate::engine::VerifyReport) -> String {
     let mut lines = report
         .steps
@@ -1446,24 +2221,6 @@ pub fn render_verify_report(report: &crate::engine::VerifyReport) -> String {
     lines
 }
 
-/// Pure: dedupe a row list on the canonical path, keeping the first row seen
-/// for each distinct executable. Order-preserving.
-///
-/// This is the fix for the old adjacent-only `dedup_by` that let the same
-/// executable survive under two display names (e.g. one per launch dir).
-#[must_use]
-fn dedupe_by_canonical(rows: &[Row]) -> Vec<Row> {
-    let mut seen = HashSet::new();
-    rows.iter()
-        .filter(|row| seen.insert(canonical(&row.path)))
-        .cloned()
-        .collect()
-}
-
-/// Pure: apply the SAVE-settings action to a config, returning the new config
-/// on success or a human-readable error string to show in the FEEDBACK line.
-/// Routing validation failures to the feedback line (not a modal) is the P1-7
-/// fix; modals are reserved for hard failures like a missing data dir.
 pub fn apply_save(config: &Config, delay_text: &str, host_text: &str) -> Result<Config, String> {
     let mut out = config.clone();
     let delay = delay_text
@@ -1507,530 +2264,6 @@ pub fn apply_rename(config: &Config, row_path: &str, new_name: &str) -> Result<C
     }
 }
 
-fn rows(shared: &Shared, page: Page, query: &str) -> Vec<Row> {
-    let ignored = |path: &str| {
-        shared
-            .config
-            .ignored_games
-            .iter()
-            .chain(&shared.config.excluded_paths)
-            .any(|p| canonical(p) == canonical(path))
-    };
-    let mut rows = match page {
-        Page::Games => shared
-            .games
-            .iter()
-            .map(|g| {
-                let off = ignored(&g.path);
-                let running = shared
-                    .active_games
-                    .iter()
-                    .any(|a| canonical(&a.path) == canonical(&g.path));
-                Row {
-                    label: format!(
-                        "{}  |  {}  |  {}{}",
-                        g.name,
-                        g.launcher,
-                        if off {
-                            "Automatic pausing off"
-                        } else {
-                            "Automatic pausing on"
-                        },
-                        if running { "  |  Running" } else { "" }
-                    ),
-                    path: g.path.clone(),
-                    name: g.name.clone(),
-                    custom: g.launcher == "Custom",
-                    ignored: off,
-                    running,
-                }
-            })
-            .collect::<Vec<_>>(),
-        Page::Running => shared
-            .running_apps
-            .iter()
-            .map(|a| Row {
-                label: a.name.clone(),
-                path: a.path.clone(),
-                name: a.name.trim_end_matches(".exe").into(),
-                custom: false,
-                ignored: ignored(&a.path),
-                running: true,
-            })
-            .collect(),
-        Page::Ignored => shared
-            .config
-            .ignored_games
-            .iter()
-            .chain(&shared.config.excluded_paths)
-            .map(|path| Row {
-                label: shared
-                    .games
-                    .iter()
-                    .find(|g| canonical(&g.path) == canonical(path))
-                    .map(|g| format!("{}  |  Automatic pausing off", g.name))
-                    .unwrap_or_else(|| {
-                        format!(
-                            "{}  |  Automatic pausing off",
-                            path.rsplit(['\\', '/']).next().unwrap_or(path)
-                        )
-                    }),
-                path: path.clone(),
-                name: String::new(),
-                custom: false,
-                ignored: true,
-                running: false,
-            })
-            .collect(),
-    };
-    let query = query.to_lowercase();
-    rows.retain(|row| {
-        row.label.to_lowercase().contains(&query) || row.path.to_lowercase().contains(&query)
-    });
-    rows.sort_by_key(|row| row.label.to_lowercase());
-    // Dedupe on canonical path *globally* (not adjacent-only after the label
-    // sort), so the same executable listed under two names collapses to one row.
-    dedupe_by_canonical(&rows)
-}
-/// Height of one owner-drawn listbox item in design units at the given DPI.
-/// Single-line text with vertical padding.
-fn row_height(dpi: i32) -> i32 {
-    scale(24, dpi)
-}
-
-/// `WM_MEASUREITEM` for the games listbox. `LBS_OWNERDRAWFIXED` asks the owner
-/// for each item's size before it draws; not answering leaves rows at zero height.
-unsafe fn measure_list_item(lparam: LPARAM, dpi: i32) {
-    unsafe {
-        let item = &mut *(lparam as *mut MEASUREITEMSTRUCT);
-        if item.CtlID == LIST as u32 {
-            item.itemHeight = row_height(dpi) as u32;
-        }
-    }
-}
-/// Draw text-only rows. Transparent text prevents an opaque text rectangle
-/// from covering selection. Preserve the supplied DC state.
-unsafe fn draw_list_item(lparam: LPARAM, index: usize, font: HFONT, rows: &[Row], dpi: i32) {
-    let palette = snapshot()
-        .and_then(|s| s.theme.clone())
-        .map(|theme| theme.palette)
-        .unwrap_or_else(|| crate::theme::Palette::for_mode(false));
-    unsafe {
-        draw_list_item_palette(lparam, index, font, rows, dpi, palette);
-    }
-}
-unsafe fn draw_list_item_palette(
-    lparam: LPARAM,
-    index: usize,
-    font: HFONT,
-    rows: &[Row],
-    dpi: i32,
-    palette: crate::theme::Palette,
-) {
-    unsafe {
-        let item = *(lparam as *const DRAWITEMSTRUCT);
-        let saved = SaveDC(item.hDC);
-        if saved == 0 {
-            return;
-        }
-        let selected = item.itemState & ODS_SELECTED != 0;
-        crate::theme::fill(
-            item.hDC,
-            &item.rcItem,
-            if selected {
-                palette.selected
-            } else {
-                palette.background
-            },
-        );
-        if let Some(row) = rows.get(index) {
-            SetTextColor(
-                item.hDC,
-                if item.itemState & ODS_DISABLED != 0 {
-                    palette.disabled
-                } else if selected {
-                    palette.selected_text
-                } else {
-                    palette.text
-                },
-            );
-            SetBkMode(item.hDC, TRANSPARENT as i32);
-            SelectObject(item.hDC, font);
-            let mut rect = item.rcItem;
-            rect.left += scale(8, dpi);
-            rect.right -= scale(4, dpi);
-            draw_row_text(
-                item.hDC,
-                &row.label,
-                rect,
-                palette,
-                item.itemState & ODS_DISABLED != 0,
-            );
-        }
-        if item.itemState & ODS_FOCUS != 0 && item.itemState & ODS_NOFOCUSRECT == 0 {
-            DrawFocusRect(item.hDC, &item.rcItem);
-        }
-        if saved != 0 {
-            RestoreDC(item.hDC, saved);
-        }
-    }
-}
-
-unsafe fn draw_row_text(
-    dc: HDC,
-    label: &str,
-    mut rect: RECT,
-    palette: crate::theme::Palette,
-    disabled: bool,
-) {
-    unsafe {
-        let base = GetTextColor(dc);
-        let span = if !disabled && palette.color_words {
-            crate::rich_text::pausing_word(label)
-        } else {
-            None
-        };
-        let parts = if let Some((start, end, on)) = span {
-            vec![
-                (&label[..start], base),
-                (
-                    &label[start..end],
-                    if on {
-                        crate::theme::on_color(palette.dark)
-                    } else {
-                        crate::theme::off_color(palette.dark)
-                    },
-                ),
-                (&label[end..], base),
-            ]
-        } else {
-            vec![(label, base)]
-        };
-        for (part, color) in parts {
-            let value = wide(part);
-            let mut size: SIZE = std::mem::zeroed();
-            GetTextExtentPoint32W(dc, value.as_ptr(), (value.len() - 1) as i32, &mut size);
-            SetTextColor(dc, color);
-            DrawTextW(
-                dc,
-                value.as_ptr(),
-                (value.len() - 1) as i32,
-                &mut rect,
-                DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
-            );
-            rect.left += size.cx;
-            if rect.left >= rect.right {
-                break;
-            }
-        }
-        SetTextColor(dc, base);
-    }
-}
-
-pub fn refresh() {
-    let Some(mut state) = snapshot() else { return };
-    let Ok(shared) = state.shared.lock().map(|s| s.clone()) else {
-        return;
-    };
-    let desired_dark = crate::theme::effective_dark(shared.config.appearance);
-    if state
-        .theme
-        .as_ref()
-        .is_none_or(|theme| theme.dark != desired_dark)
-    {
-        set_client_theme(desired_dark);
-        state = snapshot().unwrap_or(state);
-    }
-    let query = text(unsafe { GetDlgItem(state.hwnd, SEARCH) });
-    if state.settings_visible != shared.config.advanced_settings_visible {
-        let focused = unsafe { GetFocus() };
-        if !shared.config.advanced_settings_visible
-            && SETTINGS_ROW.contains(&unsafe { GetDlgCtrlID(focused) })
-        {
-            unsafe {
-                let target = if shared.commands.settings_pending {
-                    GetDlgItem(state.hwnd, AUTO)
-                } else {
-                    let checkbox = GetDlgItem(state.hwnd, SETTINGS);
-                    EnableWindow(checkbox, 1);
-                    checkbox
-                };
-                SetFocus(target);
-            }
-        }
-        STATE.with(|s| {
-            if let Some(s) = s.borrow_mut().as_mut() {
-                s.settings_visible = shared.config.advanced_settings_visible;
-            }
-        });
-        apply_settings_visibility(state.hwnd, shared.config.advanced_settings_visible);
-        position_controls();
-    }
-    let focus = unsafe { GetFocus() };
-    if !focus.is_null()
-        && unsafe { IsChild(state.hwnd, focus) } != 0
-        && unsafe { GetDlgCtrlID(focus) } != HELP
-    {
-        update_help(unsafe { GetDlgCtrlID(focus) });
-    }
-    let dark = state.theme.as_ref().is_some_and(|theme| theme.dark);
-    let accent = crate::theme::state_accent(shared.activity, dark);
-    unsafe {
-        crate::theme::set_accent(state.hwnd, accent);
-        for id in [STATE_ACCENT, NAVIGATION, PAUSE, RESUME] {
-            crate::theme::set_accent(GetDlgItem(state.hwnd, id), accent);
-        }
-    }
-    let updated = rows(&shared, state.page, &query);
-    let summary = crate::presentation::summarize(&shared);
-    let status = summary.ai_text();
-    let games_control = unsafe { GetDlgItem(state.hwnd, RUNNING_GAMES) };
-    if text(games_control) != summary.games {
-        set(games_control, &summary.games);
-    }
-    if state.last_status != status {
-        set(unsafe { GetDlgItem(state.hwnd, STATUS) }, &status);
-    }
-    unsafe {
-        let appearance = GetDlgItem(state.hwnd, APPEARANCE);
-        if SendMessageW(appearance, CB_GETCURSEL, 0, 0) != shared.config.appearance.index() as isize
-        {
-            SendMessageW(
-                appearance,
-                CB_SETCURSEL,
-                shared.config.appearance.index(),
-                0,
-            );
-        }
-        EnableWindow(appearance, i32::from(!shared.commands.settings_pending));
-        SendMessageW(
-            GetDlgItem(state.hwnd, NOTIFICATIONS),
-            BM_SETCHECK,
-            usize::from(shared.config.notifications_enabled),
-            0,
-        );
-        SendMessageW(
-            GetDlgItem(state.hwnd, SOUND),
-            BM_SETCHECK,
-            usize::from(shared.config.sound_enabled),
-            0,
-        );
-        for id in [NOTIFICATIONS, SOUND] {
-            EnableWindow(
-                GetDlgItem(state.hwnd, id),
-                i32::from(!shared.commands.settings_pending),
-            );
-        }
-        SendMessageW(
-            GetDlgItem(state.hwnd, SETTINGS),
-            BM_SETCHECK,
-            usize::from(shared.config.advanced_settings_visible),
-            0,
-        );
-        EnableWindow(
-            GetDlgItem(state.hwnd, SETTINGS),
-            i32::from(!shared.commands.settings_pending),
-        );
-        SendMessageW(
-            GetDlgItem(state.hwnd, LM_ENABLED),
-            BM_SETCHECK,
-            usize::from(shared.config.lm_enabled()),
-            0,
-        );
-        EnableWindow(
-            GetDlgItem(state.hwnd, LM_ENABLED),
-            i32::from(
-                !shared.provider_pending(crate::provider::Kind::LMStudio)
-                    && !shared.commands.settings_pending
-                    && shared.config.lm().is_some(),
-            ),
-        );
-        let ollama = shared
-            .config
-            .providers
-            .iter()
-            .find(|provider| provider.kind() == crate::provider::Kind::Ollama);
-        SendMessageW(
-            GetDlgItem(state.hwnd, OLLAMA_ENABLED),
-            BM_SETCHECK,
-            usize::from(ollama.is_some_and(|provider| provider.enabled())),
-            0,
-        );
-        for id in [OLLAMA_ENABLED, OLLAMA_ADDRESS, OLLAMA_SAVE] {
-            EnableWindow(
-                GetDlgItem(state.hwnd, id),
-                i32::from(
-                    ollama.is_some()
-                        && !shared.commands.settings_pending
-                        && !shared.provider_pending(crate::provider::Kind::Ollama),
-                ),
-            );
-        }
-        let mut detail = format!(
-            "LM Studio: {}. Endpoint: {}. Guarantee: captured settings and original server-state verification.{}\r\nOllama: {}. Endpoint: {}. Experimental. Not tested with a live Ollama installation. Limited identity/context/remaining-deadline guarantee; full load settings are not preserved.",
-            if shared.config.lm_enabled() {
-                "enabled"
-            } else {
-                "disabled"
-            },
-            shared.config.lm_endpoint(),
-            if shared.provider_pending(crate::provider::Kind::LMStudio) {
-                " Recovery pending: restore before disabling or changing the endpoint."
-            } else {
-                ""
-            },
-            if ollama.is_some_and(|provider| provider.enabled()) {
-                "enabled"
-            } else {
-                "disabled"
-            },
-            ollama.map_or("not configured", |provider| provider.endpoint())
-        );
-        detail.push_str("\r\n");
-        detail.push_str(&crate::diagnostics::render(&shared));
-        if text(GetDlgItem(state.hwnd, PROVIDER_DETAIL)) != detail {
-            set(GetDlgItem(state.hwnd, PROVIDER_DETAIL), &detail);
-        }
-        SendMessageW(
-            GetDlgItem(state.hwnd, AUTO),
-            BM_SETCHECK,
-            usize::from(shared.config.automation_enabled),
-            0,
-        );
-        SendMessageW(
-            GetDlgItem(state.hwnd, STARTUP),
-            BM_SETCHECK,
-            usize::from(tray::startup_enabled()),
-            0,
-        );
-        set(GetDlgItem(state.hwnd, PAUSE), "Pause AI");
-        set(
-            GetDlgItem(state.hwnd, RESUME),
-            crate::restore_dialog::resume_label(
-                !shared.active_games.is_empty(),
-                shared.coexistence,
-                shared.pending,
-            ),
-        );
-        EnableWindow(
-            GetDlgItem(state.hwnd, DOCTOR),
-            i32::from(!shared.doctor_pending),
-        );
-        EnableWindow(
-            GetDlgItem(state.hwnd, VERIFY),
-            i32::from(crate::ui_commands::verify_available(&shared)),
-        );
-        let availability = shared.controls().availability();
-        EnableWindow(GetDlgItem(state.hwnd, PAUSE), i32::from(availability.pause));
-        EnableWindow(
-            GetDlgItem(state.hwnd, RESUME),
-            i32::from(availability.restore || availability.resume),
-        );
-        let navigation = GetDlgItem(state.hwnd, NAVIGATION);
-        if SendMessageW(navigation, TCM_GETCURSEL, 0, 0) != state.page.tab() as isize {
-            SendMessageW(navigation, TCM_SETCURSEL, state.page.tab(), 0);
-        }
-    }
-    if updated != state.rows {
-        let selected = selection(&state).map(|r| r.path);
-        let list = unsafe { GetDlgItem(state.hwnd, LIST) };
-        unsafe {
-            SendMessageW(list, WM_SETREDRAW, 0, 0);
-            SendMessageW(list, LB_RESETCONTENT, 0, 0);
-            for row in &updated {
-                SendMessageW(list, LB_ADDSTRING, 0, wide(&row.label).as_ptr() as isize);
-            }
-            if let Some(path) = selected
-                && let Some(i) = selected_index(&updated, &path)
-            {
-                SendMessageW(list, LB_SETCURSEL, i, 0);
-            }
-            SendMessageW(list, WM_SETREDRAW, 1, 0);
-            InvalidateRect(list, null(), 1);
-        }
-    }
-    // Do not overwrite an edit the user is typing while timers update status.
-    if state.revision != shared.revision
-        && unsafe { GetFocus() } != unsafe { GetDlgItem(state.hwnd, DELAY) }
-        && unsafe { GetFocus() } != unsafe { GetDlgItem(state.hwnd, ADDRESS) }
-        && unsafe { GetFocus() } != unsafe { GetDlgItem(state.hwnd, OLLAMA_ADDRESS) }
-    {
-        set(
-            unsafe { GetDlgItem(state.hwnd, DELAY) },
-            &format!("{}", shared.config.restore_delay_seconds),
-        );
-        set(
-            unsafe { GetDlgItem(state.hwnd, ADDRESS) },
-            shared.config.lm_endpoint(),
-        );
-        set(
-            unsafe { GetDlgItem(state.hwnd, OLLAMA_ADDRESS) },
-            shared
-                .config
-                .providers
-                .iter()
-                .find(|provider| provider.kind() == crate::provider::Kind::Ollama)
-                .map_or("", |provider| provider.endpoint()),
-        );
-    }
-    let errors = shared
-        .discovery_errors
-        .iter()
-        .map(|(launcher, error)| format!("{launcher}: {error}"))
-        .collect::<Vec<_>>()
-        .join("; ");
-    // P2-1: a round-trip verify result (per-step, with the failing field on
-    // failure) takes the FEEDBACK line; settings errors still win, then
-    // discovery errors, then the default hint.
-    let feedback = if !shared.settings_error.is_empty() {
-        shared.settings_error.clone()
-    } else if let Some(result) = &shared.commands.latest {
-        result.message.clone()
-    } else if let Some(feedback) = &shared.restore_feedback {
-        feedback.text()
-    } else if let Some(report) = &shared.verify_report {
-        render_verify_report(report)
-    } else if !errors.is_empty() {
-        format!("Some discovery needs attention: {errors}")
-    } else {
-        "Games refresh automatically. New recognized games are enabled without setup.".into()
-    };
-    set_if_changed(unsafe { GetDlgItem(state.hwnd, FEEDBACK) }, &feedback);
-    STATE.with(|s| {
-        if let Some(s) = s.borrow_mut().as_mut() {
-            s.rows = updated;
-            s.last_status = status;
-            s.revision = shared.revision;
-        }
-    });
-    update_selection();
-}
-fn update_selection() {
-    let Some(state) = snapshot() else { return };
-    let row = selection(&state);
-    let detail=row.as_ref().map(|r|format!("{}\r\n{}\r\n{}",r.label,r.path,match state.page{Page::Games=>"Recognized from launcher metadata or your saved game. Launch normally to pause AI.",Page::Running=>"Choose Add selected as game if discovery missed this game. Helpers are excluded automatically.",Page::Ignored=>"This entry does not start automatic pausing. Enable it to recognize it again."})).unwrap_or_else(||match state.page{Page::Games=>"Select a game to see how it is recognized. No per-game setup is required.".into(),Page::Running=>"Running applications are shown only while this page is open. Select a missing game to add it.".into(),Page::Ignored=>"Ignored games and applications appear here. You can enable them again at any time.".into()});
-    set_if_changed(unsafe { GetDlgItem(state.hwnd, DETAILS) }, &detail);
-    set(
-        unsafe { GetDlgItem(state.hwnd, TOGGLE) },
-        match state.page {
-            Page::Running => "Add selected as game",
-            Page::Ignored => "Enable selected",
-            Page::Games => {
-                if row.as_ref().is_some_and(|r| r.ignored) {
-                    "Enable selected"
-                } else {
-                    "Ignore selected"
-                }
-            }
-        },
-    );
-    unsafe {
-        EnableWindow(GetDlgItem(state.hwnd, TOGGLE), i32::from(row.is_some()));
-        let custom = row.as_ref().is_some_and(|row| row.custom);
-        EnableWindow(GetDlgItem(state.hwnd, REMOVE), i32::from(custom));
-        EnableWindow(GetDlgItem(state.hwnd, RENAME), i32::from(custom));
-    }
-}
 fn browse(hwnd: HWND) -> anyhow::Result<Option<String>> {
     unsafe {
         let mut buffer = vec![0u16; 32768];
@@ -2053,6 +2286,7 @@ fn browse(hwnd: HWND) -> anyhow::Result<Option<String>> {
         Ok(Some(String::from_utf16_lossy(&buffer[..n])))
     }
 }
+
 fn add_game(config: &mut Config, path: String, name: String) {
     config
         .excluded_paths
@@ -2068,1272 +2302,10 @@ fn add_game(config: &mut Config, path: String, name: String) {
         config.extra_games.push(ExtraGame { name, path });
     }
 }
-fn command(id: i32, notification: u32) {
-    if notification == BN_SETFOCUS || notification == EN_SETFOCUS {
-        update_help(id);
-        return;
-    }
-    let Some(state) = snapshot() else { return };
-    if id == SEARCH && notification == EN_CHANGE {
-        refresh();
-        return;
-    }
-    if id == LIST && notification == LBN_SELCHANGE {
-        update_selection();
-        return;
-    }
-    if id == APPEARANCE && notification == CBN_SELCHANGE {
-        let available = state
-            .shared
-            .lock()
-            .is_ok_and(|s| s.config.advanced_settings_visible && !s.commands.settings_pending);
-        if available
-            && let Some(choice) = crate::config::Appearance::from_index(unsafe {
-                SendMessageW(GetDlgItem(state.hwnd, APPEARANCE), CB_GETCURSEL, 0, 0)
-            })
-        {
-            crate::app::request_action(
-                &state.shared,
-                &state.tx,
-                Action::Appearance(choice),
-                "Change appearance",
-            );
-        }
-        refresh();
-        return;
-    }
-    if notification != BN_CLICKED {
-        return;
-    }
-    let Ok(mut config) = state.shared.lock().map(|s| s.config.clone()) else {
-        return;
-    };
-    if let Some(command) = Command::from_id(id) {
-        if !crate::ui_commands::allowed(&state.shared, command) {
-            return;
-        }
-    } else if SETTINGS_ROW.contains(&id) && !config.advanced_settings_visible {
-        crate::app::local_result(
-            &state.shared,
-            Outcome::Failed,
-            "Advanced settings is hidden; stale command refused.",
-        );
-        return;
-    }
-    match id {
-        OLLAMA_ENABLED => {
-            let enable = checked(unsafe { GetDlgItem(state.hwnd, OLLAMA_ENABLED) });
-            let confirmed_provider = config
-                .providers
-                .iter()
-                .find(|provider| provider.kind() == crate::provider::Kind::Ollama)
-                .cloned();
-            let disclosure = format!(
-                "Saved Ollama endpoint: {}\r\n\r\n{OLLAMA_DISCLOSURE}",
-                confirmed_provider
-                    .as_ref()
-                    .map_or("not configured", |provider| provider.endpoint())
-            );
-            if enable
-                && unsafe {
-                    MessageBoxW(
-                        state.hwnd,
-                        wide(&disclosure).as_ptr(),
-                        wide("Experimental Ollama opt-in").as_ptr(),
-                        MB_OKCANCEL | MB_DEFBUTTON2 | MB_ICONWARNING,
-                    )
-                } != IDOK
-            {
-                crate::app::local_result(
-                    &state.shared,
-                    Outcome::Cancelled,
-                    "Ollama opt-in cancelled; settings unchanged.",
-                );
-                refresh();
-                return;
-            }
-            // A modal can process settings timers; use the current saved config.
-            if let Ok(shared) = state.shared.lock() {
-                if !shared.config.advanced_settings_visible
-                    || shared.commands.settings_pending
-                    || shared.provider_pending(crate::provider::Kind::Ollama)
-                    || shared
-                        .config
-                        .providers
-                        .iter()
-                        .find(|provider| provider.kind() == crate::provider::Kind::Ollama)
-                        != confirmed_provider.as_ref()
-                {
-                    drop(shared);
-                    crate::app::local_result(
-                        &state.shared,
-                        Outcome::Failed,
-                        "Ollama settings changed while confirming; retry after recovery or saving finishes.",
-                    );
-                    refresh();
-                    return;
-                }
-                config = shared.config.clone();
-            } else {
-                return;
-            }
-            if let Some(crate::config::Provider::Ollama { enabled, .. }) = config
-                .providers
-                .iter_mut()
-                .find(|provider| provider.kind() == crate::provider::Kind::Ollama)
-            {
-                *enabled = enable;
-                send_advanced_settings(&state, config);
-                refresh();
-            }
-        }
-        OLLAMA_SAVE => {
-            let endpoint = text(unsafe { GetDlgItem(state.hwnd, OLLAMA_ADDRESS) });
-            if let Some(crate::config::Provider::Ollama {
-                endpoint: saved, ..
-            }) = config
-                .providers
-                .iter_mut()
-                .find(|provider| provider.kind() == crate::provider::Kind::Ollama)
-            {
-                *saved = endpoint.trim().into();
-                match config.validate() {
-                    Ok(()) => send_advanced_settings(&state, config),
-                    Err(error) => {
-                        set_feedback(&state, &format!("Check Ollama endpoint: {error:#}"))
-                    }
-                }
-            }
-        }
-        CONTRIBUTE => {
-            let result = unsafe {
-                windows_sys::Win32::UI::Shell::ShellExecuteW(
-                    state.hwnd,
-                    wide("open").as_ptr(),
-                    wide(concat!(
-                        env!("CARGO_PKG_REPOSITORY"),
-                        "/blob/main/CONTRIBUTING.md"
-                    ))
-                    .as_ptr(),
-                    null(),
-                    null(),
-                    SW_SHOWNORMAL,
-                )
-            };
-            crate::app::local_result(
-                &state.shared,
-                if tray::shell_execute_failed(result) {
-                    Outcome::Failed
-                } else {
-                    Outcome::Completed
-                },
-                if tray::shell_execute_failed(result) {
-                    "Could not open contribution page."
-                } else {
-                    "Contribution page opened in your browser."
-                },
-            );
-        }
-        AUTO => {
-            config.automation_enabled = checked(unsafe { GetDlgItem(state.hwnd, AUTO) });
-            send_settings(&state, config);
-        }
-        STARTUP => {
-            tray::request_startup(
-                &state.shared,
-                checked(unsafe { GetDlgItem(state.hwnd, STARTUP) }),
-                &state.folder,
-            );
-        }
-        SETTINGS => {
-            let visible = checked(unsafe { GetDlgItem(state.hwnd, SETTINGS) });
-            crate::app::request_action(
-                &state.shared,
-                &state.tx,
-                Action::AdvancedVisibility(visible),
-                "Advanced visibility",
-            );
-            refresh();
-        }
-        NOTIFICATIONS | SOUND => {
-            crate::app::request_action(
-                &state.shared,
-                &state.tx,
-                Action::NotificationPreferences {
-                    visual: checked(unsafe { GetDlgItem(state.hwnd, NOTIFICATIONS) }),
-                    sound: checked(unsafe { GetDlgItem(state.hwnd, SOUND) }),
-                },
-                "Notification preferences",
-            );
-            refresh();
-        }
-        OPEN_FOLDER => tray::request_folder(&state.shared, &state.folder),
-        QUIT => {
-            crate::app::request_quit(&state.shared, &state.tx);
-        }
-        LM_ENABLED => {
-            if let Some(crate::config::Provider::LMStudio { enabled, .. }) = config
-                .providers
-                .iter_mut()
-                .find(|p| p.kind() == crate::provider::Kind::LMStudio)
-            {
-                *enabled = checked(unsafe { GetDlgItem(state.hwnd, LM_ENABLED) });
-                crate::app::request_action(
-                    &state.shared,
-                    &state.tx,
-                    Action::AdvancedSettings(Box::new(config)),
-                    "LM Studio preference",
-                );
-            }
-        }
-        REFRESH => {
-            crate::app::request_action(
-                &state.shared,
-                &state.tx,
-                Action::Refresh,
-                "Discovery refresh",
-            );
-        }
-        DOCTOR => {
-            crate::app::request_action(
-                &state.shared,
-                &state.tx,
-                Action::Doctor,
-                "Read-only diagnostics",
-            );
-        }
-        VERIFY => {
-            // P2-1: round-trip test against the live backend. Runs in the
-            // worker thread; the per-step result lands in the FEEDBACK line.
-            if unsafe { tray::confirm_verify(state.hwnd) } {
-                crate::app::request_verify(&state.shared, &state.tx);
-            } else {
-                crate::app::local_result(
-                    &state.shared,
-                    Outcome::Cancelled,
-                    "Test round-trip cancelled; AI unchanged.",
-                );
-            }
-        }
-        ADD => match browse(state.hwnd) {
-            Ok(Some(path)) => {
-                let name = std::path::Path::new(&path)
-                    .file_stem()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned();
-                add_game(&mut config, path, name);
-                send_settings(&state, config);
-            }
-            Ok(None) => crate::app::local_result(
-                &state.shared,
-                Outcome::Cancelled,
-                "Add game cancelled; settings unchanged.",
-            ),
-            Err(error) => set_feedback(&state, &format!("Could not add game: {error:#}")),
-        },
-        TOGGLE => {
-            if let Some(row) = selection(&state) {
-                match state.page {
-                    Page::Running => add_game(&mut config, row.path, row.name),
-                    _ => {
-                        config
-                            .ignored_games
-                            .retain(|p| canonical(p) != canonical(&row.path));
-                        config
-                            .excluded_paths
-                            .retain(|p| canonical(p) != canonical(&row.path));
-                        if !row.ignored {
-                            config.ignored_games.push(row.path);
-                        }
-                    }
-                }
-                send_settings(&state, config);
-            }
-        }
-        REMOVE => {
-            if let Some(row) = selection(&state) {
-                if !row.custom {
-                    set_feedback(
-                        &state,
-                        "Only games you added yourself can be removed. Use Ignore for launcher games.",
-                    );
-                    return;
-                }
-                let result = unsafe {
-                    MessageBoxW(state.hwnd, wide(&format!("Remove custom game \"{}\"?\r\n{}\r\nOther games and pending recovery remain unchanged.", row.name, row.path)).as_ptr(), wide("Remove selected game").as_ptr(), MB_OKCANCEL | MB_DEFBUTTON2 | MB_ICONQUESTION)
-                };
-                if result == IDOK {
-                    crate::app::request_action(
-                        &state.shared,
-                        &state.tx,
-                        Action::RemoveCustom {
-                            path: row.path,
-                            name: row.name,
-                        },
-                        "Remove selected game",
-                    );
-                } else {
-                    crate::app::local_result(
-                        &state.shared,
-                        if result == 0 {
-                            Outcome::Failed
-                        } else {
-                            Outcome::Cancelled
-                        },
-                        if result == 0 {
-                            "Could not open removal confirmation; settings unchanged."
-                        } else {
-                            "Custom removal cancelled; settings unchanged."
-                        },
-                    );
-                }
-            }
-        }
-        RENAME => {
-            if let Some(row) = selection(&state) {
-                if !row.custom {
-                    set_feedback(&state, "Only games you added yourself can be renamed.");
-                    return;
-                }
-                let name = match ask_name(state.hwnd, &row.name) {
-                    Ok(Some(name)) => name,
-                    Ok(None) => {
-                        crate::app::local_result(
-                            &state.shared,
-                            Outcome::Cancelled,
-                            "Rename cancelled; settings unchanged.",
-                        );
-                        return;
-                    }
-                    Err(error) => {
-                        set_feedback(&state, &format!("Could not rename game: {error:#}"));
-                        return;
-                    }
-                };
-                if name.trim().is_empty() {
-                    set_feedback(&state, "Game name cannot be empty.");
-                    return;
-                }
-                match apply_rename(&config, &row.path, &name) {
-                    Ok(cfg) => send_settings(&state, cfg),
-                    Err(message) => set_feedback(&state, &message),
-                }
-            }
-        }
-        RESUME => {
-            crate::restore_dialog::request(state.hwnd, &state.shared, &state.tx);
-        }
-        PAUSE => {
-            crate::app::request_core(&state.shared, &state.tx, CoreCommand::Pause);
-        }
-        SAVE => {
-            let delay = text(unsafe { GetDlgItem(state.hwnd, DELAY) });
-            let host = text(unsafe { GetDlgItem(state.hwnd, ADDRESS) });
-            match apply_save(&config, &delay, &host) {
-                Ok(cfg) => send_advanced_settings(&state, cfg),
-                Err(message) => set_feedback(&state, &message),
-            }
-        }
-        CLI => match browse(state.hwnd) {
-            Ok(Some(path)) => match config.lm_mut() {
-                Ok(lm) => {
-                    lm.lms_path = path;
-                    send_advanced_settings(&state, config);
-                }
-                Err(e) => set_feedback(&state, &e.to_string()),
-            },
-            Ok(None) => crate::app::local_result(
-                &state.shared,
-                Outcome::Cancelled,
-                "Locate lms cancelled; settings unchanged.",
-            ),
-            Err(error) => set_feedback(&state, &format!("Could not locate lms: {error:#}")),
-        },
-        _ => (),
-    }
-}
-unsafe extern "system" fn procedure(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-        procedure_inner(hwnd, message, w, l)
-    }))
-    .unwrap_or_else(|_| {
-        crate::app::log(
-            &crate::config::data_directory(),
-            "Dashboard callback panic contained",
-        );
-        0
-    })
-}
-unsafe fn procedure_inner(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
-    match message {
-        WM_COMMAND => {
-            command((w & 0xffff) as i32, ((w >> 16) & 0xffff) as u32);
-            reveal_focus();
-            0
-        }
-        WM_SIZE => {
-            if w != SIZE_MINIMIZED as usize {
-                position_controls();
-            }
-            0
-        }
-        WM_HSCROLL | WM_VSCROLL if l == 0 => {
-            scroll_viewport(message == WM_HSCROLL, (w & 0xffff) as i32);
-            0
-        }
-        WM_NOTIFY if l != 0 => unsafe {
-            let notification = &*(l as *const NMHDR);
-            if notification.idFrom == NAVIGATION as usize && notification.code == TCN_SELCHANGE {
-                select_page(SendMessageW(notification.hwndFrom, TCM_GETCURSEL, 0, 0));
-            }
-            0
-        },
-        WM_TIMER => {
-            refresh();
-            0
-        }
-        WM_SETTINGCHANGE | WM_THEMECHANGED => {
-            theme_changed();
-            0
-        }
-        WM_ERASEBKGND => unsafe {
-            if let Some(theme) = snapshot().filter(|s| s.hwnd == hwnd).and_then(|s| s.theme) {
-                let mut rect: RECT = std::mem::zeroed();
-                GetClientRect(hwnd, &mut rect);
-                FillRect(w as HDC, &rect, theme.background);
-                1
-            } else {
-                DefWindowProcW(hwnd, message, w, l)
-            }
-        },
-        WM_DPICHANGED => {
-            if l != 0 {
-                unsafe {
-                    let rect = *(l as *const RECT);
-                    SetWindowPos(
-                        hwnd,
-                        null_mut(),
-                        rect.left,
-                        rect.top,
-                        rect.right - rect.left,
-                        rect.bottom - rect.top,
-                        SWP_NOZORDER | SWP_NOACTIVATE,
-                    );
-                }
-            }
-            let dpi = (w >> 16) as i32;
-            let settings_visible = snapshot().map(|s| s.settings_visible).unwrap_or(false);
-            relayout(hwnd, dpi, settings_visible);
-            reveal_focus();
-            0
-        }
-        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX => unsafe {
-            if let Some(theme) = snapshot()
-                .filter(|s| s.hwnd == hwnd)
-                .and_then(|s| s.theme)
-                .filter(|theme| theme.dark)
-            {
-                let button = message == WM_CTLCOLORBTN;
-                SetBkColor(
-                    w as HDC,
-                    if button {
-                        theme.palette.surface
-                    } else {
-                        theme.palette.background
-                    },
-                );
-                SetTextColor(
-                    w as HDC,
-                    if IsWindowEnabled(l as HWND) != 0 {
-                        theme.palette.text
-                    } else {
-                        theme.palette.disabled
-                    },
-                );
-                return if button {
-                    theme.surface
-                } else {
-                    theme.background
-                } as LRESULT;
-            }
-            let idx = ctlcolor_index(message);
-            SetBkColor(w as HDC, GetSysColor(idx));
-            let text = if IsWindowEnabled(l as HWND) != 0 {
-                if message == WM_CTLCOLORBTN {
-                    COLOR_BTNTEXT
-                } else {
-                    COLOR_WINDOWTEXT
-                }
-            } else {
-                COLOR_GRAYTEXT
-            };
-            SetTextColor(w as HDC, GetSysColor(text));
-            GetSysColorBrush(idx) as LRESULT
-        },
-        // P1-4: owner-drawn games listbox — supply the row height, then paint it.
-        WM_MEASUREITEM => unsafe {
-            let dpi = GetDpiForWindow(hwnd) as i32;
-            measure_list_item(l, dpi);
-            1 // TRUE: handled
-        },
-        WM_DRAWITEM => unsafe {
-            let item = *(l as *const DRAWITEMSTRUCT);
-            if item.CtlID == LIST as u32 {
-                let state = snapshot();
-                if let Some(st) = state {
-                    draw_list_item(
-                        l,
-                        item.itemID as usize,
-                        st.font,
-                        &st.rows,
-                        GetDpiForWindow(hwnd) as i32,
-                    );
-                }
-                1 // TRUE: handled
-            } else if item.CtlID == STATE_ACCENT as u32 {
-                crate::theme::fill(item.hDC, &item.rcItem, crate::theme::accent(hwnd));
-                1
-            } else if item.CtlType == ODT_BUTTON
-                && snapshot()
-                    .and_then(|s| s.theme)
-                    .is_some_and(|theme| theme.palette.color_words)
-            {
-                let dark = snapshot()
-                    .and_then(|s| s.theme)
-                    .is_some_and(|theme| theme.dark);
-                crate::theme::paint_control(item.hwndItem, item.hDC, false, dark);
-                1
-            } else {
-                0
-            }
-        },
-        WM_CLOSE => {
-            unsafe {
-                DestroyWindow(hwnd);
-            }
-            0
-        }
-        WM_DESTROY => {
-            RUNNING_REQUESTED.store(false, Ordering::Relaxed);
-            if let Some(state) = snapshot() {
-                unsafe {
-                    if IsWindow(state.tooltips.hwnd) != 0 {
-                        DestroyWindow(state.tooltips.hwnd);
-                    }
-                }
-            }
-            0
-        }
-        WM_NCDESTROY => {
-            let old = STATE.with(|s| s.borrow_mut().take());
-            if let Some(old) = old {
-                unsafe {
-                    for font in old.fonts.values() {
-                        DeleteObject(*font);
-                    }
-                }
-            }
-            0
-        }
-        _ => unsafe { DefWindowProcW(hwnd, message, w, l) },
-    }
-}
-pub fn is_dialog_message(msg: &MSG) -> bool {
-    if let Some(state) = snapshot() {
-        if msg.message == WM_KEYDOWN
-            && msg.wParam == VK_F1 as usize
-            && unsafe { IsChild(state.hwnd, GetFocus()) } != 0
-        {
-            let id = unsafe { GetDlgCtrlID(GetFocus()) };
-            if id != HELP {
-                update_help(id);
-            }
-            unsafe {
-                SetFocus(GetDlgItem(state.hwnd, HELP));
-            }
-            reveal_focus();
-            return true;
-        }
-        let handled = unsafe { IsDialogMessageW(state.hwnd, msg) != 0 };
-        if handled {
-            reveal_focus();
-        }
-        handled
-    } else {
-        false
-    }
-}
-pub fn theme_changed() {
-    let choice = snapshot()
-        .and_then(|s| s.shared.lock().ok().map(|s| s.config.appearance))
-        .unwrap_or_default();
-    set_client_theme(crate::theme::effective_dark(choice));
-}
-fn set_client_theme(dark: bool) {
-    if let Some(state) = snapshot() {
-        let Some(theme) = crate::theme::Theme::new(dark) else {
-            return;
-        };
-        let old = STATE.with(|s| {
-            s.borrow_mut()
-                .as_mut()
-                .and_then(|s| s.theme.replace(theme.clone()))
-        });
-        unsafe {
-            tray::apply_theme_mode(state.hwnd, dark);
-            for control in LAYOUT
-                .iter()
-                .filter(|e| e.class == "BUTTON" || e.id == NAVIGATION)
-            {
-                crate::theme::apply_control(
-                    GetDlgItem(state.hwnd, control.id),
-                    theme.dark,
-                    control.id == NAVIGATION,
-                );
-            }
-            if IsWindow(state.tooltips.hwnd) != 0 {
-                SendMessageW(
-                    state.tooltips.hwnd,
-                    TTM_SETTIPBKCOLOR,
-                    theme.palette.surface as usize,
-                    0,
-                );
-                SendMessageW(
-                    state.tooltips.hwnd,
-                    TTM_SETTIPTEXTCOLOR,
-                    theme.palette.text as usize,
-                    0,
-                );
-            }
-            let detail = GetDlgItem(state.hwnd, DETAILS);
-            format_details(detail, &text(detail));
-            RedrawWindow(
-                state.hwnd,
-                null(),
-                null_mut(),
-                RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN,
-            );
-        }
-        drop(old);
-    }
-}
-pub fn close() {
-    if let Some(state) = snapshot() {
-        unsafe {
-            DestroyWindow(state.hwnd);
-        }
-    }
-}
-pub fn show(shared: SharedState, tx: Sender<Action>, folder: PathBuf) {
-    unsafe {
-        if let Some(state) = snapshot() {
-            ShowWindow(state.hwnd, SW_RESTORE);
-            SetForegroundWindow(state.hwnd);
-            return;
-        }
-        if !crate::rich_text::initialize() {
-            tray::error("Could not initialize the native game details control.");
-            return;
-        }
-        let instance = GetModuleHandleW(null());
-        let controls = INITCOMMONCONTROLSEX {
-            dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
-            dwICC: ICC_TAB_CLASSES,
-        };
-        if InitCommonControlsEx(&controls) == 0 {
-            tray::error("Could not initialize dashboard navigation.");
-            return;
-        }
-        let class = wide("GamePauseDashboard");
-        let wc = WNDCLASSW {
-            lpfnWndProc: Some(procedure),
-            hInstance: instance,
-            lpszClassName: class.as_ptr(),
-            hCursor: LoadCursorW(null_mut(), IDC_ARROW),
-            hbrBackground: (COLOR_WINDOW + 1) as HBRUSH,
-            ..std::mem::zeroed()
-        };
-        RegisterClassW(&wc);
-        let dpi = GetDpiForSystem() as i32;
-        let scale = |v: i32| v * dpi / 96;
-        let (desired_width, desired_height) = outer_size(false, dpi);
-        let mut work = RECT {
-            left: 0,
-            top: 0,
-            right: GetSystemMetrics(SM_CXSCREEN),
-            bottom: GetSystemMetrics(SM_CYSCREEN),
-        };
-        SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut work as *mut RECT as *mut _, 0);
-        let width = desired_width.min(work.right - work.left);
-        let height = desired_height.min(work.bottom - work.top);
-        let hwnd = CreateWindowExW(
-            WS_EX_COMPOSITED,
-            class.as_ptr(),
-            wide("GamePause for LM Studio").as_ptr(),
-            WINDOW_STYLE,
-            work.left + (work.right - work.left - width) / 2,
-            work.top + (work.bottom - work.top - height) / 2,
-            width,
-            height,
-            null_mut(),
-            null_mut(),
-            instance,
-            null(),
-        );
-        if hwnd.is_null() {
-            tray::error("Could not open the GamePause dashboard.");
-            return;
-        }
-        tray::apply_theme(hwnd);
-        let font = dashboard_font(dpi);
-        if font.is_null() {
-            DestroyWindow(hwnd);
-            tray::error("Could not create dashboard font.");
-            return;
-        }
-        for e in LAYOUT {
-            let child = CreateWindowExW(
-                if (e.class == "EDIT" && e.style & ES_READONLY as u32 == 0) || e.class == "LISTBOX"
-                {
-                    WS_EX_CLIENTEDGE
-                } else {
-                    0
-                },
-                wide(e.class).as_ptr(),
-                wide(e.label).as_ptr(),
-                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | e.style,
-                scale(e.x),
-                scale(e.y),
-                scale(e.w),
-                scale(e.h),
-                hwnd,
-                e.id as HMENU,
-                instance,
-                null(),
-            );
-            if child.is_null() {
-                DestroyWindow(hwnd);
-                DeleteObject(font);
-                tray::error("Could not create dashboard controls.");
-                return;
-            }
-            SendMessageW(child, WM_SETFONT, font as usize, 1);
-        }
-        // Group boxes are overlapping siblings, rather than parents. Keep them
-        // behind their controls so WS_CLIPSIBLINGS cannot hide the controls.
-        for e in LAYOUT
-            .iter()
-            .filter(|e| e.class == "BUTTON" && e.style & BS_TYPEMASK as u32 == BS_GROUPBOX as u32)
-        {
-            SetWindowPos(
-                GetDlgItem(hwnd, e.id),
-                HWND_BOTTOM,
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-            );
-        }
-        set(
-            GetDlgItem(hwnd, TITLE),
-            &format!("GamePause v{}", env!("CARGO_PKG_VERSION")),
-        );
-        for (index, label) in ["Games", "Running apps", "Ignored"].iter().enumerate() {
-            let mut label = wide(label);
-            let mut item: TCITEMW = std::mem::zeroed();
-            item.mask = TCIF_TEXT;
-            item.pszText = label.as_mut_ptr();
-            if SendMessageW(
-                GetDlgItem(hwnd, NAVIGATION),
-                TCM_INSERTITEMW,
-                index,
-                &item as *const _ as isize,
-            ) < 0
-            {
-                DestroyWindow(hwnd);
-                DeleteObject(font);
-                tray::error("Could not create dashboard navigation pages.");
-                return;
-            }
-        }
-        let appearance = GetDlgItem(hwnd, APPEARANCE);
-        for label in ["Follow Windows", "Light", "Dark"] {
-            SendMessageW(appearance, CB_ADDSTRING, 0, wide(label).as_ptr() as isize);
-        }
-        SendMessageW(appearance, CB_SETMINVISIBLE, 3, 0);
-        let tooltips = create_tooltips(hwnd, instance, dpi);
-        SendMessageW(tooltips.hwnd, WM_SETFONT, font as usize, 1);
-        apply_settings_visibility(hwnd, false);
-        let revision = shared
-            .lock()
-            .map(|s| s.revision)
-            .unwrap_or(0)
-            .wrapping_sub(1);
-        STATE.with(|s| {
-            *s.borrow_mut() = Some(WindowState {
-                hwnd,
-                shared,
-                tx,
-                folder,
-                page: Page::Games,
-                rows: vec![],
-                last_status: String::new(),
-                revision,
-                font,
-                fonts: [(dpi, font)].into_iter().collect(),
-                theme: None,
-                settings_visible: false,
-                viewport: Viewport::default(),
-                positioning: false,
-                tooltips,
-            })
-        });
-        theme_changed();
-        position_controls();
-        refresh();
-        SetTimer(hwnd, 1, 1000, None);
-        ShowWindow(hwnd, SW_SHOW);
-        // A quiet startup can supply SW_HIDE in STARTUPINFO, overriding the first call.
-        ShowWindow(hwnd, SW_SHOW);
-        SetForegroundWindow(hwnd);
-    }
-}
 
 #[cfg(test)]
-mod tests {
-    #[test]
-    fn viewport_keeps_focus_reachable_at_each_supported_dpi() {
-        for dpi in [96, 144, 192] {
-            for settings in [false, true] {
-                let content = (scale(884, dpi), window_height(settings, dpi));
-                let client = (scale(520, dpi), scale(400, dpi));
-                let bottom = Viewport {
-                    x: i32::MAX,
-                    y: i32::MAX,
-                }
-                .bounded(content, client);
-                assert_eq!(
-                    bottom,
-                    Viewport {
-                        x: content.0 - client.0,
-                        y: content.1 - client.1
-                    }
-                );
-                for entry in LAYOUT.iter().filter(|entry| entry.style & WS_TABSTOP != 0) {
-                    if is_settings_row(entry.id) && !settings {
-                        continue;
-                    }
-                    let rect = if entry.id == TITLE {
-                        footer_position(settings, dpi)
-                    } else {
-                        (
-                            scale(entry.x, dpi),
-                            scale(entry.y, dpi),
-                            scale(entry.w, dpi),
-                            scale(entry.h, dpi),
-                        )
-                    };
-                    let view = bottom.reveal(rect, client).bounded(content, client);
-                    assert!(rect.0 >= view.x && rect.0 < view.x + client.0);
-                    assert!(rect.1 >= view.y && rect.1 + rect.3 <= view.y + client.1);
-                    if rect.2 <= client.0 {
-                        assert!(rect.0 + rect.2 <= view.x + client.0);
-                    }
-                    assert_eq!(view.reveal(rect, client).bounded(content, client), view);
-                }
-                assert_eq!(bottom.bounded(content, content), Viewport::default());
-                assert_eq!(
-                    Viewport { x: -10, y: -20 }.bounded(content, client),
-                    Viewport::default()
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn hidden_native_resize_preserves_edit_selection_and_settings_reachability() {
-        // This private window is never shown. Exercise WM_SIZE and real EDIT
-        // selection without a provider, message loop, or physical desktop test.
-        struct Fixture(HWND);
-        impl Drop for Fixture {
-            fn drop(&mut self) {
-                unsafe {
-                    DestroyWindow(self.0);
-                }
-            }
-        }
-        unsafe {
-            let instance = GetModuleHandleW(null());
-            let class = wide("GamePauseHiddenViewportFixture");
-            let wc = WNDCLASSW {
-                lpfnWndProc: Some(procedure),
-                hInstance: instance,
-                lpszClassName: class.as_ptr(),
-                ..std::mem::zeroed()
-            };
-            assert_ne!(RegisterClassW(&wc), 0);
-            let hwnd = CreateWindowExW(
-                0,
-                class.as_ptr(),
-                wide("Fixture").as_ptr(),
-                WINDOW_STYLE,
-                0,
-                0,
-                540,
-                440,
-                null_mut(),
-                null_mut(),
-                instance,
-                null(),
-            );
-            assert!(!hwnd.is_null());
-            let fixture = Fixture(hwnd);
-            for id in [SEARCH, TITLE, SAVE] {
-                let child = CreateWindowExW(
-                    0,
-                    wide("EDIT").as_ptr(),
-                    wide("Fixture text").as_ptr(),
-                    WS_CHILD | WS_VISIBLE | ES_MULTILINE as u32,
-                    0,
-                    0,
-                    100,
-                    30,
-                    hwnd,
-                    id as HMENU,
-                    instance,
-                    null(),
-                );
-                assert!(!child.is_null());
-            }
-            let (tx, _) = std::sync::mpsc::channel();
-            STATE.with(|s| {
-                *s.borrow_mut() = Some(WindowState {
-                    hwnd,
-                    shared: Arc::new(std::sync::Mutex::new(Shared::default())),
-                    tx,
-                    folder: PathBuf::new(),
-                    page: Page::Games,
-                    rows: vec![],
-                    last_status: String::new(),
-                    revision: 0,
-                    font: null_mut(),
-                    fonts: Default::default(),
-                    theme: None,
-                    settings_visible: true,
-                    viewport: Viewport {
-                        x: 100_000,
-                        y: 100_000,
-                    },
-                    positioning: false,
-                    tooltips: Tooltips {
-                        hwnd: null_mut(),
-                        _texts: Arc::new(vec![]),
-                    },
-                })
-            });
-            let edit = GetDlgItem(hwnd, SEARCH);
-            SendMessageW(edit, EM_SETSEL, 2, 7);
-            SetWindowPos(hwnd, null_mut(), 0, 0, 550, 450, SWP_NOMOVE | SWP_NOZORDER);
-            let state = snapshot().unwrap();
-            assert!(state.viewport.x > 0 && state.viewport.y > 0);
-            assert!(!state.positioning);
-            let mut client: RECT = std::mem::zeroed();
-            GetClientRect(hwnd, &mut client);
-            let dpi = GetDpiForWindow(hwnd) as i32;
-            assert_eq!(state.viewport.y, window_height(true, dpi) - client.bottom);
-            let mut feedback: RECT = std::mem::zeroed();
-            GetWindowRect(GetDlgItem(hwnd, TITLE), &mut feedback);
-            MapWindowPoints(
-                null_mut(),
-                hwnd,
-                &mut feedback as *mut RECT as *mut POINT,
-                2,
-            );
-            assert!(feedback.top >= 0 && feedback.bottom <= client.bottom);
-            STATE.with(|s| s.borrow_mut().as_mut().unwrap().settings_visible = false);
-            apply_settings_visibility(hwnd, false);
-            position_controls();
-            assert_eq!(
-                GetWindowLongPtrW(GetDlgItem(hwnd, SAVE), GWL_STYLE) as u32 & WS_VISIBLE,
-                0
-            );
-            assert_eq!(
-                snapshot().unwrap().viewport.y,
-                window_height(false, dpi) - client.bottom
-            );
-            let mut start = 0u32;
-            let mut end = 0u32;
-            SendMessageW(
-                edit,
-                EM_GETSEL,
-                &mut start as *mut _ as usize,
-                &mut end as *mut _ as isize,
-            );
-            assert_eq!((start, end), (2, 7));
-            assert_eq!(text(edit), "Fixture text");
-            let dc = CreateCompatibleDC(null_mut());
-            assert!(!dc.is_null());
-            EnableWindow(edit, 0);
-            let brush = SendMessageW(hwnd, WM_CTLCOLORSTATIC, dc as usize, edit as isize);
-            assert_eq!(brush, GetSysColorBrush(COLOR_WINDOW) as isize);
-            assert_eq!(GetTextColor(dc), GetSysColor(COLOR_GRAYTEXT));
-            assert_eq!(GetBkColor(dc), GetSysColor(COLOR_WINDOW));
-            set_client_theme(true);
-            let theme = snapshot().unwrap().theme.unwrap();
-            let brush = SendMessageW(hwnd, WM_CTLCOLORSTATIC, dc as usize, edit as isize);
-            assert_eq!(brush, theme.background as isize);
-            assert_eq!(GetTextColor(dc), theme.palette.disabled);
-            assert_eq!(GetBkColor(dc), theme.palette.background);
-            SendMessageW(
-                edit,
-                EM_GETSEL,
-                &mut start as *mut _ as usize,
-                &mut end as *mut _ as isize,
-            );
-            assert_eq!((start, end), (2, 7), "theme must preserve native selection");
-            set_client_theme(false);
-            DeleteDC(dc);
-            let (width, height) = outer_size(false, dpi);
-            SetWindowPos(
-                hwnd,
-                null_mut(),
-                0,
-                0,
-                width + 100,
-                height + 100,
-                SWP_NOMOVE | SWP_NOZORDER,
-            );
-            assert_eq!(snapshot().unwrap().viewport, Viewport::default());
-            drop(fixture);
-            assert!(snapshot().is_none());
-            assert_ne!(UnregisterClassW(class.as_ptr(), instance), 0);
-        }
-    }
-
-    #[test]
-    fn selected_text_only_row_preserves_dc_state_and_has_no_dot() {
-        unsafe {
-            let dc = CreateCompatibleDC(null_mut());
-            assert!(!dc.is_null());
-            let mut info: BITMAPINFO = std::mem::zeroed();
-            info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-            info.bmiHeader.biWidth = 256;
-            info.bmiHeader.biHeight = -24;
-            info.bmiHeader.biPlanes = 1;
-            info.bmiHeader.biBitCount = 32;
-            let mut pixels = null_mut();
-            let bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut pixels, null_mut(), 0);
-            assert!(!bitmap.is_null());
-            let old_bitmap = SelectObject(dc, bitmap);
-            let font = dashboard_font(96);
-            assert!(!font.is_null());
-            SetBkMode(dc, OPAQUE as i32);
-            SetBkColor(dc, 0x00ffffff);
-            SetTextColor(dc, 0x00012345);
-            let old_font = GetCurrentObject(dc, OBJ_FONT as u32);
-            let rows = [Row {
-                // Leading whitespace exposes opaque white text backgrounds
-                // inside the selected text extent, not merely outside it.
-                label: "   Fixture game".into(),
-                name: "Fixture game".into(),
-                path: r"D:\Fixture Games\play.exe".into(),
-                custom: true,
-                ignored: false,
-                running: true,
-            }];
-            let item = DRAWITEMSTRUCT {
-                CtlID: LIST as u32,
-                itemID: 0,
-                itemState: ODS_SELECTED,
-                hDC: dc,
-                rcItem: RECT {
-                    left: 0,
-                    top: 0,
-                    right: 256,
-                    bottom: 24,
-                },
-                ..std::mem::zeroed()
-            };
-            draw_list_item(&item as *const _ as isize, 0, font, &rows, 96);
-            let restored = (
-                GetBkMode(dc),
-                GetBkColor(dc),
-                GetTextColor(dc),
-                GetCurrentObject(dc, OBJ_FONT as u32),
-            );
-            let former_dot = GetPixel(dc, 12, 12);
-            let selection = crate::theme::Palette::for_mode(false).selected;
-            let dark = crate::theme::Palette::for_mode(true);
-            draw_list_item_palette(&item as *const _ as isize, 0, font, &rows, 96, dark);
-            assert_eq!(
-                GetPixel(dc, 12, 12),
-                dark.selected,
-                "whitespace inside the text extent must retain selection color"
-            );
-            let dark_restored = (
-                GetBkMode(dc),
-                GetBkColor(dc),
-                GetTextColor(dc),
-                GetCurrentObject(dc, OBJ_FONT as u32),
-            );
-            assert_eq!(dark_restored, restored);
-            SelectObject(dc, old_bitmap);
-            DeleteObject(bitmap);
-            DeleteObject(font);
-            DeleteDC(dc);
-            assert_eq!(restored, (OPAQUE as i32, 0x00ffffff, 0x00012345, old_font));
-            assert_eq!(former_dot, selection);
-        }
-    }
-    #[test]
-    fn native_navigation_is_distinct_and_every_action_has_focus_help() {
-        assert_eq!(by_id(NAVIGATION).class, "SysTabControl32");
-        for page in [Page::Games, Page::Running, Page::Ignored] {
-            assert!(Page::from_tab(page.tab() as isize) == Some(page));
-        }
-        assert!(Page::from_tab(-1).is_none());
-        let shared = Shared::default();
-        for control in LAYOUT
-            .iter()
-            .filter(|control| control.style & WS_TABSTOP != 0)
-        {
-            let help = description(control.id, Page::Games, &shared);
-            assert!(!help.is_empty());
-            if control.class == "BUTTON" {
-                assert!(DESCRIPTIONS.iter().any(|(id, _)| *id == control.id));
-                assert_ne!(control.style & BS_NOTIFY as u32, 0);
-            }
-        }
-        for id in [STATUS, RUNNING_GAMES, HELP, FEEDBACK] {
-            assert_eq!(by_id(id).class, "EDIT");
-            assert_ne!(by_id(id).style & ES_READONLY as u32, 0);
-            assert_eq!(by_id(id).style & WS_VSCROLL, 0);
-        }
-    }
-    #[test]
-    fn captions_fit_measured_dashboard_font_at_100_150_200_percent() {
-        for dpi in [96, 144, 192] {
-            let mut measurements = Vec::new();
-            unsafe {
-                let dc = CreateCompatibleDC(null_mut());
-                assert!(!dc.is_null());
-                let font = dashboard_font(dpi);
-                assert!(!font.is_null());
-                let old = SelectObject(dc, font);
-                let mut captions = LAYOUT
-                    .iter()
-                    .filter(|e| e.class == "BUTTON" && e.style & BS_GROUPBOX as u32 == 0)
-                    .map(|e| (e.id, e.label))
-                    .collect::<Vec<_>>();
-                captions.extend([
-                    (TOGGLE, "Add selected as game"),
-                    (TOGGLE, "Enable selected"),
-                    (RESUME, "Resume AI..."),
-                    (RESUME, "Retry resume"),
-                ]);
-                for (id, label) in captions {
-                    let text = wide(label);
-                    let mut extent: SIZE = std::mem::zeroed();
-                    assert_ne!(
-                        GetTextExtentPoint32W(
-                            dc,
-                            text.as_ptr(),
-                            (text.len() - 1) as i32,
-                            &mut extent
-                        ),
-                        0
-                    );
-                    let geometry = by_id(id);
-                    let padding = if geometry.style & BS_AUTOCHECKBOX as u32 != 0 {
-                        34
-                    } else {
-                        24
-                    };
-                    measurements.push((
-                        id,
-                        label,
-                        extent,
-                        scale(geometry.w, dpi) - scale(padding, dpi),
-                        scale(geometry.h, dpi) - scale(8, dpi),
-                    ));
-                }
-                SelectObject(dc, old);
-                DeleteObject(font);
-                DeleteDC(dc);
-            }
-            for (id, label, extent, available, height) in measurements {
-                assert!(
-                    extent.cx <= available,
-                    "{dpi} DPI: {label} needs {} pixels; {available} available",
-                    extent.cx
-                );
-                assert!(
-                    extent.cy <= height,
-                    "{dpi} DPI: {label} exceeds padded control height"
-                );
-                if [REMOVE, VERIFY, CLI].contains(&id) {
-                    eprintln!(
-                        "{dpi} DPI: {label}: text {}x{}, padded width {available}, padded height {height}",
-                        extent.cx, extent.cy
-                    );
-                }
-            }
-        }
-    }
-    #[test]
-    fn selected_path_survives_unrelated_row_updates_and_reordering() {
-        let row = |name: &str, path: &str| super::Row {
-            label: name.into(),
-            name: name.into(),
-            path: path.into(),
-            custom: true,
-            ignored: false,
-            running: false,
-        };
-        let mut rows = vec![
-            row("Fixture A", r"D:\Fixture Games\a.exe"),
-            row("Fixture B", r"D:\Fixture Games\b.exe"),
-        ];
-        rows.insert(0, row("Fixture launcher", r"D:\Fixture Steam\game"));
-        rows[2].label = "Fixture B running".into();
-        assert_eq!(
-            super::selected_index(&rows, r"d:\fixture games\B.EXE"),
-            Some(2)
-        );
-        assert_eq!(
-            super::selected_index(&rows, r"D:\Fixture Games\missing.exe"),
-            None
-        );
-    }
+mod preserved_behavior_tests {
     use super::*;
-    #[test]
-    fn game_rows_explain_running_ignored_and_search() {
-        let mut shared = Shared::default();
-        shared.games.push(crate::discovery::Game::new(
-            "Steam",
-            "292030",
-            "The Witcher 3",
-            r"D:\Games\Witcher",
-        ));
-        shared.active_games.push(crate::processes::ActiveGame {
-            pid: 42,
-            created_at: 1,
-            executable: r"D:\Games\Witcher\play.exe".into(),
-            game: "The Witcher 3".into(),
-            launcher: "Steam".into(),
-            path: r"D:\Games\Witcher".into(),
-        });
-        shared.config.ignored_games.push(r"d:\games\witcher".into());
-        let rows = rows(&shared, Page::Games, "WITCHER");
-        assert_eq!(rows.len(), 1);
-        assert!(rows[0].label.contains("Running"));
-        assert!(rows[0].label.contains("pausing off"));
-        assert!(rows[0].ignored);
-        assert_eq!(super::rows(&shared, Page::Ignored, "witcher").len(), 1);
-        assert!(super::rows(&shared, Page::Games, "not installed").is_empty());
-    }
     #[test]
     fn adding_executable_deduplicates_and_clears_ignore() {
         let mut config = Config::default();
@@ -3352,174 +2324,6 @@ mod tests {
         assert_eq!(scale(960, 144), 1440);
         assert_eq!(scale(960, 192), 1920);
     }
-    #[test]
-    fn window_height_tracks_settings_visibility() {
-        assert_eq!(window_height(false, 96), 804);
-        assert_eq!(window_height(true, 96), 1244);
-        assert_eq!(window_height(false, 144), 1206);
-        assert_eq!(window_height(true, 144), 1866);
-    }
-    #[test]
-    fn version_footer_sits_below_settings_and_feedback_stays_below_help() {
-        assert!(by_id(FEEDBACK).y >= by_id(HELP).y + by_id(HELP).h);
-        assert!(by_id(FEEDBACK).y + by_id(FEEDBACK).h <= by_id(OPTIONS_BOX).y);
-        assert_eq!(footer_position(false, 96), (24, 734, 836, 26));
-        assert_eq!(footer_position(true, 96), (24, 1174, 836, 26));
-        let (_, y, _, _) = footer_position(true, 144);
-        assert_eq!(y, 1761);
-        for dpi in [96, 144, 192] {
-            let (_, y, _, height) = footer_position(true, dpi);
-            let frame = by_id(SETTINGS_BOX);
-            assert!(scale(frame.y + frame.h, dpi) < y);
-            assert!(y + height < window_height(true, dpi));
-        }
-    }
-    #[test]
-    fn group_boxes_present_and_contain_their_controls() {
-        // P1-3 acceptance: four section frames exist in LAYOUT, and every control
-        // assigned to a frame sits strictly inside that frame's bounds at 96 DPI.
-        for gb in GROUPBOXES {
-            let frame = by_id(gb.id);
-            assert_eq!(frame.class, "BUTTON");
-            assert_ne!(
-                frame.style & BS_GROUPBOX as u32,
-                0,
-                "box must be a group box"
-            );
-            for &member in gb.members {
-                let m = by_id(member);
-                assert!(
-                    m.x >= frame.x
-                        && m.y >= frame.y
-                        && m.x + m.w <= frame.x + frame.w
-                        && m.y + m.h <= frame.y + frame.h,
-                    "control {} ({}x{} at {},{}) must sit inside box {} ({}x{} at {},{})",
-                    member,
-                    m.w,
-                    m.h,
-                    m.x,
-                    m.y,
-                    gb.id,
-                    frame.w,
-                    frame.h,
-                    frame.x,
-                    frame.y
-                );
-            }
-        }
-    }
-    #[test]
-    fn every_control_id_appears_in_exactly_one_layout_entry() {
-        // A duplicate id would make GetDlgItem ambiguous; a missing one would break
-        // relayout silently. LAYOUT must be a partition of the 30 control ids.
-        let mut ids: Vec<i32> = LAYOUT.iter().map(|e| e.id).collect();
-        ids.sort_unstable();
-        let mut unique = ids.clone();
-        unique.dedup();
-        assert_eq!(ids, unique, "LAYOUT must not contain duplicate control ids");
-        for &box_id in &[OPTIONS_BOX, GAMES_BOX, ACTIONS_BOX, SETTINGS_BOX] {
-            assert!(
-                by_id(box_id).id == box_id,
-                "section box id must be in LAYOUT"
-            );
-        }
-    }
-    #[test]
-    fn ctlcolor_static_tracks_window_and_button_tracks_btnface() {
-        // Statics sit on the window background; buttons on the button face.
-        assert_eq!(
-            super::ctlcolor_index(WM_CTLCOLORSTATIC),
-            COLOR_WINDOW,
-            "statics should track the system window color"
-        );
-        assert_eq!(
-            super::ctlcolor_index(WM_CTLCOLORBTN),
-            COLOR_BTNFACE,
-            "buttons should track COLOR_BTNFACE"
-        );
-    }
-    #[test]
-    fn ctlcolor_static_returns_the_window_color() {
-        // The acceptance test: the WM_CTLCOLORSTATIC handler returns a brush whose
-        // color equals GetSysColor(COLOR_WINDOW), not a literal white.
-        assert_eq!(
-            super::ctlcolor_index(WM_CTLCOLORSTATIC) as i32,
-            COLOR_WINDOW,
-            "the handler must use COLOR_WINDOW, not RGB(255,255,255)"
-        );
-    }
-
-    #[test]
-    fn row_height_scales_with_dpi() {
-        assert_eq!(super::row_height(96), 24);
-        assert_eq!(super::row_height(144), 36);
-        assert_eq!(super::row_height(192), 48);
-    }
-    #[test]
-    fn draw_list_item_on_empty_rows_is_guarded_not_crashing() {
-        let mut item: super::DRAWITEMSTRUCT = unsafe { std::mem::zeroed() };
-        item.CtlID = super::LIST as u32;
-        item.itemID = 0;
-        // Null device context: the fill is a harmless no-op. The behavior under
-        // test is that an out-of-range item index is guarded by `rows.get(..)`
-        // rather than dereferenced — an empty/short list must not panic.
-        let lp = &mut item as *mut _ as isize;
-        unsafe {
-            super::draw_list_item(lp, 0, std::ptr::null_mut(), &[], 96);
-        }
-        assert_eq!(
-            item.CtlID,
-            super::LIST as u32,
-            "struct still well-formed after the call"
-        );
-    }
-    #[test]
-    fn game_rows_report_running_and_ignore_state_in_text() {
-        let mut shared = Shared::default();
-        shared.games.push(crate::discovery::Game::new(
-            "Steam",
-            "1",
-            "Alpha",
-            r"D:\G\alpha",
-        ));
-        shared.games.push(crate::discovery::Game::new(
-            "Epic",
-            "2",
-            "Beta",
-            r"D:\G\beta",
-        ));
-        shared.active_games.push(crate::processes::ActiveGame {
-            pid: 7,
-            created_at: 1,
-            executable: r"D:\G\alpha\play.exe".into(),
-            game: "Alpha".into(),
-            launcher: "Steam".into(),
-            path: r"D:\G\alpha".into(),
-        });
-        shared.config.ignored_games.push(r"d:\g\beta".into());
-        let rows = super::rows(&shared, super::Page::Games, "");
-        let alpha = rows.iter().find(|r| r.name == "Alpha").unwrap();
-        let beta = rows.iter().find(|r| r.name == "Beta").unwrap();
-        assert!(alpha.running && alpha.label.contains("Running"));
-        assert!(
-            beta.ignored && !beta.running,
-            "an ignored idle game stays labelled in text"
-        );
-    }
-
-    // ── P1-7 acceptance tests ─────────────────────────────────────────────────
-    fn row(label: &str, path: &str, name: &str, custom: bool) -> super::Row {
-        super::Row {
-            label: label.into(),
-            path: path.into(),
-            name: name.into(),
-            custom,
-            ignored: false,
-            running: false,
-        }
-    }
-
-    // ── P2-1 acceptance: the FEEDBACK rendering of a round-trip report ──────
     #[test]
     fn render_verify_report_shows_every_step_and_the_failing_one() {
         // A failed report must name each step, mark the failing one FAIL, and
@@ -3573,27 +2377,6 @@ mod tests {
             "a passing report must not say FAIL"
         );
     }
-
-    #[test]
-    fn scrollbars_only_appear_for_overflow_and_account_for_each_other() {
-        assert_eq!(
-            needed_scrollbars((884, 804), (884, 804), (17, 17)),
-            (false, false)
-        );
-        assert_eq!(
-            needed_scrollbars((884, 804), (883, 804), (17, 17)),
-            (true, true)
-        );
-        assert_eq!(
-            needed_scrollbars((884, 804), (1000, 600), (17, 17)),
-            (false, true)
-        );
-        assert_eq!(
-            needed_scrollbars((884, 804), (600, 1000), (17, 17)),
-            (true, false)
-        );
-    }
-
     #[test]
     fn save_validation_routes_to_feedback_not_modal() {
         // A bad value yields the Err(String) variant — the exact value dispatch
@@ -3619,26 +2402,6 @@ mod tests {
         assert_eq!(ok.restore_delay_seconds, 45.0);
         assert_eq!(ok.lm_endpoint(), "127.0.0.1:8080");
     }
-
-    #[test]
-    fn dedupe_by_canonical_removes_two_names_same_path() {
-        // Two display names for one executable: the old adjacent-only dedup
-        // kept both after the label sort; the global canonical dedup keeps one.
-        let rows = vec![
-            row("Alpha", "C:\\Games\\App\\game.exe", "Alpha", false),
-            row("Beta", "c:/games/app/game.exe", "Beta", false), // same exe, other spelling
-            row("Gamma", "C:\\Games\\Other\\other.exe", "Gamma", true),
-        ];
-        let kept = super::dedupe_by_canonical(&rows);
-        assert_eq!(
-            kept.len(),
-            2,
-            "the two spellings of one executable must collapse to a single row"
-        );
-        assert_eq!(kept[0].label, "Alpha");
-        assert_eq!(kept[1].label, "Gamma");
-    }
-
     #[test]
     fn rename_updates_the_matching_custom_entry() {
         let mut cfg = crate::config::Config::default();
@@ -3658,649 +2421,5 @@ mod tests {
         let err = super::apply_rename(&cfg, "C:\\Games\\App\\game.exe", "   ")
             .expect_err("a blank name must be rejected");
         assert!(err.contains("empty"), "got: {err}");
-    }
-    #[test]
-    #[ignore = "requires an interactive Windows desktop; opens the test dashboard"]
-    fn native_ollama_opt_in_handles_cancel_accept_and_stale_timer_reentry() {
-        use std::cell::Cell;
-        use windows_sys::Win32::System::Threading::GetCurrentThreadId;
-        thread_local! {
-            static OWNER: Cell<HWND> = const { Cell::new(null_mut()) };
-            static CANCEL_DEFAULT: Cell<bool> = const { Cell::new(false) };
-            static REPLY: Cell<i32> = const { Cell::new(IDCANCEL) };
-            static HIDE: Cell<bool> = const { Cell::new(false) };
-            static SHARED: RefCell<Option<SharedState>> = const { RefCell::new(None) };
-        }
-        unsafe extern "system" fn cancel_dialog(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
-            if code == HCBT_ACTIVATE as i32 {
-                let dialog = w as HWND;
-                let owner = OWNER.with(Cell::get);
-                if unsafe { GetWindow(dialog, GW_OWNER) } == owner
-                    && !unsafe { GetDlgItem(dialog, IDCANCEL) }.is_null()
-                {
-                    CANCEL_DEFAULT.with(|value| {
-                        value.set(
-                            unsafe { SendMessageW(dialog, DM_GETDEFID, 0, 0) } as u32 & 0xffff
-                                == IDCANCEL as u32,
-                        )
-                    });
-                    if HIDE.with(Cell::get)
-                        && let Some(shared) = SHARED.with(|value| value.borrow().clone())
-                    {
-                        let mut shared = shared.lock().unwrap();
-                        shared.config.advanced_settings_visible = false;
-                        shared.revision += 1;
-                    }
-                    unsafe {
-                        SendMessageW(owner, WM_TIMER, 1, 0);
-                        PostMessageW(dialog, WM_COMMAND, REPLY.with(Cell::get) as usize, 0);
-                    }
-                }
-            }
-            unsafe { CallNextHookEx(null_mut(), code, w, l) }
-        }
-        struct Fixture {
-            hwnd: HWND,
-            hook: HHOOK,
-        }
-        impl Drop for Fixture {
-            fn drop(&mut self) {
-                unsafe {
-                    UnhookWindowsHookEx(self.hook);
-                    SendMessageW(self.hwnd, WM_CLOSE, 0, 0);
-                }
-                OWNER.with(|value| value.set(null_mut()));
-                SHARED.with(|value| *value.borrow_mut() = None);
-            }
-        }
-        let shared = Arc::new(std::sync::Mutex::new(Shared {
-            active_mode: false,
-            config: Config {
-                advanced_settings_visible: true,
-                ..Default::default()
-            },
-            ..Default::default()
-        }));
-        let (tx, rx) = std::sync::mpsc::channel();
-        show(shared.clone(), tx, PathBuf::new());
-        let hwnd = snapshot().unwrap().hwnd;
-        OWNER.with(|value| value.set(hwnd));
-        SHARED.with(|value| *value.borrow_mut() = Some(shared.clone()));
-        let hook = unsafe {
-            SetWindowsHookExW(
-                WH_CBT,
-                Some(cancel_dialog),
-                null_mut(),
-                GetCurrentThreadId(),
-            )
-        };
-        assert!(!hook.is_null());
-        let fixture = Fixture { hwnd, hook };
-        for (reply, hide) in [(IDCANCEL, false), (IDOK, false), (IDOK, true)] {
-            REPLY.with(|value| value.set(reply));
-            HIDE.with(|value| value.set(hide));
-            shared.lock().unwrap().commands.settings_pending = false;
-            unsafe {
-                SendMessageW(
-                    GetDlgItem(hwnd, OLLAMA_ENABLED),
-                    BM_SETCHECK,
-                    BST_CHECKED as usize,
-                    0,
-                );
-            }
-            command(OLLAMA_ENABLED, BN_CLICKED);
-            assert!(CANCEL_DEFAULT.with(Cell::get));
-            if reply == IDOK && !hide {
-                assert!(
-                    matches!(rx.try_recv(), Ok(Action::Tracked { action, .. }) if matches!(*action, Action::AdvancedSettings(ref config) if config.providers[1].enabled()))
-                );
-            } else {
-                assert!(rx.try_recv().is_err());
-            }
-            assert!(
-                !shared.lock().unwrap().config.providers[1].enabled(),
-                "enablement waits for worker persistence"
-            );
-            assert!(!checked(unsafe { GetDlgItem(hwnd, OLLAMA_ENABLED) }));
-        }
-        drop(fixture);
-    }
-    #[test]
-    #[ignore = "requires an interactive Windows desktop; renders an isolated mock dashboard"]
-    fn native_dashboard_controls_are_visible_and_scrollbars_follow_overflow() {
-        let shared = Arc::new(std::sync::Mutex::new(Shared {
-            active_mode: true,
-            discovery_ready: true,
-            detection_ok: true,
-            activity: crate::control::Activity::Watching,
-            ..Default::default()
-        }));
-        let (tx, rx) = std::sync::mpsc::channel();
-        show(shared.clone(), tx, PathBuf::new());
-        let hwnd = snapshot().unwrap().hwnd;
-        struct Fixture(HWND);
-        impl Drop for Fixture {
-            fn drop(&mut self) {
-                unsafe {
-                    DestroyWindow(self.0);
-                }
-            }
-        }
-        let _fixture = Fixture(hwnd);
-        unsafe {
-            let dpi = GetDpiForWindow(hwnd) as i32;
-            let size = outer_size(false, dpi);
-            SetWindowPos(hwnd, HWND_TOP, 0, 0, size.0, size.1, SWP_NOMOVE);
-            position_controls();
-            assert_eq!(
-                GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & (WS_HSCROLL | WS_VSCROLL),
-                0
-            );
-            for id in [
-                AUTO, SETTINGS, NAVIGATION, REFRESH, ADD, SEARCH, LIST, TOGGLE, PAUSE, RESUME, QUIT,
-            ] {
-                let child = GetDlgItem(hwnd, id);
-                let mut rect: RECT = std::mem::zeroed();
-                GetWindowRect(child, &mut rect);
-                let mut point = POINT {
-                    x: (rect.left + rect.right) / 2,
-                    y: (rect.top + rect.bottom) / 2,
-                };
-                ScreenToClient(hwnd, &mut point);
-                assert_eq!(
-                    ChildWindowFromPointEx(hwnd, point, CWP_SKIPINVISIBLE),
-                    child,
-                    "control {id} is covered by a sibling"
-                );
-            }
-            let edit = GetDlgItem(hwnd, STATUS);
-            set(edit, "Short readable status.");
-            assert_eq!(GetWindowLongPtrW(edit, GWL_STYLE) as u32 & WS_VSCROLL, 0);
-            set(edit, &"A long provider status line.\r\n".repeat(50));
-            assert_ne!(GetWindowLongPtrW(edit, GWL_STYLE) as u32 & WS_VSCROLL, 0);
-            SendMessageW(edit, EM_SETSEL, 2, 7);
-            update_text_scrollbar(edit);
-            let mut start = 0u32;
-            let mut end = 0u32;
-            SendMessageW(
-                edit,
-                EM_GETSEL,
-                &mut start as *mut _ as usize,
-                &mut end as *mut _ as isize,
-            );
-            assert_eq!((start, end), (2, 7));
-            set(edit, "Short readable status.");
-            assert_eq!(GetWindowLongPtrW(edit, GWL_STYLE) as u32 & WS_VSCROLL, 0);
-            SetWindowPos(
-                hwnd,
-                null_mut(),
-                0,
-                0,
-                scale(540, dpi),
-                scale(440, dpi),
-                SWP_NOMOVE | SWP_NOZORDER,
-            );
-            assert_ne!(GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & WS_VSCROLL, 0);
-            SetWindowPos(
-                hwnd,
-                null_mut(),
-                0,
-                0,
-                size.0,
-                size.1,
-                SWP_NOMOVE | SWP_NOZORDER,
-            );
-            assert_eq!(
-                GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & (WS_HSCROLL | WS_VSCROLL),
-                0
-            );
-            assert_eq!(
-                (
-                    snapshot().unwrap().viewport.x,
-                    snapshot().unwrap().viewport.y
-                ),
-                (0, 0)
-            );
-            STATE.with(|state| state.borrow_mut().as_mut().unwrap().last_status.clear());
-            {
-                let mut state = shared.lock().unwrap();
-                state.games = vec![
-                    crate::discovery::Game::new(
-                        "Steam",
-                        "on",
-                        "Fixture adventure",
-                        r"D:\Fixture Games\on.exe",
-                    ),
-                    crate::discovery::Game::new(
-                        "Custom",
-                        "off",
-                        "Fixture racing",
-                        r"D:\Fixture Games\off.exe",
-                    ),
-                ];
-                state
-                    .config
-                    .ignored_games
-                    .push(r"D:\Fixture Games\off.exe".into());
-                state.revision += 1;
-            }
-            refresh();
-            SendMessageW(GetDlgItem(hwnd, LIST), LB_SETCURSEL, 0, 0);
-            update_selection();
-            let details = GetDlgItem(hwnd, DETAILS);
-            SendMessageW(details, EM_SETSEL, 2, 7);
-            update_selection();
-            let mut start = 0u32;
-            let mut end = 0u32;
-            SendMessageW(
-                details,
-                EM_GETSEL,
-                &mut start as *mut _ as usize,
-                &mut end as *mut _ as isize,
-            );
-            assert_eq!(
-                (start, end),
-                (2, 7),
-                "unchanged details must preserve selection"
-            );
-            set_client_theme(true);
-            assert_ne!(
-                GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & WS_CLIPCHILDREN,
-                0
-            );
-            assert_ne!(
-                GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_COMPOSITED,
-                0
-            );
-            shared.lock().unwrap().config.advanced_settings_visible = true;
-            refresh();
-            let appearance = GetDlgItem(hwnd, APPEARANCE);
-            SendMessageW(appearance, CB_SETCURSEL, 1, 0);
-            command(APPEARANCE, CBN_SELCHANGE);
-            assert!(
-                matches!(rx.try_recv(), Ok(Action::Tracked { action, .. }) if matches!(*action, Action::Appearance(crate::config::Appearance::Light)))
-            );
-            assert_eq!(
-                SendMessageW(appearance, CB_GETCURSEL, 0, 0),
-                shared.lock().unwrap().config.appearance.index() as isize
-            );
-            shared.lock().unwrap().commands.settings_pending = false;
-            for _ in 0..30 {
-                scroll_viewport(false, SB_BOTTOM);
-                RedrawWindow(
-                    hwnd,
-                    null(),
-                    null_mut(),
-                    RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW,
-                );
-                assert!(snapshot().unwrap().viewport.y > 0);
-                scroll_viewport(false, SB_TOP);
-                RedrawWindow(
-                    hwnd,
-                    null(),
-                    null_mut(),
-                    RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW,
-                );
-                assert_eq!(snapshot().unwrap().viewport.y, 0);
-            }
-            SendMessageW(
-                details,
-                EM_GETSEL,
-                &mut start as *mut _ as usize,
-                &mut end as *mut _ as isize,
-            );
-            assert_eq!(
-                (start, end),
-                (2, 7),
-                "scrolling must not reset details selection"
-            );
-            shared.lock().unwrap().config.advanced_settings_visible = false;
-            shared.lock().unwrap().commands.settings_pending = false;
-            refresh();
-            assert!(!checked(GetDlgItem(hwnd, SETTINGS)));
-            assert_ne!(IsWindowEnabled(GetDlgItem(hwnd, SETTINGS)), 0);
-            std::fs::create_dir_all("build").unwrap();
-            for dark in [true, false] {
-                shared.lock().unwrap().config.appearance = if dark {
-                    crate::config::Appearance::Dark
-                } else {
-                    crate::config::Appearance::Light
-                };
-                set_client_theme(dark);
-                refresh();
-                for activity in [
-                    crate::control::Activity::Watching,
-                    crate::control::Activity::ManualHold,
-                    crate::control::Activity::Restoring,
-                ] {
-                    shared.lock().unwrap().activity = activity;
-                    refresh();
-                    assert_eq!(
-                        crate::theme::accent(hwnd),
-                        crate::theme::state_accent(activity, dark)
-                    );
-                }
-                shared.lock().unwrap().activity = crate::control::Activity::Watching;
-                refresh();
-                for id in [PAUSE, RESUME, REMOVE, TOGGLE] {
-                    let button = GetDlgItem(hwnd, id);
-                    if dark {
-                        assert_eq!(
-                            GetWindowLongPtrW(button, GWL_STYLE) as u32 & BS_TYPEMASK as u32,
-                            BS_OWNERDRAW as u32
-                        );
-                        SendMessageW(button, WM_MOUSEMOVE, 0, 0);
-                        SendMessageW(button, WM_MOUSELEAVE, 0, 0);
-                        SendMessageW(button, BM_SETSTATE, 1, 0);
-                        SendMessageW(button, BM_SETSTATE, 0, 0);
-                    }
-                }
-                RedrawWindow(
-                    hwnd,
-                    null(),
-                    null_mut(),
-                    RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW,
-                );
-                let mut message: MSG = std::mem::zeroed();
-                while PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE) != 0 {
-                    TranslateMessage(&message);
-                    DispatchMessageW(&message);
-                }
-                RedrawWindow(
-                    GetDlgItem(hwnd, LIST),
-                    null(),
-                    null_mut(),
-                    RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW,
-                );
-                let mut rect: RECT = std::mem::zeroed();
-                GetClientRect(hwnd, &mut rect);
-                let source = GetDC(hwnd);
-                let dc = CreateCompatibleDC(source);
-                let info = BITMAPINFO {
-                    bmiHeader: BITMAPINFOHEADER {
-                        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                        biWidth: rect.right,
-                        biHeight: -rect.bottom,
-                        biPlanes: 1,
-                        biBitCount: 32,
-                        biCompression: BI_RGB,
-                        ..std::mem::zeroed()
-                    },
-                    ..std::mem::zeroed()
-                };
-                let mut bits = null_mut();
-                let bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
-                assert!(!bitmap.is_null());
-                let old = SelectObject(dc, bitmap);
-                assert_ne!(
-                    windows_sys::Win32::Storage::Xps::PrintWindow(
-                        hwnd,
-                        dc,
-                        windows_sys::Win32::Storage::Xps::PW_CLIENTONLY | 2
-                    ),
-                    0
-                );
-                GdiFlush();
-                let pixels = std::slice::from_raw_parts(
-                    bits as *const u8,
-                    (rect.right * rect.bottom * 4) as usize,
-                );
-                // Inspect the actual composited button surface, not an isolated WM_PRINTCLIENT.
-                let x = scale(by_id(PAUSE).x + 5, dpi);
-                let y = scale(by_id(PAUSE).y + 5, dpi);
-                let offset = ((y * rect.right + x) * 4) as usize;
-                if dark {
-                    assert_ne!(&pixels[offset..offset + 3], &[0x20, 0x20, 0x20]);
-                }
-                let mut bmp = Vec::new();
-                bmp.extend_from_slice(b"BM");
-                bmp.extend_from_slice(&(54u32 + pixels.len() as u32).to_le_bytes());
-                bmp.extend_from_slice(&[0; 4]);
-                bmp.extend_from_slice(&54u32.to_le_bytes());
-                let header =
-                    std::slice::from_raw_parts(&info.bmiHeader as *const _ as *const u8, 40);
-                bmp.extend_from_slice(header);
-                bmp.extend_from_slice(pixels);
-                let name = if dark { "dark" } else { "light" };
-                std::fs::write(format!("build/dashboard-review-{name}.bmp"), bmp).unwrap();
-                SelectObject(dc, old);
-                DeleteObject(bitmap);
-                DeleteDC(dc);
-                ReleaseDC(hwnd, source);
-            }
-        }
-        assert!(
-            rx.try_recv().is_err(),
-            "rendering must not request provider work"
-        );
-        {
-            let mut state = shared.lock().unwrap();
-            state.manual_pause = true;
-            state.pending = true;
-            state.activity = crate::control::Activity::ManualHold;
-            state.revision += 1;
-        }
-        refresh();
-        unsafe {
-            assert_eq!(IsWindowEnabled(GetDlgItem(hwnd, PAUSE)), 0);
-            assert_ne!(IsWindowEnabled(GetDlgItem(hwnd, RESUME)), 0);
-        }
-        command(RESUME, BN_CLICKED);
-        assert!(
-            matches!(rx.try_recv(), Ok(Action::Tracked { action, .. }) if matches!(*action, Action::Restore))
-        );
-        {
-            let mut state = shared.lock().unwrap();
-            state.activity = crate::control::Activity::Restoring;
-            state.revision += 1;
-        }
-        refresh();
-        command(RESUME, BN_CLICKED);
-        assert!(
-            rx.try_recv().is_err(),
-            "busy Resume must be rejected again at dispatch"
-        );
-    }
-
-    #[test]
-    #[ignore = "requires an interactive Windows desktop; opens the test dashboard"]
-    fn native_dashboard_rescales_font_and_fixed_rows_without_gdi_leaks() {
-        use std::sync::{Arc, Mutex, mpsc};
-        use windows_sys::Win32::System::Threading::{
-            GR_GDIOBJECTS, GetCurrentProcess, GetGuiResources,
-        };
-        let shared = Arc::new(Mutex::new(Shared {
-            active_mode: false,
-            ..Default::default()
-        }));
-        let (tx, rx) = mpsc::channel();
-        show(shared.clone(), tx, PathBuf::new());
-        fn pump() {
-            unsafe {
-                let mut message: MSG = std::mem::zeroed();
-                while PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE) != 0 {
-                    TranslateMessage(&message);
-                    DispatchMessageW(&message);
-                }
-            }
-        }
-        let hwnd = snapshot().unwrap().hwnd;
-        for id in [
-            VERIFY,
-            DOCTOR,
-            CLI,
-            OPEN_FOLDER,
-            STARTUP,
-            SAVE,
-            NOTIFICATIONS,
-            SOUND,
-            OLLAMA_ENABLED,
-            OLLAMA_SAVE,
-            CONTRIBUTE,
-        ] {
-            command(id, BN_CLICKED);
-        }
-        assert!(rx.try_recv().is_err(), "hidden tools must not dispatch");
-        unsafe {
-            SendMessageW(
-                GetDlgItem(hwnd, SETTINGS),
-                BM_SETCHECK,
-                BST_CHECKED as usize,
-                0,
-            );
-        }
-        command(SETTINGS, BN_CLICKED);
-        assert!(
-            matches!(rx.try_recv(), Ok(Action::Tracked { action, .. }) if matches!(*action, Action::AdvancedVisibility(true)))
-        );
-        assert!(
-            !snapshot().unwrap().settings_visible,
-            "visibility waits for persistence"
-        );
-        {
-            let mut state = shared.lock().unwrap();
-            state.config.advanced_settings_visible = true;
-            state.commands.settings_pending = false;
-            state.revision += 1;
-        }
-        refresh();
-        for id in SETTINGS_ROW {
-            assert_ne!(
-                unsafe { GetWindowLongPtrW(GetDlgItem(hwnd, id), GWL_STYLE) } as u32 & WS_VISIBLE,
-                0
-            );
-        }
-        command(DOCTOR, BN_CLICKED);
-        assert!(
-            matches!(rx.try_recv(), Ok(Action::Tracked { action, .. }) if matches!(*action, Action::Doctor))
-        );
-        command(DOCTOR, BN_CLICKED);
-        assert!(rx.try_recv().is_err(), "pending diagnostics must coalesce");
-        refresh();
-        assert_eq!(unsafe { IsWindowEnabled(GetDlgItem(hwnd, DOCTOR)) }, 0);
-        {
-            let mut state = shared.lock().unwrap();
-            let provider = state
-                .config
-                .providers
-                .iter()
-                .find(|provider| matches!(provider, crate::config::Provider::LMStudio { .. }))
-                .unwrap();
-            let connection = state.config.lm().unwrap().clone();
-            state.doctor_report = Some(serde_json::json!({"providers":[{
-                "id":provider.id(),"endpoint":provider.endpoint(),"enabled":provider.enabled(),
-                "connection":connection,"observed_at_unix_seconds":0,
-                "cli_version":{"ok":false,"error":"fixture CLI unavailable"}
-            }]}));
-            state.doctor_pending = false;
-        }
-        refresh();
-        assert_ne!(unsafe { IsWindowEnabled(GetDlgItem(hwnd, DOCTOR)) }, 0);
-        let cached_detail = text(unsafe { GetDlgItem(hwnd, PROVIDER_DETAIL) });
-        assert!(cached_detail.contains("fixture CLI unavailable"));
-        assert!(cached_detail.contains("1970-01-01 00:00:00 UTC"));
-        refresh();
-        assert_eq!(
-            text(unsafe { GetDlgItem(hwnd, PROVIDER_DETAIL) }),
-            cached_detail
-        );
-        unsafe {
-            SendMessageW(
-                GetDlgItem(hwnd, NOTIFICATIONS),
-                BM_SETCHECK,
-                BST_UNCHECKED as usize,
-                0,
-            );
-        }
-        command(NOTIFICATIONS, BN_CLICKED);
-        assert!(
-            matches!(rx.try_recv(), Ok(Action::Tracked { action, .. }) if matches!(*action, Action::NotificationPreferences { visual:false, sound:true }))
-        );
-        assert!(shared.lock().unwrap().config.notifications_enabled);
-        assert!(
-            checked(unsafe { GetDlgItem(hwnd, NOTIFICATIONS) }),
-            "pending save must show saved preference"
-        );
-        unsafe {
-            SetFocus(GetDlgItem(hwnd, SAVE));
-        }
-        {
-            let mut state = shared.lock().unwrap();
-            state.config.advanced_settings_visible = false;
-            state.commands.settings_pending = false;
-        }
-        refresh();
-        assert_eq!(unsafe { GetFocus() }, unsafe { GetDlgItem(hwnd, SETTINGS) });
-        let mut tab = unsafe { GetDlgItem(hwnd, SETTINGS) };
-        for _ in 0..LAYOUT.len() {
-            tab = unsafe { GetNextDlgTabItem(hwnd, tab, 0) };
-            assert!(
-                !SETTINGS_ROW.contains(&unsafe { GetDlgCtrlID(tab) }),
-                "hidden tool remained in tab order"
-            );
-        }
-        // Prime both themes at all font DPIs. The expanded native drawing paths
-        // take more than the old single-theme 49 relayouts to reach a plateau.
-        for (index, dpi) in [96, 144, 192, 144, 96, 192, 96]
-            .into_iter()
-            .cycle()
-            .take(98)
-            .enumerate()
-        {
-            shared.lock().unwrap().config.appearance = if index % 2 == 0 {
-                crate::config::Appearance::Dark
-            } else {
-                crate::config::Appearance::Light
-            };
-            set_client_theme(index % 2 == 0);
-            relayout(hwnd, dpi, false);
-            pump();
-        }
-        let before = unsafe { GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS) };
-        for (index, dpi) in [96, 144, 192, 144, 96, 192, 96]
-            .into_iter()
-            .cycle()
-            .take(49)
-            .enumerate()
-        {
-            shared.lock().unwrap().config.appearance = if index % 2 == 0 {
-                crate::config::Appearance::Dark
-            } else {
-                crate::config::Appearance::Light
-            };
-            set_client_theme(index % 2 == 0);
-            relayout(hwnd, dpi, false);
-            pump();
-            let state = snapshot().unwrap();
-            assert_eq!(
-                unsafe { SendMessageW(state.tooltips.hwnd, TTM_GETTIPBKCOLOR, 0, 0) } as u32,
-                state.theme.as_ref().unwrap().palette.surface
-            );
-            let mut font: LOGFONTW = unsafe { std::mem::zeroed() };
-            unsafe {
-                assert_ne!(
-                    GetObjectW(
-                        state.font,
-                        std::mem::size_of::<LOGFONTW>() as i32,
-                        &mut font as *mut _ as *mut _
-                    ),
-                    0
-                );
-                assert_eq!(font.lfHeight, -scale(16, dpi));
-                assert_eq!(
-                    SendMessageW(GetDlgItem(hwnd, LIST), LB_GETITEMHEIGHT, 0, 0),
-                    row_height(dpi) as isize
-                );
-            }
-        }
-        theme_changed();
-        pump();
-        let after = unsafe { GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS) };
-        eprintln!("GDI after 98 warmups / 49 measured theme-DPI relayouts: {before} / {after}");
-        close();
-        assert!(
-            after <= before + 2,
-            "GDI handles leaked: {before} -> {after}"
-        );
     }
 }

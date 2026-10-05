@@ -14,7 +14,7 @@ cargo build --locked --release
 
 Default behavior automatically pauses AI. For non-mutating diagnostics, explicitly pass `--observe`. Use a private data directory for development. Do not overwrite a real pending journal, and do not commit runtime files.
 
-During implementation, run tests relevant to the latest ticket. Run the full suite once for final candidate validation, then fix any failures. Formatting and Clippy remain applicable quality gates. The owner authorized ticket commits on 2026-10-05; publication still requires human review and a separate publishing instruction.
+During implementation, run tests relevant to the latest ticket. Run the full suite once for final candidate validation, then fix any failures. Formatting and Clippy remain applicable quality gates. Do not commit or publish unless the current task explicitly requests it.
 
 P1-4 handles suspend and automatic resume. The tray routes [WM_POWERBROADCAST](https://learn.microsoft.com/en-us/windows/win32/power/wm-powerbroadcast); headless watchers use [PowerRegisterSuspendResumeNotification](https://learn.microsoft.com/en-us/windows/win32/api/powerbase/nf-powerbase-powerregistersuspendresumenotification), without another application thread. The later user-interaction resume event does not reset the delay again. Atomic generations invalidate in-flight scans and provider work at coordinator boundaries. The worker rebuilds process caches, rejects pre-event inventory generations, refreshes discovery and invalidates provider completion evidence before further control. Journal writes preserve original snapshots, completed restoration entries and Ollama deadlines/monotonic budgets. Failed writes hold control and honor retry backoff. Observation does not rewrite journals.
 
@@ -28,8 +28,9 @@ The characterized policy starts a full configured grace period after reliable po
 | `diagnostics.rs` | Shared read-only provider probes, cached Advanced evidence and unchanged legacy Doctor fields |
 | `power.rs` | Atomic power generations and lifetime-bound headless native notification callbacks |
 | `tray.rs` | Win32 hidden window, notification icon/menu, dashboard routing, sign-in registration |
-| `dashboard.rs` | On-demand native controls, game search/registration, exclusions, live settings |
-| `theme.rs` | UI-thread palette resources and dark native-control painting with system-color fallback |
+| `dashboard.rs` | Rust-native eframe dashboard, UI-only event loop, tables, settings, dialogs and Activity |
+| `dashboard_theme.rs` | Shared egui design tokens, installed/bundled fonts, vector icons and accessible checkboxes |
+| `theme.rs` | UI-thread native tray palette resources with system-color fallback |
 | `processes.rs` | Toolhelp process snapshots, creation-time/path cache, folder matching and exclusions |
 | `detection_worker.rs` | Persistent periodic scanner, bounded latest-state mailbox and fresh guard deadlines |
 | `discovery.rs` | Launcher metadata adapters, incremental inventory, safe parser boundaries |
@@ -51,7 +52,7 @@ The characterized policy starts a full configured grace period after reliable po
 | `ui_commands.rs` | Native command IDs, Advanced visibility and shared verification availability |
 | `notifications.rs` | Single pending completion event, fake-clock policy and one-source delivery selection |
 | `gameplay.rs` | Transient process-instance restore approval and selected exclusions |
-| `restore_dialog.rs` | Shared native gameplay warning with Cancel as the default |
+| `restore_dialog.rs` | Shared Resume policy routing; gameplay warnings open in the themed dashboard |
 
 The watcher polls native process metadata every two seconds by default on one persistent detection thread. Provider calls stay on the existing control thread, so a blocked capture/load does not stop periodic detection. The scanner only queries executable paths for new `(PID, creation time)` pairs. Inventory refresh runs on a separate worker and retains the previous successful adapter inventory after errors. No installed-game directory tree is recursively scanned. Xbox package discovery uses a bounded occasional PowerShell query and is deferred during gaming.
 
@@ -59,7 +60,7 @@ Detection has one replaceable input and one latest result, with no per-tick thre
 
 The scanner publishes detection/game rows to shared native status while control is busy. It takes no engine ownership or provider action, and no mailbox/UI mutex spans process enumeration. Engine grace, retries and gameplay authority stay on the control thread. Normal ticking cannot overwrite newer scanner-owned rows with an older frame. Fresh guards still interrupt only between provider units; a model load already in progress must return before remaining loads can be deferred. CLI `status.json` remains the last control-tick report, and inventory acceptance still waits for the control loop. Unknown/unregistered games and OS process-query stalls remain detection limits.
 
-The UI uses Win32 directly: no webview, GUI framework, or async runtime. Completed gaming pauses do not repeatedly contact LM Studio or rewrite the journal. Runtime status is written only when it changes, with bounded log rotation. The dashboard is created on demand and destroyed when closed; running-app rows are produced only on request. Settings travel through the worker action channel, validate and save atomically before replacing scanner/backend configuration. Turning off automatic pausing still allows recovery after recognized games exit. The old broad Steam-library fallback is replaced by a one-shot refresh request for new unfamiliar processes inside known libraries.
+The tray uses Win32 directly. The v1.5.0 dashboard uses eframe/egui with Glow and AccessKit; there is no webview or frontend. Completed gaming pauses do not repeatedly contact LM Studio or rewrite the journal. Runtime status is written only when it changes, with bounded log rotation. The dashboard starts on demand on one dedicated UI thread. Closing releases the window and renderer; the UI thread waits on its mailbox and reuses its event loop when reopened. It exits on watcher shutdown. Running-app rows are produced only while the Running apps page is visible. Settings travel through the worker action channel, validate and save atomically before replacing scanner/backend configuration. Turning off automatic pausing still allows recovery after recognized games exit. The old broad Steam-library fallback is replaced by a one-shot refresh request for new unfamiliar processes inside known libraries.
 
 ## LM Studio integration
 
@@ -163,7 +164,7 @@ This test opens and dismisses three native menus belonging to its own observatio
 
 Win32 popup tracking runs a nested message loop. Never hold a UI-state RefCell borrow or shared-state mutex across native calls that may dispatch messages synchronously.
 
-## v1.0.0 candidate implementation
+## v1.0.0 candidate implementation (historical native dashboard)
 
 The engine publishes capture/unload/restore progress to shared state before bounded synchronous provider work. The observer takes only a short shared-state lock and makes no Win32 calls. Dashboard and tray consume the same `ControlState` availability policy. Worker dispatch revalidates engine state, detection readiness and a fresh exclusion-free game scan; restoration still checks remembered games between loads. Pause and Resume are explicit commands, so repeated Pause cannot toggle a hold. Discovery errors hold automatic control/recovery and manual commands until a successful inventory and process scan establish detection readiness.
 
@@ -177,12 +178,14 @@ Gameplay Restore uses a one-use offer containing PID, creation time and executab
 
 Ignore selections save only selected canonical executable exclusions, independently of restoration. The native dialog releases shared locks before its nested message loop, prevents reentry, defaults to Cancel and does not post a thread quit message when closed. Internal process identity fields are excluded from cached status JSON. Failed enumeration or inaccessible previously recognized/explicitly registered game processes make evidence unknown; unfamiliar protected processes remain subject to the existing recognition limits. No scan-performance claim follows from the fixture tests.
 
-## Stabilisation regression checks
+## Stabilisation regression checks (historical v1.0.0 UI notes)
+
+The native dashboard details below describe v1.0.0. The current dashboard architecture and fixtures are documented under [v1.5.0 dashboard development](#v150-dashboard-development).
 
 ```powershell
 cargo run --locked --release --features resilience-test --example resilience_probe
 cargo test --locked native_popup_survives_repeated_timer_reentry -- --ignored --nocapture
-cargo test --locked native_dashboard_rescales_font_and_fixed_rows_without_gdi_leaks -- --ignored --nocapture
+cargo test --locked ui_design_review_snapshots -- --ignored --test-threads=1 --nocapture
 ```
 
 The feature-gated probe injects a discovery panic under the production release profile and verifies retention, subsequent refresh and local panic logging. It is not included in default release executables. Unit tests alone do not prove the release panic strategy. Interactive tests open only isolated test windows; protocol fixtures bind localhost and do not connect to LM Studio. Two ignored command fixtures are invoked as child processes by ordinary timeout/output-cap tests; do not run all ignored tests as a batch.
@@ -205,3 +208,12 @@ Ollama opt-in uses a native Cancel-default disclosure without a state borrow or 
 Appearance uses a typed, optional-default version-3 setting. Its worker action saves only the preference; it does not rebuild provider transport/scanners, change the manual hold or touch recovery. The UI applies saved preferences after successful persistence. High contrast overrides forced dark mode. Native Rich Edit (the Windows system DLL) formats only pausing metadata words and preserves selection/scroll position. It adds no runtime download or GUI framework.
 
 Push buttons in both palettes use native owner-draw input with one drawing path, avoiding theme-animation painting over the dark renderer. Group boxes paint their full uncovered background in both themes. Child positions are deferred in a bounded batch, followed by one redraw; failed batches fall back to all positions. The composited parent clips child areas during background erase. Pure viewport scrolling does not toggle text scrollbars. Tray menus retain native strings, command IDs, disabled/check flags and keyboard dispatch, with UI-thread-owned palette/font resources until the menu is destroyed. High contrast retains native menu drawing.
+
+
+## v1.5.0 dashboard development
+
+[The implementation journal](UI_V1.5.0_JOURNAL.md) records the current redesign and acceptance status. `dashboard.rs` consumes cloned shared state and sends existing tracked worker actions. It never creates provider adapters or performs model operations. The UI bridge sends egui contexts and typed requests between the tray and dashboard UI threads; no HWND crosses to engine workers. Shared/bridge locks are released before renderer or native modal dispatch. Tray timers compare state before requesting repaint. Closed dashboards have no window or renderer and do not poll/redraw; five-second toast expiry requests one scheduled repaint. Activity holds at most 160 observed changes in memory, with unchanged frames adding nothing.
+
+Advanced edits use a revision-bound config draft and existing validated atomic worker saves. Provider recovery gates and exact experimental-enrollment confirmation remain in place. Gameplay confirmation keeps the offer ID and initially unchecked executable exclusions; the worker performs fresh process checks before accepting it. The old Win32 dashboard geometry/GDI tests were replaced because those controls no longer exist; pure save, rename, registration and verification-report regressions remain.
+
+Focused UI tests render all typed activity states and pages at compact, normal and large sizes, with 100/125/150/175/200% scale factors. The single ignored `ui_design_review_snapshots` fixture renders fictional state in its own eframe window and exports that window's framebuffer to `scratch/ui-review`. It has no watcher/provider and writes no configuration or recovery. It is intended for explicit visual review, not a batch of ignored tests. This is not physical multi-monitor, screen-reader or live provider acceptance.

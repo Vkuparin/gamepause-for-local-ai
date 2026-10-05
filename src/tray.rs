@@ -126,13 +126,6 @@ pub fn show_existing(folder: &Path) -> bool {
         PostMessageW(window, SHOW_DASHBOARD, 0, 0) != 0
     }
 }
-/// # Safety
-/// `hwnd` must be a live owner window or null.
-pub unsafe fn confirm_verify(hwnd: HWND) -> bool {
-    unsafe {
-        MessageBoxW(hwnd, wide("This test unloads and reloads every loaded model. Finish inference and close games first. Unfinished restoration is kept in the recovery journal. Continue?").as_ptr(), wide("Reload models and verify").as_ptr(), MB_YESNO | MB_ICONWARNING) == IDYES
-    }
-}
 pub fn request_exit() {
     FINISHED.store(true, Ordering::Relaxed);
     let window = WINDOW.load(Ordering::Relaxed);
@@ -666,15 +659,11 @@ unsafe fn menu(hwnd: HWND, ui: &UI) {
                 None
             }
             Command::Verify => {
-                if confirm_verify(hwnd) {
-                    crate::app::request_verify(&ui.shared, &ui.tx);
-                } else {
-                    crate::app::local_result(
-                        &ui.shared,
-                        crate::commands::Outcome::Cancelled,
-                        "Test round-trip cancelled; AI unchanged.",
-                    );
-                }
+                dashboard::request_verify_modal(
+                    ui.shared.clone(),
+                    ui.tx.clone(),
+                    ui.folder.clone(),
+                );
                 None
             }
             Command::Quit => {
@@ -741,6 +730,7 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> L
             0
         }
         WM_TIMER => {
+            dashboard::refresh();
             if FINISHED.load(Ordering::Relaxed) {
                 unsafe {
                     DestroyWindow(hwnd);
