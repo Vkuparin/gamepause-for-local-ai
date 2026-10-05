@@ -10,7 +10,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
+      - run: rustup toolchain install 1.99.0 --profile minimal --component rustfmt --component clippy
       - run: cargo test --locked
       - run: cargo run --locked --release --features resilience-test --example resilience_probe
       - name: Install official Inno Setup compiler
@@ -25,6 +25,8 @@ jobs:
           if ($taskInstall.ExitCode -ne 0) { throw 'Inno Setup installation failed' }
       - shell: pwsh
         run: ./scripts/build_release.ps1 -Iscc (Join-Path $env:RUNNER_TEMP 'GamePause-InnoSetup\ISCC.exe')
+      - shell: pwsh
+        run: ./scripts/verify_release.ps1
       - uses: actions/upload-artifact@v4
         with:
           name: GamePause-windows-x64
@@ -32,3 +34,4 @@ jobs:
             dist/*.zip
             dist/*-Setup.exe
             dist/SHA256SUMS.txt
+            dist/BUILD-INFO.json

@@ -1,9 +1,19 @@
+#[cfg(test)]
+use crate::config::write_json;
 use crate::{
-    config::{Config, write_json},
-    lmstudio::{Backend, Snapshot, compare_fields},
+    config::Config,
+    control::Activity,
+    gameplay::{GameEvidence, GameplayControl},
+    lmstudio::{Backend, Snapshot},
+    provider::Backend as ProviderBackend,
+    recovery::{self, Binding, Intent, Journal},
 };
 use anyhow::{Result, bail};
-use std::{fs, path::PathBuf};
+#[cfg(test)]
+use std::fs;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+type ProviderObserver = Box<dyn FnMut(&[crate::coordinator::Report]) + Send>;
 
 /// Per-step outcome of the P2-1 round-trip verify, so the dashboard and the
 /// `gamepause verify` CLI can render exactly what happened at each stage
@@ -27,7 +37,10 @@ pub struct Engine<B: Backend> {
     pub backend: B,
     pub config: Config,
     pub state: Option<Snapshot>,
+    recovery: Option<Journal>,
     pub path: PathBuf,
+    binding: Option<Binding>,
+    intent: Intent,
     pub message: String,
     pub last_error: String,
     pub disabled: bool,
@@ -42,78 +55,54 @@ pub struct Engine<B: Backend> {
     pub verify_report: Option<crate::engine::VerifyReport>,
     pub pause_completions: u64,
     pub restore_completions: u64,
+    pub activity: Activity,
+    pub gameplay: GameplayControl,
+    pub provider_statuses: Vec<crate::coordinator::Report>,
+    provider_progress: Option<ProviderObserver>,
+    coordinator_memory: Option<crate::coordinator::Continuation<crate::recovery::Payload>>,
+    adapter_progress: Option<crate::lm_session::Progress>,
+    ollama_runtime: crate::provider_runtime::OllamaRuntime,
+    provider_now: Duration,
+    progress: Option<Box<dyn FnMut(Activity) + Send>>,
     quiet_since: Option<f64>,
     retry_at: f64,
-}
-
-fn validate_snapshot(snapshot: &Snapshot) -> Result<()> {
-    if !snapshot.server["running"].is_boolean()
-        || snapshot.server["port"]
-            .as_u64()
-            .is_none_or(|port| port == 0 || port > 65535)
-    {
-        bail!("Invalid recovery server settings; recovery retained");
-    }
-    if snapshot.schema != 2 {
-        bail!("Unsupported recovery format; preserve state.json and inspect manually");
-    }
-    {
-        if snapshot
-            .games
-            .iter()
-            .any(|g| g.name.is_empty() || !std::path::Path::new(&g.path).is_absolute())
-        {
-            bail!("Invalid recovery game location; recovery retained");
-        }
-        let mut identifiers = std::collections::BTreeSet::new();
-        for model in &snapshot.models {
-            if model.identifier.is_empty()
-                || model.model_key.is_empty()
-                || model.base_key.is_empty()
-                || !identifiers.insert(&model.identifier)
-                || !["llm", "embedding"].contains(&model.namespace.as_str())
-                || !["planned", "unloading", "unloaded", "restoring", "restored"]
-                    .contains(&model.stage.as_str())
-                || !model.load_config["fields"].is_array()
-                || !model.native_config.is_object()
-            {
-                bail!("Invalid recovery model; preserve state.json and inspect manually");
-            }
-        }
-    }
-    Ok(())
+    resume_pending: bool,
+    resume_grace: bool,
+    power_guard: Option<Box<dyn Fn() -> bool + Send>>,
 }
 
 impl<B: Backend> Engine<B> {
     pub fn new(config: Config, backend: B, path: PathBuf) -> Result<Self> {
-        let mut state: Option<Snapshot> = match fs::read_to_string(&path) {
-            Ok(text) => serde_json::from_str(&text)?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e.into()),
+        let recovery = recovery::load(&path, &config)?;
+        let lm = recovery.as_ref().and_then(|journal| {
+            journal
+                .providers
+                .iter()
+                .find(|entry| entry.binding.kind == crate::provider::Kind::LMStudio)
+        });
+        let binding = lm.map(|entry| entry.binding.clone());
+        let state = lm.map(|entry| entry.payload.lm().cloned()).transpose()?;
+        let intent = recovery
+            .as_ref()
+            .map_or(Intent::Reconcile, |journal| journal.session.intent);
+        let remembered_games = recovery
+            .as_ref()
+            .map(|journal| journal.session.games.clone())
+            .unwrap_or_default();
+        let activity = if recovery.is_some() {
+            Activity::Recovery
+        } else {
+            Activity::Unknown
         };
-        if let Some(snapshot) = &mut state {
-            // Older schema-2 empty snapshots omitted the port when the server was stopped.
-            if snapshot.server["running"] == false
-                && snapshot.models.is_empty()
-                && snapshot.server.get("port").is_none()
-            {
-                snapshot.server["port"] = serde_json::json!(
-                    config
-                        .api_host
-                        .rsplit_once(':')
-                        .and_then(|(_, port)| port.parse::<u16>().ok())
-                        .unwrap_or(1234)
-                );
-            }
-            validate_snapshot(snapshot)?;
-        }
-        let remembered_games = state.as_ref().map(|s| s.games.clone()).unwrap_or_default();
         Ok(Self {
             remembered_games,
             backend,
             config,
             state,
+            recovery,
             path,
+            binding,
+            intent,
             message: "Observing games".into(),
             last_error: String::new(),
             disabled: false,
@@ -122,19 +111,250 @@ impl<B: Backend> Engine<B> {
             verify_report: None,
             pause_completions: 0,
             restore_completions: 0,
+            activity,
+            gameplay: GameplayControl::default(),
+            provider_statuses: vec![],
+            provider_progress: None,
+            coordinator_memory: None,
+            adapter_progress: None,
+            ollama_runtime: Default::default(),
+            provider_now: Duration::ZERO,
+            progress: None,
             quiet_since: None,
             retry_at: 0.,
+            resume_pending: false,
+            resume_grace: false,
+            power_guard: None,
         })
     }
-    fn save(&self) -> Result<()> {
-        write_json(&self.path, &self.state)
+    fn save(&mut self) -> Result<()> {
+        // A separate remembered-game/verification save changes the projected view.
+        // Reconcile again before control; the original capture remains in state.
+        self.coordinator_memory = None;
+        self.adapter_progress = None;
+        let journal = self.projected_journal()?;
+        if let Some(journal) = &journal {
+            journal.validate()?;
+        }
+        self.recovery = journal;
+        recovery::save(&self.path, self.recovery.as_ref())
+    }
+    pub fn pending(&self) -> bool {
+        self.recovery.is_some() || self.state.is_some()
+    }
+    pub fn pause_verified(&self) -> bool {
+        if self.resume_pending
+            || self
+                .coordinator_memory
+                .as_ref()
+                .is_some_and(|memory| memory.persistence_pending())
+            || self
+                .state
+                .as_ref()
+                .is_some_and(|snapshot| !snapshot.pause_complete)
+        {
+            return false;
+        }
+        self.providers_paused()
+            && self.recovery.as_ref().map_or_else(
+                || {
+                    self.state
+                        .as_ref()
+                        .is_some_and(|snapshot| snapshot.pause_complete)
+                },
+                |journal| {
+                    journal.providers.iter().all(|entry| match &entry.payload {
+                        crate::recovery::Payload::LMStudio(snapshot) => snapshot.pause_complete,
+                        crate::recovery::Payload::Ollama(snapshot) => snapshot.pause_complete,
+                    })
+                },
+            )
+    }
+    pub fn validate_recovery_edit(&self, updated: &Config) -> Result<()> {
+        let Some(journal) = &self.recovery else {
+            return self.config.validate_recovery_edit(updated);
+        };
+        for entry in journal
+            .providers
+            .iter()
+            .filter(|entry| !entry.restore_complete)
+        {
+            let original = self
+                .config
+                .providers
+                .iter()
+                .find(|provider| provider.id() == entry.binding.id);
+            let replacement = updated
+                .providers
+                .iter()
+                .find(|provider| provider.id() == entry.binding.id);
+            if original != replacement {
+                entry.binding.validate_route(updated).map_err(|error| {
+                    anyhow::anyhow!("{} recovery is pending; {error}", entry.binding.kind.name())
+                })?;
+            }
+        }
+        Ok(())
+    }
+    fn projected_journal(&self) -> Result<Option<Journal>> {
+        let mut journal = self.recovery.clone();
+        if let Some(snapshot) = &self.state {
+            let binding = self
+                .binding
+                .clone()
+                .map(Ok)
+                .unwrap_or_else(|| Binding::capture(&self.config, snapshot))?;
+            if let Some(journal) = &mut journal {
+                let entry = journal
+                    .providers
+                    .iter_mut()
+                    .find(|entry| entry.binding.kind == crate::provider::Kind::LMStudio)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "LM projection has no recovery provider; all recovery retained"
+                        )
+                    })?;
+                if entry.binding != binding {
+                    bail!("LM recovery projection binding changed; all recovery retained");
+                }
+                crate::lm_session::validate_original(entry.payload.lm()?, snapshot)?;
+                entry.payload = crate::recovery::Payload::LMStudio(snapshot.clone());
+                journal.session.games = snapshot.games.clone();
+            } else {
+                journal = Some(Journal::lm(binding, snapshot.clone(), self.intent));
+            }
+        } else if let Some(journal) = &mut journal {
+            journal.session.games = self.remembered_games.clone();
+        }
+        if let Some(journal) = &mut journal {
+            journal.session.intent = self.intent;
+        }
+        Ok(journal)
+    }
+    pub fn observe_progress(&mut self, observer: impl FnMut(Activity) + Send + 'static) {
+        self.progress = Some(Box::new(observer));
+    }
+    pub fn observe_providers(
+        &mut self,
+        observer: impl FnMut(&[crate::coordinator::Report]) + Send + 'static,
+    ) {
+        self.provider_progress = Some(Box::new(observer));
+    }
+    fn providers_paused(&self) -> bool {
+        let enabled = self
+            .config
+            .providers
+            .iter()
+            .filter(|provider| provider.enabled())
+            .collect::<Vec<_>>();
+        // Retain compatibility with pre-coordinator in-memory LM evidence.
+        if self.provider_statuses.is_empty() {
+            return enabled.len() == 1 && enabled[0].kind() == crate::provider::Kind::LMStudio;
+        }
+        !enabled.is_empty()
+            && enabled.iter().all(|provider| {
+                self.provider_statuses.iter().any(|report| {
+                    report.id == provider.id()
+                        && report.kind == provider.kind()
+                        && report.state == crate::coordinator::State::Paused
+                })
+            })
+    }
+    fn set_activity(&mut self, activity: Activity) {
+        self.activity = activity;
+        if activity.busy() {
+            self.message = activity.progress_message().into();
+        }
+        if let Some(observer) = &mut self.progress {
+            observer(activity);
+        }
+    }
+    pub fn provider_pending(&self, kind: crate::provider::Kind) -> bool {
+        self.recovery.as_ref().map_or(
+            kind == crate::provider::Kind::LMStudio && self.state.is_some(),
+            |journal| {
+                journal
+                    .providers
+                    .iter()
+                    .any(|entry| entry.binding.kind == kind && !entry.restore_complete)
+            },
+        )
     }
     pub fn settings_changed(&mut self) {
+        if !self.provider_pending(crate::provider::Kind::Ollama) {
+            self.ollama_runtime = Default::default();
+        }
+        self.retry_providers();
         self.retry_at = 0.;
         self.disabled = false;
     }
+    /// Power events carry no game/provider evidence and authorize no mutation.
+    pub fn resume_detected(&mut self) {
+        self.resume_pending = true;
+        self.resume_grace = true;
+        self.retry_at = 0.;
+        self.quiet_since = None;
+        self.gameplay.invalidate_offer();
+        self.provider_statuses.clear();
+        self.set_activity(Activity::DetectionUnavailable);
+        self.message =
+            "Windows resumed; waiting for fresh game detection before reconciling saved AI.".into();
+    }
+    pub fn observe_power(&mut self, interrupted: impl Fn() -> bool + Send + 'static) {
+        self.power_guard = Some(Box::new(interrupted));
+    }
+    pub fn awaiting_resume_detection(&self) -> bool {
+        self.resume_pending
+    }
+    fn power_interrupted(&self) -> bool {
+        self.power_guard.as_ref().is_some_and(|guard| guard())
+    }
+    fn reconcile_resumed(&mut self) -> Result<()> {
+        let mut journal = self.projected_journal()?;
+        if let Some(journal) = &mut journal {
+            for entry in journal
+                .providers
+                .iter_mut()
+                .filter(|entry| !entry.restore_complete)
+            {
+                match &mut entry.payload {
+                    crate::recovery::Payload::LMStudio(snapshot) => snapshot.pause_complete = false,
+                    crate::recovery::Payload::Ollama(snapshot) => {
+                        if journal.session.intent == Intent::Pause {
+                            snapshot.begin();
+                        } else {
+                            snapshot.pause_complete = false;
+                        }
+                    }
+                }
+            }
+            journal.validate()?;
+            // Invalidate completion evidence durably before any further control.
+            // A failed save leaves the original authority and resume gate intact.
+            recovery::save(&self.path, Some(journal))?;
+        }
+        self.recovery = journal;
+        let lm = self.recovery.as_ref().and_then(|journal| {
+            journal
+                .providers
+                .iter()
+                .find(|entry| entry.binding.kind == crate::provider::Kind::LMStudio)
+        });
+        self.binding = lm.map(|entry| entry.binding.clone());
+        self.state = lm.map(|entry| entry.payload.lm().cloned()).transpose()?;
+        self.coordinator_memory = None;
+        self.adapter_progress = None;
+        self.retry_at = 0.;
+        self.resume_pending = false;
+        Ok(())
+    }
+    pub fn request_manual_pause(&mut self) {
+        self.retry_providers();
+        self.manual_pause = true;
+        self.retry_at = 0.;
+    }
     pub fn remember_games(&mut self, games: Vec<crate::discovery::Game>) -> Result<()> {
-        if self.state.is_none() {
+        if !self.pending() {
             self.remembered_games = games;
             return Ok(());
         }
@@ -148,17 +368,41 @@ impl<B: Backend> Engine<B> {
             }
         }
         if changed {
-            self.state.as_mut().unwrap().games = self.remembered_games.clone();
+            if let Some(snapshot) = &mut self.state {
+                snapshot.games = self.remembered_games.clone();
+            }
             self.save()?;
         }
         Ok(())
     }
     pub fn step(&mut self, gaming: bool, now: f64, cancelled: &mut dyn FnMut() -> bool) {
+        if self.resume_pending {
+            self.set_activity(Activity::DetectionUnavailable);
+            self.message =
+                "Windows resumed; fresh game detection is required before AI control.".into();
+            return;
+        }
+        if now.is_finite() && now >= 0. {
+            self.provider_now = Duration::from_secs_f64(now);
+        }
+        if !self
+            .config
+            .providers
+            .iter()
+            .any(|provider| provider.enabled())
+            && !self.pending()
+        {
+            self.set_activity(Activity::Watching);
+            self.message = "No AI provider is enabled; choose one in Advanced settings".into();
+            return;
+        }
         if self.disabled {
+            self.set_activity(Activity::DetectionUnavailable);
             self.message = "Detection disabled; recovery retained".into();
             return;
         }
         if self.config.mode == "observe" {
+            self.set_activity(Activity::Observation);
             self.message = if gaming {
                 "Would pause AI: game detected"
             } else {
@@ -168,11 +412,13 @@ impl<B: Backend> Engine<B> {
             return;
         }
         if !self.config.automation_enabled && !self.manual_pause {
-            if self.state.is_none() {
+            if !self.pending() {
+                self.set_activity(Activity::Watching);
                 self.message = "Automatic pausing is off".into();
                 return;
             }
             if gaming {
+                self.set_activity(Activity::Recovery);
                 self.quiet_since = None;
                 self.message =
                     "Automatic pausing is off; saved AI will return after the game exits".into();
@@ -180,25 +426,147 @@ impl<B: Backend> Engine<B> {
             }
         }
         if gaming || self.manual_pause {
+            self.resume_grace = false;
             self.quiet_since = None;
-            if now >= self.retry_at {
-                let result = self.pause();
+            if self.provider_work_ready(Intent::Pause, now) || self.pause_verified() {
+                let result = self.pause_guarded(&mut || false);
                 self.attempt(result, now);
             }
-        } else if self.state.is_some() {
+        } else if self.pending() {
             let since = *self.quiet_since.get_or_insert(now);
             let remaining = self.config.restore_delay_seconds - (now - since);
             if remaining > 0. {
-                self.message = format!("Restoring AI in {}s", remaining.ceil() as u64);
-            } else if now >= self.retry_at {
-                let result = self.restore(cancelled);
+                if self.resume_grace {
+                    self.set_activity(Activity::Recovery);
+                    self.message = format!(
+                        "Windows resumed; saved AI recovery in {}s after fresh game detection.",
+                        remaining.ceil() as u64
+                    );
+                } else if self.pause_verified() {
+                    self.set_activity(Activity::Countdown);
+                    self.message = format!("Restoring AI in {}s", remaining.ceil() as u64);
+                } else {
+                    self.set_activity(Activity::Recovery);
+                    self.message = format!(
+                        "AI recovery in {}s; pause was incomplete. {}",
+                        remaining.ceil() as u64,
+                        self.last_error
+                    );
+                }
+            } else if self.provider_work_ready(Intent::Restore, now) {
+                let result = self.restore_checked(cancelled, false);
                 self.restore_failed = true;
                 self.attempt(result, now);
             }
         } else {
+            self.resume_grace = false;
+            self.set_activity(Activity::Watching);
             self.last_error.clear();
+            self.provider_statuses.clear();
+            if let Some(observer) = &mut self.provider_progress {
+                observer(&self.provider_statuses);
+            }
             self.retry_at = 0.;
-            self.message = "AI available".into();
+            self.message = "Watching games; LM Studio state has not been probed".into();
+        }
+    }
+    /// The explicit gameplay path is the only caller that can use transient
+    /// authority. Ordinary restore and verification retain their supplied guards.
+    pub fn restore_gameplay(
+        &mut self,
+        scan: &mut dyn FnMut() -> Option<GameEvidence>,
+    ) -> Result<()> {
+        self.restore_gameplay_checked(scan, true)
+    }
+    fn restore_gameplay_checked(
+        &mut self,
+        scan: &mut dyn FnMut() -> Option<GameEvidence>,
+        explicit: bool,
+    ) -> Result<()> {
+        if explicit {
+            self.retry_providers();
+        }
+        let mut policy = std::mem::take(&mut self.gameplay);
+        if self.config.mode != "active" || self.disabled {
+            policy.revoke();
+        }
+        policy.reconcile(scan().as_ref());
+        let result = if policy.active() && self.config.mode == "active" && !self.disabled {
+            self.manual_pause = false;
+            self.restore_checked(
+                &mut || {
+                    policy.reconcile(scan().as_ref());
+                    !policy.active()
+                },
+                false,
+            )
+        } else {
+            bail_gameplay_refused()
+        };
+        self.gameplay = policy;
+        if self.gameplay.active() && !self.pending() && result.is_ok() {
+            self.set_activity(Activity::Coexistence);
+            self.message = "LM Studio: AI restored during gameplay by your choice; automatic pausing is temporarily overridden. Pause AI ends the override.".into();
+        }
+        result
+    }
+    pub fn step_games(
+        &mut self,
+        evidence: Option<GameEvidence>,
+        now: f64,
+        scan: &mut dyn FnMut() -> Option<GameEvidence>,
+    ) {
+        if now.is_finite() && now >= 0. {
+            self.provider_now = Duration::from_secs_f64(now);
+        }
+        if self.config.mode != "active" || self.disabled {
+            self.gameplay.revoke();
+        }
+        self.gameplay.reconcile(evidence.as_ref());
+        let Some(evidence) = evidence.filter(|e| e.reliable()) else {
+            self.quiet_since = None;
+            self.set_activity(Activity::DetectionUnavailable);
+            self.message =
+                "Game detection is unknown; gameplay approval revoked and recovery held".into();
+            return;
+        };
+        if self.resume_pending && self.config.mode == "observe" {
+            self.set_activity(Activity::Observation);
+            self.message =
+                "Windows resumed; observing fresh games. AI and saved recovery are unchanged."
+                    .into();
+            return;
+        }
+        if self.resume_pending && now < self.retry_at {
+            return;
+        }
+        if self.resume_pending
+            && let Err(error) = self.reconcile_resumed()
+        {
+            self.set_activity(Activity::PartialFailure);
+            self.last_error = format!("{error:#}");
+            self.message = format!(
+                "Resume reconciliation could not save recovery; AI control held. {}",
+                self.last_error
+            );
+            self.retry_at = now + self.config.retry_seconds;
+            return;
+        }
+        if self.gameplay.active() {
+            self.resume_grace = false;
+            if !self.pending() {
+                self.set_activity(Activity::Coexistence);
+                self.message = "LM Studio: AI restored during gameplay by your choice; automatic pausing is temporarily overridden. Pause AI ends the override.".into();
+            } else if self.provider_work_ready(Intent::Restore, now) {
+                let result = self.restore_gameplay_checked(scan, false);
+                self.restore_failed = true;
+                self.attempt(result, now);
+            }
+        } else {
+            let gaming = !evidence.triggers.is_empty() || (self.pending() && evidence.gaming());
+            self.step(gaming, now, &mut || {
+                scan().is_none_or(|e| !e.reliable() || e.gaming())
+            });
         }
     }
     pub fn attempt(&mut self, result: Result<()>, now: f64) {
@@ -212,8 +580,17 @@ impl<B: Backend> Engine<B> {
                 self.retry_at = 0.;
             }
             Err(e) => {
+                let busy = e.downcast_ref::<crate::provider::InferenceBusy>().is_some();
+                self.set_activity(if busy {
+                    Activity::WaitingForInference
+                } else {
+                    Activity::PartialFailure
+                });
                 self.last_error = format!("{e:#}");
-                self.message = if was_restore {
+                self.message = if busy {
+                    "LM Studio: waiting for active inference to finish; AI has not been paused"
+                        .into()
+                } else if was_restore {
                     format!("Restore failed — AI not restored: {}", self.last_error)
                 } else {
                     format!("Needs attention: {}", self.last_error)
@@ -223,52 +600,199 @@ impl<B: Backend> Engine<B> {
         }
     }
     pub fn pause(&mut self) -> Result<()> {
+        self.retry_providers();
         self.pause_guarded(&mut || false)
     }
     fn pause_guarded(&mut self, cancelled: &mut dyn FnMut() -> bool) -> Result<()> {
-        if self.state.as_ref().is_some_and(|s| s.pause_complete) {
-            self.message = "AI paused for gaming".into();
+        self.pause_scoped(cancelled, false)
+    }
+    fn pause_scoped(&mut self, cancelled: &mut dyn FnMut() -> bool, only_lm: bool) -> Result<()> {
+        if self.resume_pending || self.power_interrupted() {
+            bail!("Power state changed; pause held until fresh resume reconciliation");
+        }
+        if !self
+            .config
+            .providers
+            .iter()
+            .any(|provider| provider.enabled())
+        {
+            bail!("No AI provider is enabled; no pause was started");
+        }
+        if self.pause_verified() && self.activity != Activity::Recovery {
+            self.set_activity(if self.manual_pause {
+                Activity::ManualHold
+            } else {
+                Activity::Paused
+            });
+            self.message = if self.manual_pause {
+                "AI paused by you; choose Resume AI to release the hold"
+            } else {
+                "AI paused for gaming"
+            }
+            .into();
             return Ok(());
         }
-        if self.state.is_none() {
-            let snapshot = self.backend.snapshot()?;
-            validate_snapshot(&snapshot)?;
-            self.state = Some(snapshot);
-            self.state.as_mut().unwrap().games = self.remembered_games.clone();
-            self.save()?;
-        }
-        if self.config.stop_server_during_gaming
-            && (self.state.as_ref().unwrap().server["running"] == true
-                || self.state.as_ref().unwrap().server_stopped)
-        {
-            self.state.as_mut().unwrap().server_stopped = true;
-            self.save()?;
-            self.backend.stop_server()?;
-        }
-        let count = self.state.as_ref().unwrap().models.len();
-        for index in 0..count {
-            if cancelled() {
-                bail!("Game detected; recovery retained");
-            }
-            let model = self.state.as_ref().unwrap().models[index].clone();
-            if ["planned", "unloading", "restoring", "restored"].contains(&model.stage.as_str()) {
-                let loaded = self.backend.loaded()?;
-                self.state.as_mut().unwrap().models[index].stage = "unloading".into();
-                self.save()?;
-                if loaded.iter().any(|m| m["identifier"] == model.identifier) {
-                    self.backend.unload(&model.identifier)?;
-                }
-                self.state.as_mut().unwrap().models[index].stage = "unloaded".into();
-                self.save()?;
-            }
-        }
-        self.state.as_mut().unwrap().pause_complete = true;
-        self.save()?;
+        self.pause_units(cancelled, only_lm)?;
         self.pause_completions += 1;
-        self.message = "AI paused for gaming".into();
+        self.set_activity(if self.manual_pause {
+            Activity::ManualHold
+        } else {
+            Activity::Paused
+        });
+        self.message = if self.manual_pause {
+            "AI paused by you; choose Resume AI to release the hold"
+        } else {
+            "AI paused for gaming"
+        }
+        .into();
         Ok(())
     }
+    fn pause_units(&mut self, cancelled: &mut dyn FnMut() -> bool, only_lm: bool) -> Result<()> {
+        use crate::coordinator::{Coordinator, JournalFile, State, Step};
+        let journal = self.projected_journal()?;
+        let memory = self.take_continuation(&journal)?;
+        let progress = if memory.is_some() {
+            self.adapter_progress.take().unwrap_or_default()
+        } else {
+            Default::default()
+        };
+        self.set_activity(if !self.pending() {
+            Activity::Capturing
+        } else {
+            Activity::Unloading
+        });
+        let power_guard = &self.power_guard;
+        let runtime = crate::provider_runtime::Providers::new(
+            &mut self.backend,
+            self.config.clone(),
+            false,
+            &mut self.ollama_runtime,
+        )
+        .with_progress(progress);
+        let mut bindings = runtime.bindings()?;
+        if only_lm {
+            bindings.retain(|binding| binding.kind == crate::provider::Kind::LMStudio);
+        }
+        let overhead = bindings.len().saturating_mul(2).saturating_add(4);
+        let mut coordinator = if let Some(memory) = memory {
+            Coordinator::resume(
+                runtime,
+                JournalFile(self.path.clone()),
+                bindings,
+                memory,
+                Duration::from_secs_f64(self.config.retry_seconds),
+            )?
+        } else {
+            Coordinator::new(
+                runtime,
+                JournalFile(self.path.clone()),
+                bindings,
+                journal,
+                Duration::from_secs_f64(self.config.retry_seconds),
+            )?
+        };
+        let began = Instant::now();
+        let mut units = 0usize;
+        let result = (|| {
+            loop {
+                let now = self.provider_now.saturating_add(began.elapsed());
+                let result =
+                    coordinator.advance(Intent::Pause, &self.remembered_games, now, &mut || {
+                        power_guard.as_ref().is_some_and(|guard| guard()) || cancelled()
+                    });
+                if let Some(journal) = coordinator.journal() {
+                    self.recovery = Some(journal.clone());
+                    let lm = journal
+                        .providers
+                        .iter()
+                        .find(|entry| entry.binding.kind == crate::provider::Kind::LMStudio);
+                    self.binding = lm.map(|entry| entry.binding.clone());
+                    self.state = lm.map(|entry| entry.payload.lm().cloned()).transpose()?;
+                    self.intent = journal.session.intent;
+                    if coordinator.persistence_pending()
+                        && let Some(snapshot) = &mut self.state
+                    {
+                        snapshot.pause_complete = false;
+                    }
+                } else {
+                    // A verified retired session can clear before a new capture.
+                    self.recovery = None;
+                    self.state = None;
+                    self.binding = None;
+                }
+                self.provider_statuses = coordinator.reports(now);
+                if let Some(observer) = &mut self.provider_progress {
+                    observer(&self.provider_statuses);
+                }
+                let step = result?;
+                if step == Step::Interrupted {
+                    if power_guard.as_ref().is_some_and(|guard| guard()) {
+                        bail!("Power state changed; pause interrupted and recovery retained");
+                    }
+                    bail!("Game detected; recovery retained");
+                }
+                if step == Step::Idle {
+                    let failures = coordinator
+                        .reports(now)
+                        .into_iter()
+                        .filter(|status| status.state == State::Failed)
+                        .map(|status| format!("{}: {}", status.kind.name(), status.error))
+                        .collect::<Vec<_>>();
+                    if !failures.is_empty() {
+                        bail!("{}", failures.join("; "));
+                    }
+                    if coordinator
+                        .statuses()
+                        .values()
+                        .any(|status| status.state == State::Deferred)
+                    {
+                        return Err(crate::provider::InferenceBusy.into());
+                    }
+                    bail!("Provider pause is incomplete; recovery retained");
+                }
+                if coordinator.pause_complete() {
+                    return Ok(());
+                }
+                if step == Step::Captured {
+                    self.activity = Activity::Unloading;
+                    self.message = Activity::Unloading.progress_message().into();
+                    if let Some(observer) = &mut self.progress {
+                        observer(Activity::Unloading);
+                    }
+                }
+                units += 1;
+                if units
+                    > self
+                        .recovery
+                        .as_ref()
+                        .map_or(0, |journal| {
+                            journal
+                                .providers
+                                .iter()
+                                .map(|entry| match &entry.payload {
+                                    crate::recovery::Payload::LMStudio(snapshot) => {
+                                        snapshot.models.len()
+                                    }
+                                    crate::recovery::Payload::Ollama(snapshot) => {
+                                        snapshot.models.len()
+                                    }
+                                })
+                                .sum::<usize>()
+                        })
+                        .saturating_add(overhead)
+                {
+                    bail!("Provider pause did not converge; recovery retained");
+                }
+            }
+        })();
+        let (runtime, _, memory) = coordinator.into_parts();
+        self.adapter_progress = Some(runtime.router.lm.progress());
+        drop(runtime);
+        self.coordinator_memory = Some(memory);
+        result
+    }
     pub fn restore(&mut self, cancelled: &mut dyn FnMut() -> bool) -> Result<()> {
+        self.retry_providers();
         self.restore_checked(cancelled, false)
     }
     fn restore_checked(
@@ -276,71 +800,203 @@ impl<B: Backend> Engine<B> {
         cancelled: &mut dyn FnMut() -> bool,
         compare: bool,
     ) -> Result<()> {
-        if self.state.is_none() {
+        if self.resume_pending || self.power_interrupted() {
+            bail!("Power state changed; restore held until fresh resume reconciliation");
+        }
+        if !self.pending() {
             return Ok(());
         }
+        if !self
+            .config
+            .providers
+            .iter()
+            .any(|provider| provider.enabled())
+            && !self
+                .recovery
+                .as_ref()
+                .is_some_and(|journal| journal.providers.iter().all(|entry| entry.restore_complete))
+        {
+            bail!("LM Studio recovery is pending; re-enable its provider. Recovery retained");
+        }
         if cancelled() {
+            self.set_activity(Activity::Recovery);
             self.message = "Game restarted; restoration deferred".into();
             return Ok(());
         }
-        self.state.as_mut().unwrap().pause_complete = false;
-        self.save()?;
-        let needs_server = self
-            .state
-            .as_ref()
-            .is_some_and(|state| state.server_stopped || !state.models.is_empty());
-        if needs_server {
-            // Persist control-server intent so a game interrupt can close a server we opened.
-            self.state.as_mut().unwrap().server_stopped = true;
-            self.save()?;
-            let state = self.state.as_ref().unwrap();
-            self.backend
-                .ensure_server(state.server["port"].as_u64().unwrap_or(1234) as u16)?;
-        }
-        let mut failures = Vec::new();
-        for index in 0..self.state.as_ref().unwrap().models.len() {
-            if cancelled() {
+        self.set_activity(Activity::Restoring);
+        if !self.restore_units(cancelled, compare)? {
+            if self.power_interrupted() {
+                self.set_activity(Activity::DetectionUnavailable);
+                self.message =
+                    "Power state changed; restoration held and saved recovery retained.".into();
+            } else {
+                self.set_activity(Activity::Recovery);
                 self.message = "Game restarted; restoration interrupted".into();
-                return Ok(());
             }
-            let model = self.state.as_ref().unwrap().models[index].clone();
-            if ["unloading", "unloaded", "restoring", "restored"].contains(&model.stage.as_str()) {
-                self.state.as_mut().unwrap().models[index].stage = "restoring".into();
-                self.save()?;
-                let restored = self.backend.restore(&model).and_then(|()| {
-                    if compare {
-                        compare_fields(&model.load_config, &self.backend.read_config(&model)?)?;
-                    }
-                    Ok(())
-                });
-                if let Err(error) = restored {
-                    failures.push(format!("{}: {error:#}", model.identifier));
-                    continue;
-                }
-                self.state.as_mut().unwrap().models[index].stage = "restored".into();
-                self.save()?;
-            }
-        }
-        if cancelled() {
-            self.message = "Game restarted; restoration interrupted".into();
             return Ok(());
         }
-        if !failures.is_empty() {
-            bail!("{}; recovery retained", failures.join("; "));
-        }
-        if self.state.as_ref().unwrap().server["running"] != true
-            && self.state.as_ref().unwrap().server_stopped
-        {
-            self.backend.stop_server()?;
-        }
-        // Do not forget pending recovery until clearing the disk succeeds.
-        write_json(&self.path, &Option::<Snapshot>::None)?;
         self.state = None;
+        self.recovery = None;
+        self.binding = None;
+        self.coordinator_memory = None;
+        self.adapter_progress = None;
+        self.intent = Intent::Reconcile;
         self.remembered_games.clear();
         self.quiet_since = None;
         self.restore_completions += 1;
+        self.set_activity(Activity::Watching);
         self.message = "AI restored".into();
         Ok(())
+    }
+    /// Drain serial restore units, including healthy models after a local failure.
+    /// A fresh game guard still runs at every coordinator boundary.
+    fn restore_units(
+        &mut self,
+        cancelled: &mut dyn FnMut() -> bool,
+        compare: bool,
+    ) -> Result<bool> {
+        use crate::coordinator::{Coordinator, JournalFile, Step};
+        let journal = self.projected_journal()?;
+        let limit = journal
+            .as_ref()
+            .map_or(0, |journal| {
+                journal
+                    .providers
+                    .iter()
+                    .map(|entry| match &entry.payload {
+                        crate::recovery::Payload::LMStudio(snapshot) => snapshot.models.len(),
+                        crate::recovery::Payload::Ollama(snapshot) => snapshot.models.len(),
+                    })
+                    .sum::<usize>()
+                    .saturating_mul(2)
+                    .saturating_add(journal.providers.len().saturating_mul(4))
+            })
+            .saturating_add(6);
+        let memory = self.take_continuation(&journal)?;
+        let progress = if memory.is_some() {
+            self.adapter_progress.take().unwrap_or_default()
+        } else {
+            Default::default()
+        };
+        let power_guard = &self.power_guard;
+        let runtime = crate::provider_runtime::Providers::new(
+            &mut self.backend,
+            self.config.clone(),
+            compare,
+            &mut self.ollama_runtime,
+        )
+        .with_progress(progress);
+        let mut bindings = runtime.bindings()?;
+        if compare {
+            // Raw round-trip verification is an LM capability, independent of Ollama opt-in.
+            bindings.retain(|binding| binding.kind == crate::provider::Kind::LMStudio);
+        }
+        let mut coordinator = if let Some(memory) = memory {
+            Coordinator::resume(
+                runtime,
+                JournalFile(self.path.clone()),
+                bindings,
+                memory,
+                Duration::from_secs_f64(self.config.retry_seconds),
+            )?
+        } else {
+            Coordinator::new(
+                runtime,
+                JournalFile(self.path.clone()),
+                bindings,
+                journal,
+                Duration::from_secs_f64(self.config.retry_seconds),
+            )?
+        };
+        let began = Instant::now();
+        let result = (|| {
+            for _ in 0..limit {
+                let now = self.provider_now.saturating_add(began.elapsed());
+                let result =
+                    coordinator.advance(Intent::Restore, &self.remembered_games, now, &mut || {
+                        power_guard.as_ref().is_some_and(|guard| guard()) || cancelled()
+                    });
+                // Preserve durable/dirty progress on every result, including failed writes.
+                if let Some(journal) = coordinator.journal() {
+                    self.recovery = Some(journal.clone());
+                    let lm = journal
+                        .providers
+                        .iter()
+                        .find(|entry| entry.binding.kind == crate::provider::Kind::LMStudio);
+                    self.binding = lm.map(|entry| entry.binding.clone());
+                    self.state = lm.map(|entry| entry.payload.lm().cloned()).transpose()?;
+                    self.intent = journal.session.intent;
+                    if coordinator.persistence_pending()
+                        && let Some(snapshot) = &mut self.state
+                    {
+                        snapshot.pause_complete = false;
+                    }
+                }
+                self.provider_statuses = coordinator.reports(now);
+                if let Some(observer) = &mut self.provider_progress {
+                    observer(&self.provider_statuses);
+                }
+                match result? {
+                    Step::Completed => return Ok(true),
+                    Step::Interrupted => return Ok(false),
+                    Step::Idle => {
+                        let failures = coordinator
+                            .reports(now)
+                            .into_iter()
+                            .filter(|status| !status.error.is_empty())
+                            .map(|status| format!("{}: {}", status.kind.name(), status.error))
+                            .collect::<Vec<_>>();
+                        bail!("{}; recovery retained", failures.join("; "));
+                    }
+                    _ => {}
+                }
+            }
+            bail!("Provider restoration did not converge; recovery retained")
+        })();
+        let (runtime, _, memory) = coordinator.into_parts();
+        self.adapter_progress = Some(runtime.router.lm.progress());
+        drop(runtime);
+        self.coordinator_memory = Some(memory);
+        result
+    }
+    fn provider_work_ready(&self, intent: Intent, now: f64) -> bool {
+        self.coordinator_memory
+            .as_ref()
+            .map_or(now >= self.retry_at, |memory| {
+                if memory.persistence_pending() {
+                    now >= self.retry_at
+                } else {
+                    memory.ready(intent, self.provider_now)
+                }
+            })
+    }
+    fn retry_providers(&mut self) {
+        if let Some(memory) = &mut self.coordinator_memory {
+            memory.request_retry();
+        }
+    }
+    fn take_continuation(
+        &mut self,
+        journal: &Option<Journal>,
+    ) -> Result<Option<crate::coordinator::Continuation<crate::recovery::Payload>>> {
+        if let Some(memory) = &self.coordinator_memory {
+            let mut expected = memory.journal().cloned();
+            if let Some(expected) = &mut expected {
+                for entry in &mut expected.providers {
+                    if memory.persistence_pending()
+                        && let crate::recovery::Payload::LMStudio(snapshot) = &mut entry.payload
+                    {
+                        snapshot.pause_complete = false;
+                    }
+                }
+            }
+            if &expected != journal {
+                bail!(
+                    "Recovery view changed outside the coordinator; control held and recovery retained"
+                );
+            }
+        }
+        Ok(self.coordinator_memory.take())
     }
     /// Round-trip the live models through the same durable journal as gaming.
     /// The caller supplies a fail-closed game/quit guard checked between stages.
@@ -349,9 +1005,10 @@ impl<B: Backend> Engine<B> {
         let mut phase = "guard";
         let result = (|| -> Result<()> {
             if self.config.mode != "active"
+                || !self.config.lm_enabled()
                 || self.disabled
                 || self.manual_pause
-                || self.state.is_some()
+                || self.pending()
             {
                 bail!(
                     "Verification unavailable in observe/disabled/paused mode or while recovery is pending"
@@ -363,9 +1020,11 @@ impl<B: Backend> Engine<B> {
                 );
             }
             phase = "capture";
-            let snapshot = self.backend.snapshot()?;
-            validate_snapshot(&snapshot)?;
-            // A newly created transaction is schema 2 and remains readable by older builds.
+            self.set_activity(Activity::Verifying);
+            let snapshot = self.backend.capture()?;
+            snapshot.validate_recovery()?;
+            self.intent = Intent::Pause;
+            // The adapter payload stays schema 2 inside the guarded schema-3 envelope.
             self.state = Some(snapshot);
             self.save()?;
             steps.push(VerifyStep {
@@ -373,7 +1032,7 @@ impl<B: Backend> Engine<B> {
                 ok: true,
                 detail: "Snapshot persisted before unloading".into(),
             });
-            let unloaded = self.pause_guarded(cancelled);
+            let unloaded = self.pause_scoped(cancelled, true);
             steps.push(VerifyStep {
                 name: "unload".into(),
                 ok: unloaded.is_ok(),
@@ -385,7 +1044,7 @@ impl<B: Backend> Engine<B> {
             });
             // Even a partial unload must be recovered; retain the original failure.
             let check = if unloaded.is_ok() {
-                self.backend.loaded().and_then(|models| {
+                self.backend.resident_keys().and_then(|models| {
                     if !models.is_empty() {
                         bail!("Models still loaded after unload");
                     }
@@ -406,7 +1065,7 @@ impl<B: Backend> Engine<B> {
                 });
             }
             let recovered = self.restore_checked(cancelled, true).and_then(|()| {
-                if self.state.is_some() {
+                if self.pending() {
                     bail!("Game detected; restoration deferred, recovery pending");
                 }
                 Ok(())
@@ -444,6 +1103,7 @@ impl<B: Backend> Engine<B> {
                 });
             }
             self.last_error = format!("{error:#}");
+            self.set_activity(Activity::PartialFailure);
         }
         let ok = !steps.is_empty() && steps.iter().all(|s| s.ok);
         if ok {
@@ -454,7 +1114,7 @@ impl<B: Backend> Engine<B> {
         } else {
             format!(
                 "Round-trip verify failed{}: {}",
-                if self.state.is_some() {
+                if self.pending() {
                     " — recovery pending"
                 } else {
                     ""
@@ -466,6 +1126,10 @@ impl<B: Backend> Engine<B> {
         self.verify_report = Some(report.clone());
         report
     }
+}
+
+fn bail_gameplay_refused() -> Result<()> {
+    bail!("Gameplay Restore approval is no longer valid; recovery retained")
 }
 
 #[cfg(test)]
@@ -486,10 +1150,12 @@ mod tests {
         fail_start: bool,
         events: Vec<String>,
         fail_unload: Option<String>,
+        delayed_unload: bool,
         fail_restore: Option<String>,
         fail_stop: bool,
         fail_read: Option<String>,
         fail_loaded_on: Option<usize>,
+        lock_loaded_on: Option<usize>,
         loaded_calls: usize,
         lock_after_unload: bool,
         lock_after_restore: bool,
@@ -500,6 +1166,7 @@ mod tests {
         /// captured `load_config` (temperature 0.999 vs 0.7), so the P2-1
         /// round-trip verify reports the exact failing field.
         mutate_read: bool,
+        power_on: Option<(String, std::sync::Arc<crate::power::Signal>)>,
     }
     impl Fake {
         fn new() -> Self {
@@ -510,10 +1177,12 @@ mod tests {
                 fail_start: false,
                 events: vec![],
                 fail_unload: None,
+                delayed_unload: false,
                 fail_restore: None,
                 fail_stop: false,
                 fail_read: None,
                 fail_loaded_on: None,
+                lock_loaded_on: None,
                 loaded_calls: 0,
                 lock_after_unload: false,
                 lock_after_restore: false,
@@ -521,6 +1190,7 @@ mod tests {
                 held_lock: None,
                 journal: PathBuf::new(),
                 mutate_read: false,
+                power_on: None,
             }
         }
     }
@@ -537,7 +1207,23 @@ mod tests {
         }
     }
     impl Backend for Fake {
+        fn verify_restored(&mut self, model: &Model) -> Result<()> {
+            if !self.running || !self.current.contains(&model.identifier) {
+                bail!("Restored model is missing");
+            }
+            Ok(())
+        }
+        fn server_state(&mut self) -> Result<Value> {
+            Ok(json!({"running":self.running,"port":self.port}))
+        }
         fn snapshot(&mut self) -> Result<Snapshot> {
+            if self
+                .power_on
+                .as_ref()
+                .is_some_and(|(event, _)| event == "snapshot")
+            {
+                self.power_on.take().unwrap().1.notify(4);
+            }
             self.events.push("snapshot".into());
             Ok(Snapshot {
                 games: vec![],
@@ -576,6 +1262,9 @@ mod tests {
             if self.fail_loaded_on == Some(self.loaded_calls) {
                 bail!("Inventory read failed");
             }
+            if self.lock_loaded_on == Some(self.loaded_calls) {
+                self.lock_journal();
+            }
             Ok(self
                 .current
                 .iter()
@@ -612,15 +1301,29 @@ mod tests {
             Ok(())
         }
         fn unload(&mut self, id: &str) -> Result<()> {
+            if self
+                .power_on
+                .as_ref()
+                .is_some_and(|(event, _)| event == &format!("unload:{id}"))
+            {
+                self.power_on.take().unwrap().1.notify(4);
+            }
             // The "unloading" journal-entry assertion documents the pause-flow
             // invariant. It only applies when a recovery journal actually
             // exists; a self-contained verify (P2-1) unloads without one.
             if self.journal.as_os_str().is_empty() || self.journal.exists() {
-                let disk: Option<Snapshot> =
+                let disk: Option<Journal> =
                     serde_json::from_str(&fs::read_to_string(&self.journal)?).unwrap();
+                let journal = disk.unwrap();
+                let intent = journal.session.intent;
+                let disk = journal
+                    .providers
+                    .iter()
+                    .find_map(|entry| entry.payload.lm().ok())
+                    .unwrap();
+                assert_eq!(intent, Intent::Pause);
                 assert!(
-                    disk.unwrap()
-                        .models
+                    disk.models
                         .iter()
                         .any(|m| m.identifier == id && m.stage == "unloading")
                 );
@@ -629,13 +1332,36 @@ mod tests {
             if self.fail_unload.as_deref() == Some(id) {
                 bail!("unload failed");
             }
-            self.current.remove(id);
+            if !self.delayed_unload {
+                self.current.remove(id);
+            }
             if self.lock_after_unload {
                 self.lock_journal();
             }
             Ok(())
         }
         fn restore(&mut self, m: &Model) -> Result<()> {
+            if self
+                .power_on
+                .as_ref()
+                .is_some_and(|(event, _)| event == &format!("restore:{}", m.identifier))
+            {
+                self.power_on.take().unwrap().1.notify(4);
+            }
+            let disk: Journal = serde_json::from_str(&fs::read_to_string(&self.journal)?).unwrap();
+            let intent = disk.session.intent;
+            let snapshot = disk
+                .providers
+                .iter()
+                .find_map(|entry| entry.payload.lm().ok())
+                .unwrap();
+            assert_eq!(intent, Intent::Restore);
+            assert!(
+                snapshot
+                    .models
+                    .iter()
+                    .any(|model| model.identifier == m.identifier && model.stage == "restoring")
+            );
             if !self.running {
                 bail!("REST/WS server is stopped");
             }
@@ -673,6 +1399,1204 @@ mod tests {
             folder.join("state.json"),
         )
         .unwrap()
+    }
+    fn has_restored_model(path: &std::path::Path) -> bool {
+        let journal: Journal = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        let snapshot = journal.providers[0].payload.lm().unwrap();
+        journal.session.intent == Intent::Restore
+            && snapshot
+                .models
+                .iter()
+                .any(|model| model.stage == "restored")
+    }
+    fn prepare_gameplay(e: &mut Engine<Fake>, evidence: &GameEvidence) -> u64 {
+        e.remember_games(
+            evidence
+                .all
+                .iter()
+                .map(|game| {
+                    crate::discovery::Game::new(&game.launcher, "fixture", &game.game, &game.path)
+                })
+                .collect(),
+        )
+        .unwrap();
+        e.pause().unwrap();
+        e.gameplay.refresh_offer(Some(evidence), true);
+        e.gameplay.offer().unwrap().id
+    }
+    #[test]
+    fn resume_restarts_grace_after_reliable_detection_and_preserves_original_capture() {
+        use crate::gameplay::fixtures::evidence;
+        let mut e = engine(Fake::new());
+        e.pause().unwrap();
+        let original = e.state.clone().unwrap();
+        e.step_games(Some(evidence(vec![])), 0., &mut || Some(evidence(vec![])));
+        e.resume_detected();
+        assert!(!e.pause_verified());
+        let events = e.backend.events.len();
+        e.step(false, 1000., &mut || false);
+        assert_eq!(e.backend.events.len(), events);
+        assert!(e.restore(&mut || false).is_err());
+        e.step_games(None, 1001., &mut || None);
+        assert!(e.resume_pending);
+        e.step_games(Some(evidence(vec![])), 1100., &mut || {
+            Some(evidence(vec![]))
+        });
+        assert!(!e.resume_pending);
+        assert!(
+            e.message
+                .contains("Windows resumed; saved AI recovery in 30s")
+        );
+        assert_eq!(e.backend.events.len(), events);
+        let saved = e.state.as_ref().unwrap();
+        assert_eq!(saved.server, original.server);
+        for (saved, original) in saved.models.iter().zip(&original.models) {
+            assert_eq!(saved.load_config, original.load_config);
+            assert_eq!(saved.identifier, original.identifier);
+        }
+        e.step_games(Some(evidence(vec![])), 1129.9, &mut || {
+            Some(evidence(vec![]))
+        });
+        assert!(e.pending());
+        e.step_games(Some(evidence(vec![])), 1130., &mut || {
+            Some(evidence(vec![]))
+        });
+        assert!(!e.pending());
+        assert_eq!(e.backend.current.len(), 2);
+    }
+    #[test]
+    fn resume_while_gaming_rechecks_provider_residency_without_recapturing() {
+        use crate::gameplay::fixtures::{evidence, game};
+        let mut e = engine(Fake::new());
+        e.pause().unwrap();
+        let original = e.state.clone().unwrap();
+        // A provider/client restarted and made the captured models resident again.
+        e.backend.current = ["chat".into(), "embed".into()].into_iter().collect();
+        e.backend.running = true;
+        let captures = e
+            .backend
+            .events
+            .iter()
+            .filter(|event| *event == "snapshot")
+            .count();
+        e.resume_detected();
+        let current = evidence(vec![game(42, 10)]);
+        e.step_games(Some(current.clone()), 1000., &mut || Some(current.clone()));
+        assert!(e.pause_verified());
+        assert!(e.backend.current.is_empty());
+        assert_eq!(
+            e.backend
+                .events
+                .iter()
+                .filter(|event| *event == "snapshot")
+                .count(),
+            captures
+        );
+        assert_eq!(
+            e.state.as_ref().unwrap().models[0].load_config,
+            original.models[0].load_config
+        );
+    }
+    #[test]
+    fn resume_revalidates_coexistence_and_unknown_detection_revokes_it() {
+        use crate::gameplay::fixtures::{evidence, game};
+        let mut e = engine(Fake::new());
+        let current = evidence(vec![game(42, 10)]);
+        let id = prepare_gameplay(&mut e, &current);
+        e.gameplay.confirm(id, &current).unwrap();
+        e.restore_gameplay(&mut || Some(current.clone())).unwrap();
+        let events = e.backend.events.len();
+        e.resume_detected();
+        assert!(
+            e.gameplay.active(),
+            "power event is not an unconditional restart revocation"
+        );
+        assert!(e.gameplay.offer().is_none());
+        e.step_games(Some(current.clone()), 1000., &mut || Some(current.clone()));
+        assert_eq!(e.activity, Activity::Coexistence);
+        assert_eq!(e.backend.events.len(), events);
+        e.resume_detected();
+        e.step_games(None, 1100., &mut || None);
+        assert!(!e.gameplay.active());
+        assert!(e.resume_pending);
+        assert_eq!(e.backend.events.len(), events);
+    }
+    #[test]
+    fn resume_reconciliation_write_failure_blocks_control_and_retains_authority() {
+        use crate::gameplay::fixtures::{evidence, game};
+        let mut e = engine(Fake::new());
+        e.pause().unwrap();
+        let before = fs::read(&e.path).unwrap();
+        let events = e.backend.events.len();
+        e.backend.lock_journal();
+        e.resume_detected();
+        let current = evidence(vec![game(42, 10)]);
+        e.step_games(Some(current.clone()), 1000., &mut || Some(current.clone()));
+        assert!(e.resume_pending);
+        assert_eq!(e.activity, Activity::PartialFailure);
+        assert_eq!(e.backend.events.len(), events);
+        e.backend.held_lock = None;
+        assert_eq!(fs::read(&e.path).unwrap(), before);
+        e.step_games(Some(current.clone()), 1001., &mut || Some(current.clone()));
+        assert!(
+            e.resume_pending,
+            "failed resume persistence honors retry backoff"
+        );
+        e.step_games(Some(current.clone()), 1030., &mut || Some(current.clone()));
+        assert!(!e.resume_pending);
+        assert!(e.pause_verified());
+    }
+    #[test]
+    fn power_event_during_capture_unload_or_load_stops_before_the_next_unit() {
+        for operation in ["snapshot", "unload:chat", "restore:chat"] {
+            let signal = std::sync::Arc::new(crate::power::Signal::default());
+            let mut e = engine(Fake::new());
+            if operation.starts_with("restore") {
+                e.pause().unwrap();
+            }
+            e.backend.power_on = Some((operation.into(), signal.clone()));
+            let guard = signal.clone();
+            e.observe_power(move || !guard.permits(0));
+            if operation.starts_with("restore") {
+                e.restore(&mut || false).unwrap();
+                assert!(!e.backend.current.contains("embed"));
+                assert!(e.message.contains("Power state changed"));
+            } else {
+                assert!(e.pause().is_err());
+                assert!(e.backend.current.contains("embed"));
+            }
+            assert!(e.pending());
+            let journal = recovery::load(&e.path, &e.config).unwrap().unwrap();
+            let saved = journal.providers[0].payload.lm().unwrap();
+            assert_eq!(saved.models.len(), 2);
+            assert!(
+                saved
+                    .models
+                    .iter()
+                    .all(|model| model.load_config["fields"][0]["value"] == 0.7)
+            );
+        }
+    }
+    #[test]
+    fn resume_after_partial_load_and_provider_restart_replays_originals() {
+        use crate::gameplay::fixtures::evidence;
+        let mut e = engine(Fake::new());
+        e.pause().unwrap();
+        e.backend.fail_restore = Some("embed".into());
+        assert!(e.restore(&mut || false).is_err());
+        assert!(e.backend.current.contains("chat"));
+        e.backend.current.clear();
+        e.backend.running = false;
+        e.backend.fail_restore = None;
+        e.resume_detected();
+        e.step_games(Some(evidence(vec![])), 1000., &mut || {
+            Some(evidence(vec![]))
+        });
+        assert!(e.pending());
+        e.step_games(Some(evidence(vec![])), 1030., &mut || {
+            Some(evidence(vec![]))
+        });
+        assert!(!e.pending());
+        assert_eq!(e.backend.current.len(), 2);
+        assert!(e.backend.running);
+    }
+    #[test]
+    fn resume_observation_never_rewrites_pending_recovery() {
+        use crate::gameplay::fixtures::evidence;
+        let mut e = engine(Fake::new());
+        e.pause().unwrap();
+        let before = fs::read(&e.path).unwrap();
+        let events = e.backend.events.len();
+        e.config.mode = "observe".into();
+        e.resume_detected();
+        e.step_games(Some(evidence(vec![])), 1000., &mut || {
+            Some(evidence(vec![]))
+        });
+        assert_eq!(e.activity, Activity::Observation);
+        assert_eq!(e.backend.events.len(), events);
+        assert_eq!(fs::read(&e.path).unwrap(), before);
+        assert!(
+            e.resume_pending,
+            "switching to active must still reconcile old evidence"
+        );
+    }
+    #[test]
+    fn resume_preserves_manual_hold_until_explicit_release_and_normal_grace() {
+        use crate::gameplay::fixtures::evidence;
+        let mut e = engine(Fake::new());
+        e.request_manual_pause();
+        e.pause().unwrap();
+        e.resume_detected();
+        for now in [1000., 2000.] {
+            e.step_games(Some(evidence(vec![])), now, &mut || Some(evidence(vec![])));
+            assert!(e.manual_pause);
+            assert!(e.pending());
+            assert!(e.backend.current.is_empty());
+            assert_eq!(e.activity, Activity::ManualHold);
+        }
+        e.manual_pause = false;
+        e.step_games(Some(evidence(vec![])), 2001., &mut || {
+            Some(evidence(vec![]))
+        });
+        assert!(e.pending());
+        e.step_games(Some(evidence(vec![])), 2031., &mut || {
+            Some(evidence(vec![]))
+        });
+        assert!(!e.pending());
+        assert_eq!(e.backend.current.len(), 2);
+    }
+    #[test]
+    fn compatibility_projection_cannot_replace_originals_during_a_game_save() {
+        let mut e = engine(Fake::new());
+        e.pause().unwrap();
+        let bytes = fs::read(&e.path).unwrap();
+        e.state.as_mut().unwrap().models[0].load_config = serde_json::json!({"changed":true});
+        assert!(
+            e.remember_games(vec![crate::discovery::Game::new(
+                "Custom",
+                "extra",
+                "Extra game",
+                r"D:\Fixture Games\extra.exe"
+            )])
+            .is_err()
+        );
+        assert_eq!(fs::read(&e.path).unwrap(), bytes);
+    }
+    #[test]
+    fn mixed_recovery_finishes_healthy_lm_and_retains_unavailable_ollama_across_restart() {
+        let mut e = engine(Fake::new());
+        e.pause().unwrap();
+        let mut journal = e.recovery.clone().unwrap();
+        journal.providers.push(recovery::ollama_fixture());
+        recovery::save(&e.path, Some(&journal)).unwrap();
+        let original = journal.providers[1].payload.clone();
+        let mut resumed = Engine::new(e.config.clone(), e.backend.clone(), e.path.clone()).unwrap();
+        assert!(resumed.pending());
+        assert!(!resumed.pause_verified());
+        assert!(resumed.restore(&mut || false).is_err());
+        assert_eq!(
+            resumed.backend.current.len(),
+            2,
+            "disabled Ollama cannot block healthy LM restoration"
+        );
+        let saved = recovery::load(&e.path, &e.config).unwrap().unwrap();
+        assert!(saved.providers.iter().any(|entry| entry.binding.kind
+            == crate::provider::Kind::LMStudio
+            && entry.restore_complete));
+        assert_eq!(saved.providers[1].payload, original);
+        assert_eq!(resumed.restore_completions, 0);
+        let calls = resumed.backend.loaded_calls;
+        let events = resumed.backend.events.len();
+        resumed.resume_detected();
+        use crate::gameplay::fixtures::evidence;
+        resumed.step_games(Some(evidence(vec![])), 1000., &mut || {
+            Some(evidence(vec![]))
+        });
+        let after_resume = recovery::load(&e.path, &e.config).unwrap().unwrap();
+        assert!(after_resume.providers[0].restore_complete);
+        assert_eq!(after_resume.providers[1].payload, original);
+        assert_eq!(resumed.backend.events.len(), events);
+        assert_eq!(resumed.backend.loaded_calls, calls);
+        assert!(resumed.restore(&mut || false).is_err());
+        assert_eq!(resumed.backend.loaded_calls, calls);
+        resumed
+            .remember_games(vec![crate::discovery::Game::new(
+                "Custom",
+                "extra",
+                "Extra game",
+                r"D:\Fixture Games\extra.exe",
+            )])
+            .unwrap();
+        assert_eq!(
+            recovery::load(&e.path, &e.config)
+                .unwrap()
+                .unwrap()
+                .providers[1]
+                .payload,
+            original
+        );
+        let restarted =
+            Engine::new(e.config.clone(), resumed.backend.clone(), e.path.clone()).unwrap();
+        assert!(restarted.pending());
+        assert_eq!(restarted.recovery.unwrap().providers.len(), 2);
+    }
+    #[test]
+    fn ollama_only_obligation_is_pending_without_an_lm_projection() {
+        let e = engine(Fake::new());
+        let journal = Journal {
+            schema: 3,
+            session: recovery::Session {
+                games: vec![],
+                intent: Intent::Restore,
+            },
+            providers: vec![recovery::ollama_fixture()],
+        };
+        recovery::save(&e.path, Some(&journal)).unwrap();
+        let mut resumed = Engine::new(e.config.clone(), e.backend.clone(), e.path.clone()).unwrap();
+        assert!(resumed.state.is_none());
+        assert!(resumed.pending());
+        let posts = resumed.backend.events.clone();
+        assert!(!resumed.verify_round_trip(&mut || false).ok);
+        assert!(resumed.restore(&mut || false).is_err());
+        assert_eq!(resumed.backend.events, posts);
+        assert_eq!(
+            recovery::load(&e.path, &e.config)
+                .unwrap()
+                .unwrap()
+                .providers[0]
+                .payload,
+            journal.providers[0].payload
+        );
+    }
+    #[test]
+    fn completed_pause_recovers_visible_state_after_detection_returns_without_io() {
+        let mut e = engine(Fake::new());
+        e.step(true, 0., &mut || false);
+        let calls = e.backend.loaded_calls;
+        let bytes = fs::read(&e.path).unwrap();
+        e.disabled = true;
+        e.step(true, 1., &mut || false);
+        assert_eq!(e.activity, Activity::DetectionUnavailable);
+        e.disabled = false;
+        e.step(true, 2., &mut || false);
+        assert_eq!(e.activity, Activity::Paused);
+        assert_eq!(e.backend.loaded_calls, calls);
+        assert_eq!(fs::read(&e.path).unwrap(), bytes);
+        assert_eq!(e.pause_completions, 1);
+    }
+    #[test]
+    fn verified_recovery_can_clear_after_all_providers_are_disabled_without_control() {
+        let mut e = engine(Fake::new());
+        e.pause().unwrap();
+        let mut journal = e.recovery.clone().unwrap();
+        e.restore(&mut || false).unwrap();
+        journal.session.intent = Intent::Restore;
+        journal.providers[0].restore_complete = true;
+        let snapshot = journal.providers[0].payload.lm_mut().unwrap();
+        snapshot.pause_complete = false;
+        for model in &mut snapshot.models {
+            model.stage = "restored".into();
+        }
+        recovery::save(&e.path, Some(&journal)).unwrap();
+        for provider in &mut e.config.providers {
+            if let crate::config::Provider::LMStudio { enabled, .. } = provider {
+                *enabled = false;
+            }
+        }
+        let events = e.backend.events.clone();
+        let mut resumed = Engine::new(e.config.clone(), e.backend.clone(), e.path.clone()).unwrap();
+        assert!(resumed.pending());
+        resumed.restore(&mut || false).unwrap();
+        assert!(!resumed.pending());
+        assert!(
+            recovery::load(&resumed.path, &resumed.config)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(resumed.backend.events, events);
+        recovery::save(&resumed.path, Some(&journal)).unwrap();
+        for provider in &mut resumed.config.providers {
+            if let crate::config::Provider::LMStudio {
+                enabled,
+                connection,
+                ..
+            } = provider
+            {
+                *enabled = true;
+                connection.endpoint = "127.0.0.1:5432".into();
+            }
+        }
+        resumed.backend.port = 0; // A new capture cannot validate this fixture server.
+        let mut recapture = Engine::new(
+            resumed.config.clone(),
+            resumed.backend.clone(),
+            resumed.path.clone(),
+        )
+        .unwrap();
+        let error = recapture.pause().unwrap_err();
+        assert!(
+            !recapture.pending(),
+            "a failed new capture cannot resurrect verified retired recovery: {error:#}"
+        );
+        assert!(
+            recovery::load(&recapture.path, &recapture.config)
+                .unwrap()
+                .is_none()
+        );
+        let mut expected = events;
+        expected.push("snapshot".into());
+        assert_eq!(recapture.backend.events, expected);
+    }
+    #[test]
+    fn ollama_ownership_refuses_capture_before_http_without_blocking_healthy_lm() {
+        let mut e = engine(Fake::new());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let mut owner = crate::ownership::Claims::default();
+        owner
+            .claim("fixture-owner", crate::provider::Kind::Ollama, &[&endpoint])
+            .unwrap();
+        for provider in &mut e.config.providers {
+            if let crate::config::Provider::Ollama {
+                enabled,
+                endpoint: route,
+                ..
+            } = provider
+            {
+                *enabled = true;
+                *route = endpoint.clone();
+            }
+        }
+        assert!(e.pause().is_err());
+        assert!(e.pending());
+        assert!(e.backend.current.is_empty());
+        assert!(e.state.as_ref().unwrap().pause_complete);
+        assert!(!e.pause_verified());
+        assert_eq!(e.pause_completions, 0);
+        assert_eq!(e.recovery.as_ref().unwrap().providers.len(), 1);
+        assert!(
+            e.provider_statuses
+                .iter()
+                .any(|report| report.kind == crate::provider::Kind::Ollama
+                    && report.state == crate::coordinator::State::Failed)
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+    #[test]
+    fn routed_private_http_pause_restore_preserves_mixed_and_ollama_only_recovery() {
+        use crate::{ollama_session::Stage, provider::Kind};
+        use serde_json::json;
+        use windows_sys::Win32::{
+            Foundation::{FILETIME, SYSTEMTIME},
+            System::Time::FileTimeToSystemTime,
+        };
+        for lm_enabled in [true, false] {
+            let mut e = engine(Fake::new());
+            let path = e.path.clone();
+            let ticks = (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 300)
+                * 10_000_000
+                + 116_444_736_000_000_000;
+            let filetime = FILETIME {
+                dwLowDateTime: ticks as u32,
+                dwHighDateTime: (ticks >> 32) as u32,
+            };
+            let mut time: SYSTEMTIME = unsafe { std::mem::zeroed() };
+            assert_ne!(unsafe { FileTimeToSystemTime(&filetime, &mut time) }, 0);
+            let expiry = format!(
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+                time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond
+            );
+            let model = json!({"name":"fixture-http:latest", "model":"fixture-http:latest",
+                "digest":"c".repeat(64), "context_length":4096, "expires_at":expiry});
+            let mut present = true;
+            let mut controls = 0;
+            let (endpoint, thread) = crate::ollama_session::tests::http_server(
+                if lm_enabled { 16 } else { 12 },
+                move |route, body| {
+                    let value = match route {
+                        "/api/ps" => {
+                            json!({"models":if present { vec![model.clone()] } else { vec![] }})
+                        }
+                        "/api/tags" => json!({"models":[model.clone()]}),
+                        "/api/show" => {
+                            json!({"details":{"format":"gguf"}, "capabilities":["completion"],
+                        "model_info":{"general.architecture":"fixture", "fixture.context_length":8192}})
+                        }
+                        "/api/generate" => {
+                            let body = body.unwrap();
+                            let unloading = body["keep_alive"] == 0;
+                            assert_eq!(body["prompt"], "");
+                            assert_eq!(body["stream"], false);
+                            assert_eq!(body["model"], "fixture-http:latest:local");
+                            let journal: Journal =
+                                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                            assert_eq!(
+                                journal.session.intent,
+                                if unloading {
+                                    Intent::Pause
+                                } else {
+                                    Intent::Restore
+                                }
+                            );
+                            assert_eq!(
+                                journal.providers.len(),
+                                if lm_enabled && controls == 0 { 2 } else { 1 }
+                            );
+                            let entry = journal
+                                .providers
+                                .iter()
+                                .find(|entry| entry.binding.kind == Kind::Ollama)
+                                .unwrap();
+                            let recovery::Payload::Ollama(snapshot) = &entry.payload else {
+                                panic!("wrong payload")
+                            };
+                            assert_eq!(
+                                snapshot.models[0].stage,
+                                if unloading {
+                                    Stage::Unloading
+                                } else {
+                                    Stage::Loading
+                                }
+                            );
+                            if lm_enabled && controls == 0 {
+                                let lm = journal
+                                    .providers
+                                    .iter()
+                                    .find_map(|entry| entry.payload.lm().ok())
+                                    .unwrap();
+                                assert_eq!(lm.models.len(), 2);
+                            }
+                            controls += 1;
+                            assert!(controls <= if lm_enabled { 3 } else { 2 });
+                            present = !unloading;
+                            json!({"model":body["model"], "done":true,
+                            "done_reason":if unloading {"unload"} else {"load"}, "response":""})
+                        }
+                        _ => panic!("unexpected fixture route"),
+                    };
+                    (200, serde_json::to_vec(&value).unwrap())
+                },
+            );
+            // Explicit fixture enrollment uses the same validated settings as users.
+            for provider in &mut e.config.providers {
+                match provider {
+                    crate::config::Provider::LMStudio { enabled, .. } => *enabled = lm_enabled,
+                    crate::config::Provider::Ollama {
+                        enabled,
+                        endpoint: route,
+                        ..
+                    } => {
+                        *enabled = true;
+                        *route = endpoint.clone();
+                    }
+                }
+            }
+            let initial_lm_events = e.backend.events.clone();
+            e.config.validate().unwrap();
+            e.pause().unwrap();
+            assert!(e.pending());
+            assert!(e.pause_verified());
+            assert_eq!(e.state.is_some(), lm_enabled);
+            assert_eq!(e.pause_completions, 1);
+            let mut competitor = crate::ownership::Claims::default();
+            assert!(
+                competitor
+                    .claim("competing", Kind::Ollama, &[&endpoint])
+                    .is_err()
+            );
+            if lm_enabled {
+                // Simulate an externally disabled entry in a pending session.
+                // Healthy LM restoration proceeds, but Ollama keeps its claim.
+                for provider in &mut e.config.providers {
+                    if let crate::config::Provider::Ollama { enabled, .. } = provider {
+                        *enabled = false;
+                    }
+                }
+                assert!(e.restore(&mut || false).is_err());
+                assert!(e.pending());
+                assert_eq!(e.backend.current.len(), 2);
+                assert!(
+                    competitor
+                        .claim("competing", Kind::Ollama, &[&endpoint])
+                        .is_err()
+                );
+                let journal = recovery::load(&e.path, &e.config).unwrap().unwrap();
+                assert!(journal.providers.iter().any(|entry| entry.binding.kind == Kind::LMStudio && entry.restore_complete));
+                for provider in &mut e.config.providers {
+                    if let crate::config::Provider::Ollama { enabled, .. } = provider {
+                        *enabled = true;
+                    }
+                }
+                let mut updated = e.config.clone();
+                for provider in &mut updated.providers {
+                    if let crate::config::Provider::LMStudio { enabled, .. } = provider {
+                        *enabled = false;
+                    }
+                }
+                e.validate_recovery_edit(&updated).unwrap();
+                e.config = updated;
+                e.settings_changed();
+                assert!(!e.provider_pending(Kind::LMStudio));
+                assert!(recovery::load(&e.path, &e.config).unwrap().is_some());
+                let lm_events = e.backend.events.clone();
+                e.pause().unwrap();
+                assert!(e.pause_verified());
+                assert!(e.state.is_none());
+                assert_eq!(e.recovery.as_ref().unwrap().providers.len(), 1);
+                assert_eq!(
+                    e.backend.events, lm_events,
+                    "a restored disabled provider is not repaused"
+                );
+            } else {
+                let (config, backend, path) = (e.config.clone(), e.backend.clone(), e.path.clone());
+                drop(e);
+                e = Engine::new(config, backend, path).unwrap();
+                assert!(e.pending());
+                assert!(e.state.is_none());
+            }
+            let ollama_original = e
+                .recovery
+                .as_ref()
+                .unwrap()
+                .providers
+                .iter()
+                .find_map(|entry| match &entry.payload {
+                    recovery::Payload::Ollama(snapshot) => {
+                        Some(snapshot.models[0].original.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            e.resume_detected();
+            use crate::gameplay::fixtures::evidence;
+            e.step_games(Some(evidence(vec![])), 1000., &mut || {
+                Some(evidence(vec![]))
+            });
+            assert!(e.pending(), "resume must start a fresh grace interval");
+            let recovery::Payload::Ollama(snapshot) =
+                &e.recovery.as_ref().unwrap().providers[0].payload
+            else {
+                panic!("unfinished Ollama payload must survive resume");
+            };
+            assert_eq!(snapshot.models[0].original, ollama_original);
+            e.restore(&mut || false).unwrap();
+            assert!(!e.pending());
+            assert!(recovery::load(&e.path, &e.config).unwrap().is_none());
+            assert_eq!(e.restore_completions, 1);
+            assert_eq!(e.backend.current.len(), 2);
+            if !lm_enabled {
+                assert_eq!(e.backend.events, initial_lm_events);
+            }
+            thread.join().unwrap();
+            drop(e);
+            competitor
+                .claim("competing", Kind::Ollama, &[&endpoint])
+                .unwrap();
+        }
+    }
+    #[test]
+    fn routed_provider_failure_preserves_healthy_pause_and_never_claims_whole_pause() {
+        let mut e = engine(Fake::new());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let unavailable_endpoint = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        // An explicitly enabled private endpoint; no real provider is contacted.
+        for provider in &mut e.config.providers {
+            if let crate::config::Provider::Ollama {
+                enabled, endpoint, ..
+            } = provider
+            {
+                *enabled = true;
+                *endpoint = unavailable_endpoint.clone();
+            }
+        }
+        let reports = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = reports.clone();
+        e.observe_providers(move |reports| observed.lock().unwrap().push(reports.to_vec()));
+        let mut healthy_calls = None;
+        for now in [0., 31.] {
+            e.step(true, now, &mut || false);
+            assert_eq!(e.activity, Activity::PartialFailure);
+            assert_eq!(e.pause_completions, 0);
+            assert!(
+                e.state.as_ref().unwrap().pause_complete,
+                "healthy LM pause evidence survives"
+            );
+            assert!(e.backend.current.is_empty());
+            if let Some(calls) = healthy_calls {
+                assert_eq!(
+                    e.backend.loaded_calls, calls,
+                    "healthy provider is not queried on another provider's retry"
+                );
+            }
+            healthy_calls = Some(e.backend.loaded_calls);
+            assert!(
+                e.provider_statuses
+                    .iter()
+                    .any(|report| report.kind == crate::provider::Kind::LMStudio
+                        && report.state == crate::coordinator::State::Paused
+                        && report.pending)
+            );
+            assert!(
+                e.provider_statuses
+                    .iter()
+                    .any(|report| report.kind == crate::provider::Kind::Ollama
+                        && report.state == crate::coordinator::State::Failed
+                        && !report.pending)
+            );
+        }
+        assert_eq!(
+            e.backend
+                .events
+                .iter()
+                .filter(|event| event.starts_with("unload:"))
+                .count(),
+            2
+        );
+        let observed = reports.lock().unwrap();
+        assert!(observed.iter().any(|reports| {
+            reports
+                .iter()
+                .any(|report| report.state == crate::coordinator::State::Pausing && report.pending)
+        }));
+        assert!(observed.iter().any(|reports| {
+            reports
+                .iter()
+                .any(|report| report.state == crate::coordinator::State::Paused && report.pending)
+        }));
+        let journal: Journal = serde_json::from_slice(&fs::read(&e.path).unwrap()).unwrap();
+        assert_eq!(journal.providers.len(), 1);
+        assert_eq!(
+            journal.providers[0].binding.kind,
+            crate::provider::Kind::LMStudio
+        );
+    }
+    #[test]
+    fn confirmed_gameplay_restore_is_immediate_and_stays_coexisting_without_io() {
+        use crate::gameplay::fixtures::{evidence, game};
+        let current = evidence(vec![game(42, 10), game(7, 2)]);
+        let mut e = engine(Fake::new());
+        e.config.restore_delay_seconds = 3600.;
+        let id = prepare_gameplay(&mut e, &current);
+        let feedback = crate::app::confirmed_restore(
+            &mut e,
+            id,
+            &[],
+            0.,
+            true,
+            &mut |_| Some(current.clone()),
+            &mut |_| panic!("no selections must not save settings"),
+        );
+        assert!(feedback.restoration.contains("completed"));
+        assert!(!feedback.tracking_recovery);
+        assert_eq!(e.activity, Activity::Coexistence);
+        assert!(e.gameplay.active());
+        assert!(e.state.is_none());
+        assert_eq!(e.backend.current.len(), 2);
+        assert!(e.config.automation_enabled);
+        assert!(!e.manual_pause);
+        let events = e.backend.events.clone();
+        e.step_games(Some(current.clone()), 1., &mut || Some(current.clone()));
+        assert_eq!(
+            e.backend.events, events,
+            "approved coexistence does not repause or probe models"
+        );
+        assert!(controls(&e, true).pause);
+        assert!(!controls(&e, true).restore);
+        let empty = evidence(vec![]);
+        e.step_games(Some(empty.clone()), 2., &mut || Some(empty.clone()));
+        assert!(!e.gameplay.active());
+        assert_eq!(e.activity, Activity::Watching);
+    }
+    #[test]
+    fn confirmation_rechecks_games_before_preferences_or_model_changes() {
+        use crate::gameplay::fixtures::{evidence, game};
+        let current = evidence(vec![game(42, 10)]);
+        for changed in [
+            Some(evidence(vec![game(42, 11)])),
+            Some(evidence(vec![game(42, 10), game(7, 2)])),
+            None,
+        ] {
+            let mut e = engine(Fake::new());
+            let id = prepare_gameplay(&mut e, &current);
+            let events = e.backend.events.clone();
+            let journal = fs::read(&e.path).unwrap();
+            let feedback = crate::app::confirmed_restore(
+                &mut e,
+                id,
+                &[current.all[0].executable.clone()],
+                0.,
+                true,
+                &mut |_| changed.clone(),
+                &mut |_| panic!("stale confirmation must not save preferences"),
+            );
+            assert!(feedback.restoration.contains("refused"));
+            assert_eq!(e.backend.events, events);
+            assert_eq!(fs::read(&e.path).unwrap(), journal);
+            assert!(!e.gameplay.active());
+            assert!(e.config.excluded_paths.is_empty());
+        }
+    }
+    #[test]
+    fn ignore_save_failure_is_separate_from_successful_gameplay_restore() {
+        use crate::gameplay::fixtures::{evidence, game};
+        let current = evidence(vec![game(42, 10), game(7, 2)]);
+        for fail in [false, true] {
+            let mut e = engine(Fake::new());
+            let id = prepare_gameplay(&mut e, &current);
+            let config_path = e.path.with_file_name("fixture-config.json");
+            let mut saved = None;
+            let feedback = crate::app::confirmed_restore(
+                &mut e,
+                id,
+                &[current.all[0].executable.clone()],
+                0.,
+                true,
+                &mut |_| Some(current.clone()),
+                &mut |config| {
+                    if fail {
+                        bail!("injected preference save failure");
+                    }
+                    write_json(&config_path, config)?;
+                    saved = Some(config.clone());
+                    Ok(())
+                },
+            );
+            assert!(feedback.restoration.contains("completed"));
+            assert!(e.gameplay.active());
+            if fail {
+                assert!(feedback.exclusions.contains("could not be saved"));
+                assert!(e.config.excluded_paths.is_empty());
+            } else {
+                assert!(feedback.exclusions.contains("preferences saved"));
+                assert_eq!(
+                    saved.unwrap().excluded_paths,
+                    vec![current.all[0].executable.clone()]
+                );
+                let loaded = Config::load(&config_path).unwrap();
+                assert_eq!(loaded.excluded_paths, e.config.excluded_paths);
+                assert!(!loaded.excluded_paths.contains(&current.all[1].executable));
+            }
+        }
+    }
+    #[test]
+    fn new_game_between_loads_revokes_scope_and_preserves_original_partial_journal() {
+        use crate::gameplay::fixtures::{evidence, game};
+        let current = evidence(vec![game(42, 10)]);
+        let changed = evidence(vec![game(42, 10), game(7, 2)]);
+        let mut e = engine(Fake::new());
+        let id = prepare_gameplay(&mut e, &current);
+        let original = e.state.as_ref().unwrap().models[0].load_config.clone();
+        let path = e.path.clone();
+        let feedback = crate::app::confirmed_restore(
+            &mut e,
+            id,
+            &[],
+            0.,
+            true,
+            &mut |_| {
+                let restored = has_restored_model(&path);
+                Some(if restored {
+                    changed.clone()
+                } else {
+                    current.clone()
+                })
+            },
+            &mut |_| Ok(()),
+        );
+        assert!(!e.gameplay.active());
+        assert!(feedback.restoration.contains("interrupted"));
+        assert!(e.state.is_some());
+        assert_eq!(e.restore_completions, 0);
+        assert_eq!(
+            e.backend.current.len(),
+            1,
+            "only the first model loaded before revocation"
+        );
+        e.step_games(Some(changed.clone()), 1., &mut || Some(changed.clone()));
+        assert_eq!(e.activity, Activity::Paused);
+        assert!(e.backend.current.is_empty());
+        assert_eq!(e.state.as_ref().unwrap().models[0].load_config, original);
+        assert!(
+            crate::app::confirmed_restore(
+                &mut e,
+                id,
+                &[],
+                2.,
+                true,
+                &mut |_| Some(current.clone()),
+                &mut |_| Ok(())
+            )
+            .restoration
+            .contains("refused")
+        );
+        let mut resumed = Engine::new(e.config.clone(), e.backend.clone(), e.path.clone()).unwrap();
+        assert!(!resumed.gameplay.active());
+        resumed.restore(&mut || true).unwrap();
+        assert!(
+            resumed.state.is_some(),
+            "ordinary restoration has no gameplay exemption"
+        );
+    }
+    #[test]
+    fn partial_gameplay_restore_retries_under_same_scope_and_restart_revokes_it() {
+        use crate::gameplay::fixtures::{evidence, game};
+        let current = evidence(vec![game(42, 10)]);
+        let mut e = engine(Fake::new());
+        let id = prepare_gameplay(&mut e, &current);
+        e.backend.fail_restore = Some("chat".into());
+        let feedback = crate::app::confirmed_restore(
+            &mut e,
+            id,
+            &[],
+            0.,
+            true,
+            &mut |_| Some(current.clone()),
+            &mut |_| Ok(()),
+        );
+        assert!(feedback.tracking_recovery);
+        assert!(feedback.restoration.contains("failed"));
+        assert!(e.gameplay.active());
+        assert!(e.backend.current.contains("embed"));
+        let mut resumed = Engine::new(e.config.clone(), e.backend.clone(), e.path.clone()).unwrap();
+        assert!(!resumed.gameplay.active());
+        resumed.step_games(Some(current.clone()), 1., &mut || Some(current.clone()));
+        assert!(
+            resumed.backend.current.is_empty(),
+            "restart repauses partial restoration while gaming"
+        );
+        e.backend.fail_restore = None;
+        let retry = e
+            .coordinator_memory
+            .as_ref()
+            .unwrap()
+            .next_retry_at()
+            .unwrap()
+            .as_secs_f64();
+        e.step_games(Some(current.clone()), retry + 0.001, &mut || {
+            Some(current.clone())
+        });
+        assert_eq!(e.activity, Activity::Coexistence);
+        assert!(e.state.is_none());
+        assert_eq!(e.backend.current.len(), 2);
+    }
+    #[test]
+    fn unknown_detection_revokes_approval_then_verified_detection_repauses() {
+        use crate::gameplay::fixtures::{evidence, game};
+        let current = evidence(vec![game(42, 10)]);
+        let mut e = engine(Fake::new());
+        let id = prepare_gameplay(&mut e, &current);
+        crate::app::confirmed_restore(
+            &mut e,
+            id,
+            &[],
+            0.,
+            true,
+            &mut |_| Some(current.clone()),
+            &mut |_| Ok(()),
+        );
+        let events = e.backend.events.clone();
+        e.step_games(None, 1., &mut || None);
+        assert!(!e.gameplay.active());
+        assert_eq!(e.activity, Activity::DetectionUnavailable);
+        assert_eq!(
+            e.backend.events, events,
+            "unknown detection does not invent an empty game set"
+        );
+        e.step_games(Some(current.clone()), 2., &mut || Some(current.clone()));
+        assert_eq!(e.activity, Activity::Paused);
+        assert!(e.backend.current.is_empty());
+    }
+    #[test]
+    fn observation_and_unknown_readiness_refuse_confirmation_without_saving() {
+        use crate::gameplay::fixtures::{evidence, game};
+        let current = evidence(vec![game(42, 10)]);
+        for ready in [true, false] {
+            let mut e = engine(Fake::new());
+            let id = prepare_gameplay(&mut e, &current);
+            if ready {
+                e.config.mode = "observe".into();
+            }
+            let events = e.backend.events.clone();
+            let journal = fs::read(&e.path).unwrap();
+            let feedback = crate::app::confirmed_restore(
+                &mut e,
+                id,
+                &[current.all[0].executable.clone()],
+                0.,
+                ready,
+                &mut |_| Some(current.clone()),
+                &mut |_| panic!("refused confirmation cannot save selections"),
+            );
+            assert!(feedback.restoration.contains("refused"));
+            assert_eq!(e.backend.events, events);
+            assert_eq!(fs::read(&e.path).unwrap(), journal);
+            assert!(!e.gameplay.active());
+        }
+    }
+    #[test]
+    fn ignore_without_confirmation_does_not_restore_or_drop_remembered_games() {
+        use crate::gameplay::fixtures::{evidence, game};
+        let mut current = evidence(vec![game(42, 10)]);
+        let mut e = engine(Fake::new());
+        prepare_gameplay(&mut e, &current);
+        e.gameplay.invalidate_offer();
+        e.config = crate::gameplay::selected_exclusions(
+            &e.config,
+            &current.all,
+            &[current.all[0].executable.clone()],
+        )
+        .unwrap();
+        current.triggers.clear();
+        let remembered = e.state.as_ref().unwrap().games[0].path.clone();
+        e.step_games(Some(current.clone()), 1., &mut || Some(current.clone()));
+        assert!(e.backend.current.is_empty());
+        assert!(!e.gameplay.active());
+        e.restore(&mut || current.gaming()).unwrap();
+        assert!(e.state.is_some());
+        assert_eq!(e.state.as_ref().unwrap().games[0].path, remembered);
+    }
+    fn controls(e: &Engine<Fake>, gaming: bool) -> crate::control::Availability {
+        crate::control::ControlState {
+            activity: e.activity,
+            active_mode: e.config.mode == "active",
+            provider_enabled: e.config.lm_enabled(),
+            detection_ready: !e.disabled,
+            gaming,
+            pending: e.state.is_some(),
+            manual_hold: e.manual_pause,
+            gameplay_restore: e.gameplay.active(),
+            coexistence: e.gameplay.active(),
+        }
+        .availability()
+    }
+    #[test]
+    fn actual_transitions_drive_core_availability_and_publish_progress() {
+        use std::sync::{Arc, Mutex};
+        let progress = Arc::new(Mutex::new(Vec::new()));
+        let sink = progress.clone();
+        let mut e = engine(Fake::new());
+        e.observe_progress(move |activity| sink.lock().unwrap().push(activity));
+        e.step(false, 0., &mut || false);
+        assert!(controls(&e, false).pause);
+        e.step(true, 1., &mut || false);
+        assert_eq!(e.activity, Activity::Paused);
+        assert!(!controls(&e, true).pause);
+        assert!(!controls(&e, true).restore);
+        let work = e.backend.events.len();
+        e.step(true, 2., &mut || false);
+        assert_eq!(e.backend.events.len(), work, "completed pause stays quiet");
+        assert!(!e.manual_pause, "automatic pause never becomes a hold");
+        e.step(false, 3., &mut || false);
+        assert_eq!(e.activity, Activity::Countdown);
+        assert!(controls(&e, false).restore);
+        e.step(false, 33., &mut || false);
+        assert_eq!(e.activity, Activity::Watching);
+        assert!(!controls(&e, false).restore);
+        let observed = progress.lock().unwrap();
+        for activity in [
+            Activity::Capturing,
+            Activity::Unloading,
+            Activity::Restoring,
+        ] {
+            assert!(observed.contains(&activity));
+            let availability = crate::control::ControlState {
+                activity,
+                active_mode: true,
+                provider_enabled: true,
+                detection_ready: true,
+                gaming: false,
+                pending: true,
+                manual_hold: true,
+                gameplay_restore: false,
+                coexistence: false,
+            }
+            .availability();
+            assert!(!availability.pause && !availability.restore && !availability.resume);
+        }
+    }
+    #[test]
+    fn partial_pause_and_restore_are_never_completed_pause_evidence() {
+        let mut backend = Fake::new();
+        backend.fail_unload = Some("embed".into());
+        let mut e = engine(backend);
+        e.step(true, 0., &mut || false);
+        assert_eq!(e.activity, Activity::PartialFailure);
+        assert!(!e.state.as_ref().unwrap().pause_complete);
+        assert_eq!(e.pause_completions, 0);
+        assert!(!controls(&e, true).pause);
+        e.step(false, 1., &mut || false);
+        assert_eq!(e.activity, Activity::Recovery);
+        assert!(e.message.contains("pause was incomplete"));
+        e.backend.fail_unload = None;
+        e.backend.fail_restore = Some("chat".into());
+        let result = e.restore(&mut || false);
+        e.restore_failed = true;
+        e.attempt(result, 1.);
+        assert_eq!(e.activity, Activity::PartialFailure);
+        assert!(e.state.is_some());
+        assert_eq!(e.restore_completions, 0);
+        assert!(controls(&e, false).restore);
+    }
+    #[test]
+    fn explicit_manual_pause_retries_before_old_backoff_and_clears_old_failure() {
+        let mut e = engine(Fake::new());
+        e.attempt(Err(anyhow::anyhow!("Fixture previous capture failed")), 0.);
+        assert!(e.retry_at > 1.);
+        e.request_manual_pause();
+        e.step(false, 1., &mut || false);
+        assert_eq!(e.activity, Activity::ManualHold);
+        assert!(e.last_error.is_empty());
+        assert!(e.state.as_ref().unwrap().pause_complete);
+    }
+    #[test]
+    fn delayed_unload_retains_intent_and_retries_without_false_completion() {
+        let mut backend = Fake::new();
+        backend.delayed_unload = true;
+        let mut e = engine(backend);
+        e.step(true, 0., &mut || false);
+        assert_eq!(e.activity, Activity::PartialFailure);
+        assert_eq!(e.pause_completions, 0);
+        assert!(!e.state.as_ref().unwrap().pause_complete);
+        let original = e.state.as_ref().unwrap().models[0].load_config.clone();
+        e.backend.delayed_unload = false;
+        let retry = e
+            .coordinator_memory
+            .as_ref()
+            .unwrap()
+            .next_retry_at()
+            .unwrap()
+            .as_secs_f64();
+        let calls = e.backend.loaded_calls;
+        let journal = fs::read(&e.path).unwrap();
+        e.step(true, retry - 0.001, &mut || false);
+        assert_eq!(e.backend.loaded_calls, calls, "backoff must not probe");
+        assert_eq!(
+            fs::read(&e.path).unwrap(),
+            journal,
+            "backoff must not persist"
+        );
+        e.step(true, retry + 0.001, &mut || false);
+        assert_eq!(e.activity, Activity::Paused);
+        assert_eq!(e.pause_completions, 1);
+        assert_eq!(e.state.as_ref().unwrap().models[0].load_config, original);
+    }
+    #[test]
+    fn busy_inference_and_failed_detection_remain_explicit() {
+        let mut e = engine(Fake::new());
+        e.attempt(Err(crate::lmstudio::InferenceBusy.into()), 0.);
+        assert_eq!(e.activity, Activity::WaitingForInference);
+        assert_eq!(e.pause_completions, 0);
+        assert!(e.state.is_none());
+        e.disabled = true;
+        e.step(false, 1., &mut || false);
+        assert_eq!(e.activity, Activity::DetectionUnavailable);
+        assert!(!controls(&e, false).pause);
+        assert!(!controls(&e, false).restore);
+    }
+    #[test]
+    fn failed_final_pause_write_cannot_claim_completion_on_retry() {
+        let mut backend = Fake::new();
+        backend.lock_loaded_on = Some(3);
+        let mut e = engine(backend);
+        e.step(true, 0., &mut || false);
+        assert_eq!(e.activity, Activity::PartialFailure);
+        assert_eq!(e.pause_completions, 0);
+        assert!(!e.state.as_ref().unwrap().pause_complete);
+        e.backend.held_lock = None;
+        let disk: Journal = serde_json::from_slice(&fs::read(&e.path).unwrap()).unwrap();
+        assert!(!disk.into_lm().unwrap().1.pause_complete);
+        e.step(true, e.config.retry_seconds, &mut || false);
+        assert_eq!(e.activity, Activity::Paused);
+        assert_eq!(e.pause_completions, 1);
     }
     #[test]
     fn both_models_and_grace() {
@@ -723,7 +2647,10 @@ mod tests {
         e.last_error = "AI is busy".into();
         e.step(false, 0., &mut || false);
         assert!(e.last_error.is_empty());
-        assert_eq!(e.message, "AI available");
+        assert_eq!(
+            e.message,
+            "Watching games; LM Studio state has not been probed"
+        );
     }
     #[test]
     fn recovery_remembers_game_paths_across_registration_changes_and_restart() {
@@ -772,6 +2699,27 @@ mod tests {
         e.step(false, 100., &mut || false);
         assert!(e.backend.events.is_empty());
         assert!(!e.path.exists());
+    }
+    #[test]
+    fn disabled_provider_does_no_io_and_retains_an_existing_obligation() {
+        let mut e = engine(Fake::new());
+        let original = e.config.providers.clone();
+        e.config.providers.clear();
+        e.step(true, 0., &mut || false);
+        assert!(e.pause().is_err());
+        assert!(!e.verify_round_trip(&mut || false).ok);
+        assert!(e.backend.events.is_empty());
+        assert_eq!(e.backend.loaded_calls, 0);
+        assert!(!e.path.exists());
+        e.config.providers = original;
+        e.pause().unwrap();
+        let journal = fs::read(&e.path).unwrap();
+        let events = e.backend.events.clone();
+        e.config.providers.clear();
+        assert!(e.restore(&mut || false).is_err());
+        assert_eq!(e.backend.events, events);
+        assert_eq!(fs::read(&e.path).unwrap(), journal);
+        assert!(e.state.is_some());
     }
     #[test]
     fn empty_snapshot_never_loads_default() {
@@ -838,12 +2786,8 @@ mod tests {
     fn restart_interrupts_between_models() {
         let mut e = engine(Fake::new());
         e.pause().unwrap();
-        let mut calls = 0;
-        e.restore(&mut || {
-            calls += 1;
-            calls > 2
-        })
-        .unwrap();
+        let path = e.path.clone();
+        e.restore(&mut || has_restored_model(&path)).unwrap();
         assert_eq!(e.backend.current.len(), 1);
         assert!(e.state.is_some());
         e.step(true, 10., &mut || false);
@@ -933,7 +2877,11 @@ mod tests {
         let mut e = engine(Fake::new());
         e.pause().unwrap();
         e.state.as_mut().unwrap().models[0].stage = "unknown".into();
-        e.save().unwrap();
+        assert!(e.save().is_err());
+        let mut corrupt: serde_json::Value =
+            serde_json::from_slice(&fs::read(&e.path).unwrap()).unwrap();
+        corrupt["providers"][0]["payload"]["snapshot"]["models"][0]["stage"] = "unknown".into();
+        write_json(&e.path, &corrupt).unwrap();
         let original = fs::read(&e.path).unwrap();
         assert!(Engine::new(e.config, e.backend, e.path.clone()).is_err());
         assert_eq!(fs::read(e.path).unwrap(), original);
@@ -1000,6 +2948,34 @@ mod tests {
         );
     }
     #[test]
+    fn lm_round_trip_leaves_enabled_ollama_untouched() {
+        let mut e = engine(Fake::new());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        for provider in &mut e.config.providers {
+            if let crate::config::Provider::Ollama {
+                enabled, endpoint, ..
+            } = provider
+            {
+                *enabled = true;
+                *endpoint = listener.local_addr().unwrap().to_string();
+            }
+        }
+        e.config.validate().unwrap();
+        assert!(e.verify_round_trip(&mut || false).ok);
+        assert!(!e.pending());
+        assert_eq!(e.backend.current.len(), 2);
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert!(
+            e.provider_statuses
+                .iter()
+                .all(|report| report.kind == crate::provider::Kind::LMStudio)
+        );
+    }
+    #[test]
     fn verify_guards_do_not_mutate_or_replace_recovery() {
         for mode in 0..5 {
             let mut e = engine(Fake::new());
@@ -1025,7 +3001,7 @@ mod tests {
             let mut b = Fake::new();
             b.running = running;
             let mut e = engine(b);
-            e.config.stop_server_during_gaming = false;
+            e.config.lm_mut().unwrap().stop_server_during_gaming = false;
             assert!(e.verify_round_trip(&mut || false).ok);
             assert_eq!(e.backend.running, running);
             assert_eq!(e.backend.current.len(), 2);
@@ -1082,11 +3058,24 @@ mod tests {
     #[test]
     fn verify_game_start_after_unload_retains_durable_recovery() {
         let mut e = engine(Fake::new());
-        let mut calls = 0;
+        let journal = e.path.clone();
         assert!(
             !e.verify_round_trip(&mut || {
-                calls += 1;
-                calls >= 4
+                fs::read(&journal)
+                    .ok()
+                    .and_then(|bytes| {
+                        serde_json::from_slice::<Option<Journal>>(&bytes)
+                            .ok()
+                            .flatten()
+                    })
+                    .is_some_and(|journal| {
+                        let (_, snapshot, _) = journal.into_lm().unwrap();
+                        !snapshot.models.is_empty()
+                            && snapshot
+                                .models
+                                .iter()
+                                .all(|model| model.stage == "unloaded")
+                    })
             })
             .ok
         );
@@ -1106,18 +3095,27 @@ mod tests {
     }
     #[test]
     fn restart_recovers_each_destructive_stage() {
-        for stage in ["unloading", "unloaded", "restoring", "restored"] {
-            let mut e = engine(Fake::new());
-            e.pause().unwrap();
-            for model in &mut e.state.as_mut().unwrap().models {
-                model.stage = stage.into();
+        for running in [false, true] {
+            for stage in ["planned", "unloading", "unloaded", "restoring", "restored"] {
+                let mut backend = Fake::new();
+                backend.running = running;
+                let mut e = engine(backend);
+                if stage == "planned" {
+                    e.state = Some(e.backend.snapshot().unwrap());
+                } else {
+                    e.pause().unwrap();
+                }
+                for model in &mut e.state.as_mut().unwrap().models {
+                    model.stage = stage.into();
+                }
+                e.save().unwrap();
+                let mut resumed =
+                    Engine::new(e.config.clone(), e.backend.clone(), e.path.clone()).unwrap();
+                resumed.restore(&mut || false).unwrap();
+                assert!(resumed.state.is_none());
+                assert_eq!(resumed.backend.current.len(), 2);
+                assert_eq!(resumed.backend.running, running);
             }
-            e.save().unwrap();
-            let mut resumed =
-                Engine::new(e.config.clone(), e.backend.clone(), e.path.clone()).unwrap();
-            resumed.restore(&mut || false).unwrap();
-            assert!(resumed.state.is_none());
-            assert_eq!(resumed.backend.current.len(), 2);
         }
     }
     #[test]
@@ -1151,12 +3149,8 @@ mod tests {
         b.running = false;
         let mut e = engine(b);
         e.pause().unwrap();
-        let mut calls = 0;
-        e.restore(&mut || {
-            calls += 1;
-            calls >= 2
-        })
-        .unwrap();
+        let path = e.path.clone();
+        e.restore(&mut || has_restored_model(&path)).unwrap();
         assert!(e.backend.running);
         e.pause().unwrap();
         assert!(!e.backend.running);
@@ -1198,12 +3192,35 @@ mod tests {
     }
     #[test]
     fn legacy_empty_stopped_server_journal_remains_schema_two_compatible() {
-        let mut e = engine(Fake::new());
+        let mut backend = Fake::new();
+        backend.running = false;
+        let mut e = engine(backend);
         write_json(&e.path, &json!({"schema":2,"server":{"running":false},"server_stopped":false,"models":[],"pause_complete":true})).unwrap();
         e = Engine::new(e.config.clone(), e.backend.clone(), e.path.clone()).unwrap();
         assert_eq!(e.state.as_ref().unwrap().schema, 2);
         assert_eq!(e.state.as_ref().unwrap().server["port"], 1234);
         e.restore(&mut || false).unwrap();
         assert!(e.state.is_none());
+    }
+    #[test]
+    fn empty_recovery_cannot_clear_an_unverified_original_server_state() {
+        let mut e = engine(Fake::new());
+        write_json(&e.path, &json!({"schema":2,"server":{"running":false},"server_stopped":false,"models":[],"pause_complete":true})).unwrap();
+        e = Engine::new(e.config.clone(), e.backend.clone(), e.path.clone()).unwrap();
+        assert!(
+            e.restore(&mut || false)
+                .unwrap_err()
+                .to_string()
+                .contains("server state is unverified")
+        );
+        assert!(e.state.is_some());
+        assert!(e.backend.running);
+        assert!(
+            e.backend.events.is_empty(),
+            "do not stop an externally started service without saved control intent"
+        );
+        assert_eq!(e.restore_completions, 0);
+        let journal: Journal = serde_json::from_slice(&fs::read(&e.path).unwrap()).unwrap();
+        assert!(!journal.providers[0].restore_complete);
     }
 }

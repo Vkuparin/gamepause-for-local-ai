@@ -1,7 +1,10 @@
 use crate::{
+    commands::{Commands, Outcome, Waiting},
     config::{self, Config, write_json},
+    control::{Activity, ControlState, CoreCommand},
     discovery::{Discovery, Game},
     engine::Engine,
+    gameplay::{GameEvidence, RestoreFeedback, RestoreOffer, selected_exclusions},
     lmstudio::{Backend, LMStudio},
     processes::{ActiveGame, RunningApp, Scanner},
     tray,
@@ -18,16 +21,47 @@ use std::{
 
 #[derive(Clone, Debug)]
 pub enum Action {
+    Tracked { id: u64, action: Box<Action> },
+    RemoveCustom { path: String, name: String },
     Pause,
+    Resume,
     Restore,
+    ConfirmedRestore { offer_id: u64, ignored: Vec<String> },
+    RetryGameplayRestore,
     Disable,
     Refresh,
     Verify,
+    Doctor,
+    PowerChanged,
     Quit,
     Settings(Box<Config>),
+    AdvancedSettings(Box<Config>),
+    AdvancedVisibility(bool),
+    NotificationPreferences { visual: bool, sound: bool },
+    Appearance(crate::config::Appearance),
+}
+impl Action {
+    fn changes_settings(&self) -> bool {
+        matches!(
+            self,
+            Action::Settings(_)
+                | Action::AdvancedSettings(_)
+                | Action::AdvancedVisibility(_)
+                | Action::NotificationPreferences { .. }
+                | Action::Appearance(_)
+                | Action::Disable
+                | Action::RemoveCustom { .. }
+        ) || matches!(self, Action::ConfirmedRestore { ignored, .. } if !ignored.is_empty())
+    }
 }
 #[derive(Clone, Default)]
 pub struct Shared {
+    pub commands: Commands,
+    pub restore_offer: Option<RestoreOffer>,
+    pub coexistence: bool,
+    pub restore_feedback: Option<RestoreFeedback>,
+    pub activity: Activity,
+    pub detection_ok: bool,
     pub message: String,
     pub disabled: bool,
     pub manual_pause: bool,
@@ -47,8 +81,145 @@ pub struct Shared {
     pub verifying: bool,
     pub pause_completions: u64,
     pub restore_completions: u64,
+    pub provider_statuses: Vec<crate::coordinator::Report>,
+    pub doctor_report: Option<Value>,
+    pub doctor_pending: bool,
+    pub power: Arc<crate::power::Signal>,
+}
+
+pub fn local_result(state: &SharedState, outcome: Outcome, message: impl Into<String>) {
+    if let Ok(mut shared) = state.lock() {
+        shared.settings_error.clear();
+        shared.commands.local(outcome, message);
+    }
+}
+
+pub fn request_action(state: &SharedState, tx: &mpsc::Sender<Action>, action: Action, label: &str) {
+    if let Ok(mut shared) = state.lock() {
+        let settings = action.changes_settings();
+        let doctor = matches!(action, Action::Doctor);
+        if doctor {
+            if !shared.config.advanced_settings_visible {
+                shared.commands.local(
+                    Outcome::Failed,
+                    "Advanced settings is hidden; show it before using diagnostics.",
+                );
+                return;
+            }
+            if shared.doctor_pending {
+                shared.commands.local(
+                    Outcome::NoChange,
+                    "Read-only diagnostics are already running.",
+                );
+                return;
+            }
+            shared.doctor_pending = true;
+        }
+        if settings && shared.commands.settings_pending {
+            shared.commands.local(
+                Outcome::NoChange,
+                "A settings change is still being saved. Wait before changing another preference.",
+            );
+            return;
+        }
+        shared.settings_error.clear();
+        let refresh = matches!(action, Action::Refresh);
+        let id = if refresh {
+            let Some(id) = shared.commands.request_refresh() else {
+                return;
+            };
+            id
+        } else {
+            shared.commands.begin(format!("{label} requested."))
+        };
+        shared.commands.settings_pending |= settings;
+        if tx
+            .send(Action::Tracked {
+                id,
+                action: Box::new(action),
+            })
+            .is_err()
+        {
+            shared.doctor_pending &= !doctor;
+            shared.commands.settings_pending &= !settings;
+            if refresh {
+                shared
+                    .commands
+                    .refresh_failed(id, "The discovery worker is unavailable.".into());
+            } else {
+                shared
+                    .commands
+                    .update(id, Outcome::Failed, "The control worker is unavailable.");
+            }
+        }
+    }
 }
 pub type SharedState = Arc<Mutex<Shared>>;
+pub fn request_quit(state: &SharedState, tx: &mpsc::Sender<Action>) {
+    if tx.send(Action::Quit).is_err() {
+        local_result(
+            state,
+            Outcome::Failed,
+            "The control worker is unavailable; Quit could not be delivered.",
+        );
+    }
+}
+impl Shared {
+    pub fn provider_pending(&self, kind: crate::provider::Kind) -> bool {
+        (self.pending && self.provider_statuses.is_empty())
+            || self
+                .provider_statuses
+                .iter()
+                .any(|report| report.kind == kind && report.pending)
+    }
+    pub fn controls(&self) -> ControlState {
+        ControlState {
+            activity: if self.verifying {
+                Activity::Verifying
+            } else {
+                self.activity
+            },
+            active_mode: self.active_mode,
+            provider_enabled: self.config.any_provider_enabled(),
+            detection_ready: self.discovery_ready
+                && self.detection_ok
+                && !self.disabled
+                && self.discovery_errors.is_empty(),
+            gaming: !self.active_games.is_empty(),
+            pending: self.pending,
+            manual_hold: self.manual_pause,
+            gameplay_restore: self.restore_offer.is_some() || self.coexistence,
+            coexistence: self.coexistence,
+        }
+    }
+}
+
+pub fn request_core(state: &SharedState, tx: &mpsc::Sender<Action>, command: CoreCommand) {
+    if let Ok(mut shared) = state.lock() {
+        let availability = shared.controls().availability();
+        if !availability.allows(command) {
+            shared.settings_error.clear();
+            shared.commands.local(Outcome::Failed, availability.reason);
+            return;
+        }
+        let action = match command {
+            CoreCommand::Pause => Action::Pause,
+            CoreCommand::Resume => Action::Resume,
+            CoreCommand::Restore => Action::Restore,
+        };
+        drop(shared);
+        request_action(
+            state,
+            tx,
+            action,
+            match command {
+                CoreCommand::Pause => "Pause AI",
+                CoreCommand::Resume => "Resume AI",
+                CoreCommand::Restore => "Resume AI",
+            },
+        );
+    }
+}
 #[derive(Default)]
 struct Options {
     folder: Option<PathBuf>,
@@ -142,7 +313,33 @@ fn format_status(status: &Value) -> String {
         ("last_error", field("last_error")),
         ("recovery_pending", field("recovery_pending")),
     ];
-    lines.map(|(k, v)| format!("{k}={v}")).join("\n")
+    let mut output = lines.map(|(k, v)| format!("{k}={v}")).join("\n");
+    if let Some(providers) = status["provider_outcomes"].as_array() {
+        output.push_str("\nprovider_evidence=cached_status");
+        for provider in providers {
+            // Keys come from known provider kinds, never from arbitrary IDs.
+            let Some(kind @ ("lmstudio" | "ollama")) = provider["kind"].as_str() else {
+                continue;
+            };
+            for key in [
+                "id",
+                "state",
+                "guarantee",
+                "pending",
+                "error",
+                "retry_seconds",
+            ] {
+                let value = match provider.get(key) {
+                    Some(Value::Null) | None => "-".into(),
+                    Some(Value::String(value)) => escape_field(value),
+                    Some(Value::Bool(value)) => bool_word(*value),
+                    Some(value) => value.to_string(),
+                };
+                output.push_str(&format!("\nprovider.{kind}.{key}={value}"));
+            }
+        }
+    }
+    output
 }
 /// `name<TAB>launcher<TAB>path` per installed location, in inventory order.
 /// Empty inventory renders as `none` so the command never prints an empty
@@ -214,7 +411,7 @@ pub fn main(console: bool) -> Result<()> {
     }
     if args.help {
         println!(
-            "GamePause for LM Studio\n--headless --active --observe --duration SECONDS\n--doctor --discover --restore --verify --status --games --data-dir PATH\nDefault: automatic pausing with a native dashboard. --background starts in the tray. --observe is a diagnostic override. --verify unloads/reloads all loaded models using durable recovery; close games and the GUI first. --doctor never starts/stops the server or unloads models. --status/--games print stable, parseable one-line-per-item output for scripting."
+            "GamePause for LM Studio and experimental Ollama\n--headless --active --observe --duration SECONDS\n--doctor --discover --restore --verify --status --games --data-dir PATH\nDefault: automatic pausing with a native dashboard. --background starts in the tray. --observe is a diagnostic override. --verify unloads/reloads LM Studio models using durable recovery; close games and the GUI first. --doctor never starts/stops the server or unloads models. --status/--games print stable, parseable one-line-per-item output for scripting. Ollama is disabled by default and not tested with a live installation. Opt in through Advanced settings or its explicit enabled config field. Only supported local GGUF completion models, identity/context and remaining observed finite residency are promised; full load options and conversations are not preserved. Contributor fixes and live evidence are welcome."
         );
         return Ok(());
     }
@@ -223,29 +420,16 @@ pub fn main(console: bool) -> Result<()> {
         let _ = fs::create_dir_all(&folder);
         let config_result = (|| -> Result<Config> {
             let value: Config = match fs::read_to_string(folder.join("config.json")) {
-                Ok(text) => serde_json::from_str(text.trim_start_matches('\u{feff}'))?,
+                Ok(text) => Config::parse(&text)?,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::default(),
                 Err(e) => return Err(e.into()),
             };
             value.validate()?;
             Ok(value)
         })();
-        let mut report = match config_result
-            .as_ref()
-            .map_err(|e| anyhow::anyhow!("{e:#}"))
-            .and_then(|c| LMStudio::new(c.clone()))
-        {
-            Ok(mut backend) => {
-                backend.set_log_folder(folder.clone());
-                backend.doctor(&folder)
-            }
-            Err(e) => {
-                json!({"cli_version":{"ok":false,"error":format!("{e:#}")}, "server":{"ok":null},"loaded_models":{"ok":null},"ws_protocol":{"ok":null},"data_dir":{"path":folder.to_string_lossy(),"writable":crate::lmstudio::data_dir_writable(&folder)},"read_only":true})
-            }
-        };
-        report["configuration"] = match config_result {
-            Ok(_) => json!({"ok":true}),
-            Err(e) => json!({"ok":false,"error":format!("{e:#}")}),
+        let mut report = match config_result {
+            Ok(config) => crate::diagnostics::doctor(&config, &folder),
+            Err(error) => crate::diagnostics::configuration_error(&folder, format!("{error:#}")),
         };
         if let Err(e) = write_json(&folder.join("doctor-report.json"), &report) {
             report["report_write_error"] = json!(format!("{e:#}"));
@@ -302,6 +486,11 @@ pub fn main(console: bool) -> Result<()> {
         }
     };
     let mut config = Config::load(&folder.join("config.json"))?;
+    if args.headless && config.ollama_enabled() {
+        eprintln!(
+            "Ollama: experimental, not tested with a live installation. Limited identity/context/remaining-deadline guarantee; full load settings and conversations are not preserved."
+        );
+    }
     if args.active {
         config.mode = "active".into();
     }
@@ -318,6 +507,7 @@ pub fn main(console: bool) -> Result<()> {
     }
     let backend = LMStudio::new(config.clone());
     let backend = OptionalBackend {
+        claims: Default::default(),
         backend: backend.ok(),
         config: config.clone(),
         folder: Some(folder.clone()),
@@ -327,6 +517,10 @@ pub fn main(console: bool) -> Result<()> {
         if config.mode != "active" {
             bail!("Observe mode cannot restore or verify models");
         }
+        let power = Arc::new(crate::power::Signal::default());
+        let (wake, _power_events) = mpsc::channel();
+        let power_registration = crate::power::Registration::headless(power.clone(), wake)?;
+        engine.observe_power(move || !power.permits(0));
         let mut discovery = Discovery::default();
         let games = discovery.recover_refresh(&config, 0., true, false).0;
         if !discovery.errors.is_empty() {
@@ -337,13 +531,16 @@ pub fn main(console: bool) -> Result<()> {
         }
         let guard_games = recovery_games(&engine, &games);
         let mut scanner = recovery_scanner(&config)?;
-        if !scanner.scan(&guard_games)?.is_empty() {
-            bail!("Close the detected game before restoring or verifying AI");
+        if scan_evidence(&mut scanner, &config, &guard_games)
+            .is_none_or(|evidence| evidence.gaming())
+        {
+            bail!(
+                "Close detected games and resolve unknown detection before restoring or verifying AI"
+            );
         }
         let mut cancelled = || {
-            scanner
-                .scan(&guard_games)
-                .map_or(true, |active| !active.is_empty())
+            scan_evidence(&mut scanner, &config, &guard_games)
+                .is_none_or(|evidence| evidence.gaming())
         };
         if args.verify {
             let report = engine.verify_round_trip(&mut cancelled);
@@ -355,17 +552,24 @@ pub fn main(console: bool) -> Result<()> {
         } else {
             engine.restore(&mut cancelled)?;
             println!("{}", engine.message);
-            if engine.state.is_some() {
+            if engine.pending() {
                 bail!("Restoration deferred; recovery pending");
             }
         }
+        power_registration.close()?;
         return Ok(());
     }
     let state = Arc::new(Mutex::new(Shared {
+        commands: Commands::default(),
+        activity: engine.activity,
+        restore_offer: None,
+        coexistence: false,
+        restore_feedback: None,
+        detection_ok: false,
         message: "Starting GamePause".into(),
         disabled: false,
         manual_pause: false,
-        pending: engine.state.is_some(),
+        pending: engine.pending(),
         active_mode: config.mode == "active",
         config: config.clone(),
         games: vec![],
@@ -379,10 +583,23 @@ pub fn main(console: bool) -> Result<()> {
         verifying: false,
         pause_completions: 0,
         restore_completions: 0,
+        provider_statuses: vec![],
+        doctor_report: None,
+        doctor_pending: false,
+        power: Default::default(),
     }));
     let (tx, rx) = mpsc::channel();
     if args.headless {
-        run(engine, folder, state, rx, args.duration, console)?;
+        let power_signal = state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Shared state unavailable"))?
+            .power
+            .clone();
+        let power_registration = crate::power::Registration::headless(power_signal, tx)?;
+        let result = run(engine, folder, state, rx, args.duration, console);
+        let cleanup = power_registration.close();
+        result?;
+        cleanup?;
     } else {
         let worker_state = state.clone();
         let worker_folder = folder.clone();
@@ -413,6 +630,7 @@ pub fn main(console: bool) -> Result<()> {
 }
 struct OptionalBackend {
     backend: Option<LMStudio>,
+    claims: crate::ownership::SharedClaims,
     config: Config,
     folder: Option<PathBuf>,
 }
@@ -422,6 +640,7 @@ impl OptionalBackend {
             self.backend = Some(LMStudio::new(self.config.clone())?);
         }
         let backend = self.backend.as_mut().unwrap();
+        backend.use_claims(self.claims.clone());
         if let Some(folder) = &self.folder {
             backend.set_log_folder(folder.clone());
         }
@@ -453,7 +672,17 @@ impl Backend for OptionalBackend {
     fn read_config(&mut self, m: &crate::lmstudio::Model) -> Result<Value> {
         self.get()?.read_config(m)
     }
+    fn server_state(&mut self) -> Result<Value> {
+        self.get()?.server_state()
+    }
+    fn verify_restored(&mut self, m: &crate::lmstudio::Model) -> Result<()> {
+        self.get()?.verify_restored(m)
+    }
+    fn select_control_port(&mut self, port: u16) -> Result<()> {
+        self.get()?.select_control_port(port)
+    }
 }
+#[cfg(test)]
 fn apply_action(
     action: Action,
     engine: &mut Engine<OptionalBackend>,
@@ -463,12 +692,280 @@ fn apply_action(
     now: f64,
     state: &SharedState,
 ) -> Result<bool> {
+    apply_action_detected(action, engine, folder, scanner, games, now, state, None)
+}
+#[allow(clippy::too_many_arguments)]
+fn apply_action_detected(
+    action: Action,
+    engine: &mut Engine<OptionalBackend>,
+    folder: &std::path::Path,
+    scanner: &mut Scanner,
+    games: &[Game],
+    now: f64,
+    state: &SharedState,
+    detection: Option<&BackgroundDetection>,
+) -> Result<bool> {
+    if let Action::Tracked { id, action } = action {
+        let action = *action;
+        let settings = action.changes_settings();
+        let refresh = matches!(action, Action::Refresh);
+        let before = serde_json::to_value(&engine.config)?;
+        let waiting = match action {
+            Action::Pause => Some(Waiting::Pause),
+            Action::Restore | Action::ConfirmedRestore { .. } | Action::RetryGameplayRestore => {
+                Some(Waiting::Restore)
+            }
+            _ => None,
+        };
+        let success = match &action {
+            Action::RemoveCustom { name, .. } => format!("Removed custom game \"{name}\"; saved."),
+            Action::Settings(_)
+            | Action::AdvancedSettings(_)
+            | Action::AdvancedVisibility(_)
+            | Action::NotificationPreferences { .. }
+            | Action::Appearance(_)
+            | Action::Disable => "Settings saved.".into(),
+            Action::Resume => {
+                "Manual hold released; normal recovery guards and delay apply.".into()
+            }
+            Action::Doctor => {
+                "Read-only diagnostics finished; see Advanced provider details.".into()
+            }
+            _ => "Command completed.".into(),
+        };
+        let gameplay = matches!(
+            action,
+            Action::ConfirmedRestore { .. } | Action::RetryGameplayRestore
+        );
+        let verify = matches!(action, Action::Verify);
+        let doctor = matches!(action, Action::Doctor);
+        if let Ok(mut shared) = state.lock() {
+            shared.settings_error.clear();
+            shared
+                .commands
+                .update(id, Outcome::Working, "Processing request...");
+        }
+        let result = apply_action_detected(
+            action, engine, folder, scanner, games, now, state, detection,
+        );
+        if let Ok(mut shared) = state.lock() {
+            if doctor {
+                shared.doctor_pending = false;
+            }
+            if settings {
+                shared.commands.settings_pending = false;
+            }
+            if verify && result.is_err() {
+                shared.verifying = false;
+            }
+            let failure = result
+                .as_ref()
+                .err()
+                .map(|e| format!("Command failed: {e:#}"))
+                .or_else(|| {
+                    (!shared.settings_error.is_empty()).then(|| shared.settings_error.clone())
+                });
+            if let Some(failure) = failure {
+                shared.commands.update(id, Outcome::Failed, failure);
+                shared.settings_error.clear();
+            } else if refresh {
+                // run() binds this request to the next dispatch generation.
+            } else if gameplay {
+                let text = shared
+                    .restore_feedback
+                    .as_ref()
+                    .map(RestoreFeedback::text)
+                    .unwrap_or_default();
+                let failed = !engine.last_error.is_empty()
+                    || shared
+                        .restore_feedback
+                        .as_ref()
+                        .is_some_and(|feedback| feedback.preference_failure)
+                    || !shared
+                        .restore_feedback
+                        .as_ref()
+                        .is_some_and(|feedback| feedback.accepted);
+                shared.commands.update(
+                    id,
+                    if failed {
+                        Outcome::Failed
+                    } else if engine.pending() {
+                        Outcome::Working
+                    } else {
+                        Outcome::Completed
+                    },
+                    text,
+                );
+                if !failed && engine.pending() {
+                    let exclusions = shared
+                        .restore_feedback
+                        .as_ref()
+                        .map(|f| f.exclusions.clone())
+                        .unwrap_or_default();
+                    shared.commands.waiting = Some((id, Waiting::GameplayRestore(exclusions)));
+                }
+            } else if verify {
+                if let Some(report) = &shared.verify_report {
+                    let summary = crate::dashboard::render_verify_report(report);
+                    let outcome = if report.ok {
+                        Outcome::Completed
+                    } else {
+                        Outcome::Failed
+                    };
+                    shared.commands.update(id, outcome, summary);
+                }
+            } else if let Some(waiting) = waiting {
+                shared.commands.waiting = Some((id, waiting));
+            } else {
+                let unchanged = settings && before == serde_json::to_value(&engine.config)?;
+                shared.commands.update(
+                    id,
+                    if unchanged {
+                        Outcome::NoChange
+                    } else {
+                        Outcome::Completed
+                    },
+                    if unchanged {
+                        "Settings unchanged.".into()
+                    } else {
+                        success
+                    },
+                );
+            }
+        }
+        return result;
+    }
+    let core = match action {
+        Action::Pause => Some(CoreCommand::Pause),
+        Action::Resume => Some(CoreCommand::Resume),
+        Action::Restore => Some(CoreCommand::Restore),
+        _ => None,
+    };
+    if let Some(command) = core {
+        // Revalidate against engine evidence and a fresh, exclusion-free scan.
+        // A queued UI click cannot create/release a hold by toggling stale state.
+        let ready = state
+            .lock()
+            .map(|s| s.discovery_ready && s.detection_ok && s.discovery_errors.is_empty())
+            .unwrap_or(false);
+        let mut guard = recovery_scanner(&engine.config)?;
+        let current = action_evidence(
+            detection,
+            &mut guard,
+            &engine.config,
+            &recovery_games(engine, games),
+            ready,
+        );
+        let controls = ControlState {
+            activity: engine.activity,
+            active_mode: engine.config.mode == "active",
+            provider_enabled: engine.config.any_provider_enabled(),
+            detection_ready: ready && !engine.disabled && current.is_some(),
+            gaming: current.as_ref().is_some_and(GameEvidence::gaming),
+            pending: engine.pending(),
+            manual_hold: engine.manual_pause,
+            gameplay_restore: false,
+            coexistence: engine.gameplay.active(),
+        };
+        let availability = controls.availability();
+        if !availability.allows(command) {
+            if let Ok(mut shared) = state.lock() {
+                shared.settings_error = availability.reason.into();
+            }
+            return Ok(false);
+        }
+    }
     match action {
+        Action::Tracked { .. } => unreachable!(),
+        Action::RemoveCustom { path, name } => {
+            let updated = remove_custom(&engine.config, &path, &name)?;
+            return apply_action_detected(
+                Action::Settings(Box::new(updated)),
+                engine,
+                folder,
+                scanner,
+                games,
+                now,
+                state,
+                detection,
+            );
+        }
+        Action::AdvancedSettings(updated) => {
+            if !engine.config.advanced_settings_visible {
+                bail!("Advanced settings is hidden; stale settings command refused");
+            }
+            return apply_action_detected(
+                Action::Settings(updated),
+                engine,
+                folder,
+                scanner,
+                games,
+                now,
+                state,
+                detection,
+            );
+        }
+        Action::AdvancedVisibility(visible) => {
+            let mut updated = engine.config.clone();
+            updated.advanced_settings_visible = visible;
+            return apply_action_detected(
+                Action::Settings(Box::new(updated)),
+                engine,
+                folder,
+                scanner,
+                games,
+                now,
+                state,
+                detection,
+            );
+        }
+        Action::Appearance(appearance) => {
+            if !engine.config.advanced_settings_visible {
+                bail!("Advanced settings is hidden; stale appearance preference refused");
+            }
+            let mut updated = engine.config.clone();
+            updated.appearance = appearance;
+            write_json(&folder.join("config.json"), &updated)?;
+            engine.config.appearance = appearance;
+            engine.backend.config.appearance = appearance;
+            if let Ok(mut shared) = state.lock() {
+                shared.config.appearance = appearance;
+                shared.settings_error.clear();
+                shared.revision += 1;
+            }
+        }
+        Action::NotificationPreferences { visual, sound } => {
+            if !engine.config.advanced_settings_visible {
+                bail!("Advanced settings is hidden; stale notification preference refused");
+            }
+            let mut updated = engine.config.clone();
+            updated.notifications_enabled = visual;
+            updated.sound_enabled = sound;
+            return apply_action_detected(
+                Action::Settings(Box::new(updated)),
+                engine,
+                folder,
+                scanner,
+                games,
+                now,
+                state,
+                detection,
+            );
+        }
         Action::Settings(updated) => {
+            engine.gameplay.invalidate_offer();
             let result = (|| -> Result<()> {
                 updated.validate()?;
+                if engine.pending() {
+                    engine.validate_recovery_edit(&updated)?;
+                }
                 let replacement = Scanner::new((*updated).clone())?;
                 write_json(&folder.join("config.json"), updated.as_ref())?;
+                if !engine.provider_pending(crate::provider::Kind::LMStudio)
+                    && updated.providers != engine.config.providers
+                {
+                    engine.backend.claims = Default::default();
+                }
                 engine.backend.config = (*updated).clone();
                 engine.backend.backend = None;
                 engine.config = *updated;
@@ -490,7 +987,7 @@ fn apply_action(
         Action::Disable => {
             let mut updated = engine.config.clone();
             updated.automation_enabled = !updated.automation_enabled;
-            return apply_action(
+            return apply_action_detected(
                 Action::Settings(Box::new(updated)),
                 engine,
                 folder,
@@ -498,12 +995,16 @@ fn apply_action(
                 games,
                 now,
                 state,
+                detection,
             );
         }
         Action::Pause => {
-            if engine.config.mode == "active" {
-                engine.manual_pause = !engine.manual_pause;
-            }
+            engine.remember_games(engine.gameplay.remembered_games())?;
+            engine.gameplay.revoke();
+            engine.request_manual_pause();
+        }
+        Action::Resume => {
+            engine.manual_pause = false;
         }
         Action::Restore => {
             if engine.config.mode == "observe" {
@@ -515,24 +1016,108 @@ fn apply_action(
             engine.manual_pause = false;
             let mut guard = recovery_scanner(&engine.config)?;
             let guard_games = recovery_games(engine, games);
-            let result =
-                engine.restore(&mut || guard.scan(&guard_games).map_or(true, |a| !a.is_empty()));
+            let config = engine.config.clone();
+            let result = engine.restore(&mut || {
+                action_evidence(detection, &mut guard, &config, &guard_games, true)
+                    .is_none_or(|evidence| evidence.gaming())
+            });
             engine.restore_failed = true;
             engine.attempt(result, now);
         }
+        Action::ConfirmedRestore { offer_id, ignored } => {
+            let ready = state
+                .lock()
+                .map(|s| s.discovery_ready && s.detection_ok && s.discovery_errors.is_empty())
+                .unwrap_or(false);
+            let known = recovery_games(engine, games);
+            let mut guard = recovery_scanner(&engine.config)?;
+            let feedback = confirmed_restore(
+                engine,
+                offer_id,
+                &ignored,
+                now,
+                ready,
+                &mut |config| action_evidence(detection, &mut guard, config, &known, ready),
+                &mut |config| {
+                    write_json(&folder.join("config.json"), config)?;
+                    if let Ok(mut shared) = state.lock() {
+                        shared.config = config.clone();
+                        shared.revision += 1;
+                    }
+                    Ok(())
+                },
+            );
+            engine.backend.config = engine.config.clone();
+            *scanner = Scanner::new(engine.config.clone())?;
+            if let Ok(mut shared) = state.lock() {
+                shared.restore_feedback = Some(feedback);
+                shared.restore_offer = engine.gameplay.offer();
+                shared.coexistence = engine.gameplay.active();
+                shared.config = engine.config.clone();
+                shared.revision += 1;
+            }
+        }
+        Action::RetryGameplayRestore => {
+            let ready = state
+                .lock()
+                .map(|s| s.discovery_ready && s.detection_ok && s.discovery_errors.is_empty())
+                .unwrap_or(false);
+            if !ready || !engine.pending() || !engine.gameplay.active() || engine.activity.busy() {
+                if !ready {
+                    engine.gameplay.revoke();
+                }
+                if let Ok(mut shared) = state.lock() {
+                    let feedback = shared.restore_feedback.get_or_insert_with(Default::default);
+                    feedback.accepted = false;
+                    feedback.restoration =
+                        "Gameplay retry is unavailable; no model operation performed.".into();
+                }
+                return Ok(false);
+            }
+            let known = recovery_games(engine, games);
+            let mut guard = recovery_scanner(&engine.config)?;
+            let config = engine.config.clone();
+            let result = engine.restore_gameplay(&mut || {
+                action_evidence(detection, &mut guard, &config, &known, ready)
+            });
+            let outcome = restore_outcome(engine, &result);
+            engine.restore_failed = true;
+            engine.attempt(result, now);
+            if let Ok(mut shared) = state.lock() {
+                let feedback = shared.restore_feedback.get_or_insert_with(Default::default);
+                feedback.accepted = true;
+                feedback.restoration = outcome;
+            }
+        }
+        Action::Doctor => {
+            if !engine.config.advanced_settings_visible {
+                bail!("Advanced settings is hidden; stale diagnostics command refused");
+            }
+            let report = crate::diagnostics::doctor(&engine.config, folder);
+            if let Ok(mut shared) = state.lock() {
+                shared.doctor_report = Some(report);
+                shared.revision += 1;
+            }
+        }
         Action::Verify => {
+            if !engine.config.advanced_settings_visible {
+                bail!("Advanced settings is hidden; stale test command refused");
+            }
             let ready = state
                 .lock()
                 .map(|s| s.discovery_ready && s.discovery_errors.is_empty())
                 .unwrap_or(false);
             let guard_games = recovery_games(engine, games);
             let mut guard = recovery_scanner(&engine.config)?;
+            let config = engine.config.clone();
             let report = engine.verify_round_trip(&mut || {
-                !ready || guard.scan(&guard_games).map_or(true, |a| !a.is_empty())
+                !ready
+                    || action_evidence(detection, &mut guard, &config, &guard_games, ready)
+                        .is_none_or(|evidence| evidence.gaming())
             });
             if let Ok(mut shared) = state.lock() {
                 shared.verifying = false;
-                shared.pending = engine.state.is_some();
+                shared.pending = engine.pending();
                 shared.verify_report = Some(report.clone());
                 shared.message = report.summary.clone();
                 shared.revision += 1;
@@ -540,30 +1125,162 @@ fn apply_action(
             return Ok(true);
         }
         Action::Refresh => return Ok(true),
-        Action::Quit => (),
+        Action::Quit | Action::PowerChanged => (),
     }
     Ok(false)
 }
 pub fn request_verify(state: &SharedState, tx: &mpsc::Sender<Action>) {
     if let Ok(mut shared) = state.lock() {
         if shared.verifying
+            || !shared.config.advanced_settings_visible
             || !shared.active_mode
+            || !shared.config.lm_enabled()
             || shared.disabled
             || shared.pending
             || shared.manual_pause
             || !shared.discovery_ready
+            || !shared.detection_ok
+            || shared.activity.busy()
             || !shared.active_games.is_empty()
             || !shared.discovery_errors.is_empty()
         {
-            shared.settings_error = "Round-trip unavailable: finish recovery, close games, enable active detection, and wait for discovery.".into();
+            shared.settings_error.clear();
+            shared.commands.local(Outcome::Failed, "Round-trip unavailable: finish recovery, close games, enable active detection, and wait for discovery.");
             return;
         }
         shared.settings_error.clear();
         shared.verifying = true;
-        if tx.send(Action::Verify).is_err() {
+        let id = shared.commands.begin("Test round-trip requested.");
+        if tx
+            .send(Action::Tracked {
+                id,
+                action: Box::new(Action::Verify),
+            })
+            .is_err()
+        {
             shared.verifying = false;
+            shared
+                .commands
+                .update(id, Outcome::Failed, "The control worker is unavailable.");
         }
     }
+}
+pub fn remove_custom(config: &Config, path: &str, name: &str) -> Result<Config> {
+    let index = config
+        .extra_games
+        .iter()
+        .position(|game| {
+            crate::discovery::canonical(&game.path) == crate::discovery::canonical(path)
+                && game.name == name
+        })
+        .context("Selected custom game changed or was removed; select it again")?;
+    let mut updated = config.clone();
+    updated.extra_games.remove(index);
+    updated.validate()?;
+    Ok(updated)
+}
+fn evidence_from(all: Vec<ActiveGame>, trigger_scanner: &Scanner, config: &Config) -> GameEvidence {
+    let triggers = all
+        .iter()
+        .filter(|game| {
+            let name = game.executable.rsplit(['\\', '/']).next().unwrap_or("");
+            !trigger_scanner.excluded(name, &game.executable)
+                && !config.ignored_games.iter().any(|path| {
+                    crate::discovery::canonical(path) == crate::discovery::canonical(&game.path)
+                })
+        })
+        .cloned()
+        .collect();
+    GameEvidence { all, triggers }
+}
+fn scan_evidence(guard: &mut Scanner, config: &Config, games: &[Game]) -> Option<GameEvidence> {
+    let all = guard.scan(games).ok()?;
+    if guard.uncertain_games {
+        return None;
+    }
+    let trigger_scanner = Scanner::new(config.clone()).ok()?;
+    let evidence = evidence_from(all, &trigger_scanner, config);
+    evidence.reliable().then_some(evidence)
+}
+fn restore_outcome<B: Backend>(engine: &Engine<B>, result: &Result<()>) -> String {
+    if let Err(error) = result {
+        format!("Restore failed: {error:#}. Recovery retained.")
+    } else if engine.pending() {
+        "Restore interrupted or deferred; recovery retained.".into()
+    } else {
+        "AI restoration completed and verified.".into()
+    }
+}
+pub(crate) fn confirmed_restore<B: Backend>(
+    engine: &mut Engine<B>,
+    offer_id: u64,
+    ignored: &[String],
+    now: f64,
+    ready: bool,
+    scan: &mut dyn FnMut(&Config) -> Option<GameEvidence>,
+    save: &mut dyn FnMut(&Config) -> Result<()>,
+) -> RestoreFeedback {
+    let mut feedback = RestoreFeedback {
+        accepted: false,
+        preference_failure: false,
+        exclusions: "Ignore preferences unchanged.".into(),
+        restoration: String::new(),
+        tracking_recovery: false,
+    };
+    let accepted = (|| -> Result<Vec<ActiveGame>> {
+        if !ready
+            || engine.disabled
+            || engine.config.mode != "active"
+            || engine.activity.busy()
+            || !engine.pending()
+        {
+            if !ready {
+                engine.gameplay.revoke();
+            }
+            bail!(
+                "Restore confirmation is unavailable; wait for successful detection and pending recovery"
+            );
+        }
+        let Some(current) = scan(&engine.config).filter(GameEvidence::reliable) else {
+            engine.gameplay.revoke();
+            bail!("Game detection is unknown; gameplay Restore refused");
+        };
+        let offer = engine
+            .gameplay
+            .offer()
+            .context("Restore confirmation expired")?;
+        selected_exclusions(&engine.config, &offer.games, ignored)?;
+        engine.gameplay.confirm(offer_id, &current)
+    })();
+    let approved = match accepted {
+        Ok(games) => games,
+        Err(error) => {
+            feedback.restoration = format!("Restore refused: {error:#}");
+            return feedback;
+        }
+    };
+    feedback.accepted = true;
+    if !ignored.is_empty() {
+        let saved = selected_exclusions(&engine.config, &approved, ignored).and_then(|updated| {
+            save(&updated)?;
+            engine.config = updated;
+            Ok(())
+        });
+        feedback.exclusions = match saved {
+            Ok(()) => "Selected Ignore in future preferences saved.".into(),
+            Err(error) => {
+                feedback.preference_failure = true;
+                format!("Ignore preferences could not be saved: {error:#}")
+            }
+        };
+    }
+    let config = engine.config.clone();
+    let result = engine.restore_gameplay(&mut || scan(&config));
+    feedback.restoration = restore_outcome(engine, &result);
+    feedback.tracking_recovery = engine.pending();
+    engine.restore_failed = true;
+    engine.attempt(result, now);
+    feedback
 }
 fn recovery_scanner(config: &Config) -> Result<Scanner> {
     let mut guard = config.clone();
@@ -573,7 +1290,8 @@ fn recovery_scanner(config: &Config) -> Result<Scanner> {
 }
 fn recovery_games(engine: &Engine<OptionalBackend>, games: &[Game]) -> Vec<Game> {
     let mut known = games.to_vec();
-    for game in &engine.remembered_games {
+    let approved = engine.gameplay.remembered_games();
+    for game in engine.remembered_games.iter().chain(approved.iter()) {
         if !known.iter().any(|g| {
             crate::discovery::canonical(&g.path) == crate::discovery::canonical(&game.path)
         }) {
@@ -610,6 +1328,209 @@ impl Monitor {
         self.failures = 0;
     }
 }
+#[derive(Clone)]
+struct DetectionInput {
+    power: Arc<crate::power::Signal>,
+    power_generation: u64,
+    config: Config,
+    games: Vec<Game>,
+    guard_games: Vec<Game>,
+    steam_roots: Vec<String>,
+    guarded: bool,
+    ready: bool,
+}
+#[derive(Clone)]
+struct DetectionFrame {
+    power_generation: u64,
+    config: Value,
+    active: Vec<ActiveGame>,
+    all: Vec<ActiveGame>,
+    evidence: Option<GameEvidence>,
+    inaccessible: usize,
+    candidate: u64,
+    lm_running: bool,
+    running_apps: Vec<RunningApp>,
+}
+struct NativeDetection {
+    power_generation: u64,
+    config: Value,
+    scanner: Scanner,
+    guard: Scanner,
+    candidate: u64,
+}
+impl NativeDetection {
+    fn new(config: &Config) -> Result<Self> {
+        Ok(Self {
+            power_generation: 0,
+            config: serde_json::to_value(config)?,
+            scanner: Scanner::new(config.clone())?,
+            guard: recovery_scanner(config)?,
+            candidate: 0,
+        })
+    }
+    fn scan(&mut self, input: &DetectionInput) -> Result<DetectionFrame> {
+        if !input.power.permits(input.power_generation) {
+            bail!("Power state changed; fresh post-resume detection required");
+        }
+        let config = serde_json::to_value(&input.config)?;
+        if config != self.config || self.power_generation != input.power_generation {
+            let scanner = Scanner::new(input.config.clone())?;
+            let guard = recovery_scanner(&input.config)?;
+            self.scanner = scanner;
+            self.guard = guard;
+            self.config = config.clone();
+            self.power_generation = input.power_generation;
+        }
+        let scanned = self.scanner.scan(&input.games)?;
+        if self
+            .scanner
+            .new_game_candidate(&input.games, &input.steam_roots)
+        {
+            self.candidate = self.candidate.saturating_add(1);
+        }
+        let all = if input.guarded {
+            self.guard.scan(&input.guard_games)?
+        } else {
+            scanned.clone()
+        };
+        let active = scanned
+            .into_iter()
+            .filter(|game| {
+                !input.config.ignored_games.iter().any(|path| {
+                    crate::discovery::canonical(path) == crate::discovery::canonical(&game.path)
+                })
+            })
+            .collect();
+        let evidence = (input.ready
+            && !self.scanner.uncertain_games
+            && (!input.guarded || !self.guard.uncertain_games))
+            .then(|| evidence_from(all.clone(), &self.scanner, &input.config))
+            .filter(GameEvidence::reliable);
+        if !input.power.permits(input.power_generation) {
+            bail!("Power state changed during game detection");
+        }
+        Ok(DetectionFrame {
+            power_generation: input.power_generation,
+            config,
+            active,
+            all,
+            evidence,
+            inaccessible: self.scanner.inaccessible,
+            candidate: self.candidate,
+            lm_running: self.scanner.lmstudio_running(),
+            running_apps: if crate::dashboard::needs_running_apps() {
+                self.scanner.running_apps()
+            } else {
+                vec![]
+            },
+        })
+    }
+}
+type BackgroundDetection = crate::detection_worker::DetectionWorker<
+    DetectionInput,
+    std::result::Result<DetectionFrame, String>,
+>;
+const FRESH_DETECTION_TIMEOUT: Duration = Duration::from_secs(2);
+fn publish_detection(state: &SharedState, result: &std::result::Result<DetectionFrame, String>) {
+    if let Ok(mut shared) = state.lock() {
+        match result {
+            Ok(frame)
+                if shared.power.permits(frame.power_generation)
+                    && serde_json::to_value(&shared.config).ok().as_ref()
+                        == Some(&frame.config) =>
+            {
+                shared.detection_ok = frame.evidence.is_some();
+                shared.active_games = frame.all.clone();
+                shared.running_apps = frame.running_apps.clone();
+                if !shared.detection_ok {
+                    shared.restore_offer = None;
+                    shared.coexistence = false;
+                } else if shared.restore_offer.as_ref().is_some_and(|offer| {
+                    offer.games.len() != frame.all.len()
+                        || offer.games.iter().any(|game| {
+                            !frame.all.iter().any(|current| {
+                                current.pid == game.pid
+                                    && current.created_at == game.created_at
+                                    && crate::discovery::canonical(&current.executable)
+                                        == crate::discovery::canonical(&game.executable)
+                            })
+                        })
+                }) {
+                    shared.restore_offer = None;
+                }
+            }
+            Err(_) => {
+                shared.detection_ok = false;
+                shared.restore_offer = None;
+                shared.coexistence = false;
+            }
+            _ => {}
+        }
+    }
+}
+fn fresh_detection(worker: &BackgroundDetection, input: DetectionInput) -> Result<DetectionFrame> {
+    let signal = input.power.clone();
+    let generation = input.power_generation;
+    if !signal.permits(generation) {
+        bail!("Power state changed; detection held");
+    }
+    let frame = worker
+        .fresh(input, FRESH_DETECTION_TIMEOUT)?
+        .map_err(anyhow::Error::msg)?;
+    if !signal.permits(generation) || frame.power_generation != generation {
+        bail!("Power state changed during game detection");
+    }
+    Ok(frame)
+}
+fn action_evidence(
+    worker: Option<&BackgroundDetection>,
+    fallback: &mut Scanner,
+    config: &Config,
+    games: &[Game],
+    ready: bool,
+) -> Option<GameEvidence> {
+    if !ready {
+        return None;
+    }
+    if let Some(worker) = worker {
+        worker
+            .fresh_with(FRESH_DETECTION_TIMEOUT, |input| {
+                input.config = config.clone();
+                input.games = games.to_vec();
+                input.guard_games = games.to_vec();
+                input.guarded = true;
+                input.ready = ready;
+            })
+            .ok()?
+            .ok()?
+            .evidence
+    } else {
+        scan_evidence(fallback, config, games)
+    }
+}
+fn hold_for_discovery<B: Backend>(engine: &mut Engine<B>, inventory_ready: bool) {
+    if !inventory_ready && engine.awaiting_resume_detection() {
+        // Waiting for the requested inventory is not failed process detection.
+        // Preserve the scope for later revalidation, without exposing/using it.
+        engine.gameplay.invalidate_offer();
+        engine.activity = Activity::DetectionUnavailable;
+        engine.message = "Windows resumed; refreshing game discovery before AI control. Saved recovery and any previous gameplay choice are held for revalidation.".into();
+    } else {
+        engine.gameplay.revoke();
+        engine.activity = if inventory_ready {
+            Activity::DetectionUnavailable
+        } else {
+            Activity::Unknown
+        };
+        engine.message = if inventory_ready {
+            "Game discovery has errors; AI control and recovery are held until discovery succeeds"
+                .into()
+        } else {
+            "Discovering installed games — existing recovery is held until discovery finishes"
+                .into()
+        };
+    }
+}
 fn run(
     mut engine: Engine<OptionalBackend>,
     folder: PathBuf,
@@ -618,19 +1539,85 @@ fn run(
     duration: f64,
     console: bool,
 ) -> Result<()> {
+    let power = state
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Shared state unavailable"))?
+        .power
+        .clone();
+    let accepted_power = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let progress_state = state.clone();
+    let progress_signal = power.clone();
+    let progress_generation = accepted_power.clone();
+    engine.observe_progress(move |activity| {
+        if let Ok(mut shared) = progress_state.lock() {
+            if !progress_signal
+                .permits(progress_generation.load(std::sync::atomic::Ordering::Acquire))
+            {
+                shared.activity = Activity::DetectionUnavailable;
+                shared.message =
+                    "Power state changed; AI control is held for fresh detection.".into();
+                return;
+            }
+            shared.activity = activity;
+            if activity.busy() {
+                shared.message = activity.progress_message().into();
+            }
+        }
+    });
+    let provider_state = state.clone();
+    let provider_signal = power.clone();
+    let provider_generation = accepted_power.clone();
+    engine.observe_providers(move |reports| {
+        if let Ok(mut shared) = provider_state.lock() {
+            if provider_signal
+                .permits(provider_generation.load(std::sync::atomic::Ordering::Acquire))
+            {
+                shared.provider_statuses = reports.to_vec();
+            } else {
+                shared.provider_statuses.clear();
+            }
+        }
+    });
     let mut scanner = Scanner::new(engine.config.clone())?;
-    let mut guard_config = engine.config.clone();
-    guard_config.excluded_paths.clear();
-    guard_config.excluded_executables.clear();
-    let mut recovery_scanner = Scanner::new(guard_config)?;
+    let mut power_generation = 0;
+    let guard_power = power.clone();
+    let guard_generation = accepted_power.clone();
+    engine.observe_power(move || {
+        !guard_power.permits(guard_generation.load(std::sync::atomic::Ordering::Acquire))
+    });
+    let initial_detection = DetectionInput {
+        power: power.clone(),
+        power_generation: power.snapshot().generation,
+        config: engine.config.clone(),
+        games: vec![],
+        guard_games: recovery_games(&engine, &[]),
+        steam_roots: vec![],
+        guarded: engine.pending(),
+        ready: false,
+    };
+    let mut native_detection = NativeDetection::new(&engine.config)?;
+    let detection_state = state.clone();
+    let detection = BackgroundDetection::start(
+        initial_detection,
+        |input| Duration::from_secs_f64(input.config.poll_seconds),
+        move |input| {
+            native_detection
+                .scan(input)
+                .map_err(|error| format!("{error:#}"))
+        },
+        move |frame| match frame {
+            Some(frame) => publish_detection(&detection_state, frame),
+            None => publish_detection(&detection_state, &Err("Detection worker stopped".into())),
+        },
+    )?;
     let mut games = vec![];
     let mut errors = std::collections::BTreeMap::<String, String>::new();
-    let (request_tx, request_rx) = mpsc::channel::<(Config, f64, bool, bool)>();
+    let (request_tx, request_rx) = mpsc::channel::<(u64, Config, f64, bool, bool)>();
     let (result_tx, result_rx) = mpsc::channel();
     let worker_log = folder.clone();
     let inventory_worker = std::thread::spawn(move || {
         let mut discovery = Discovery::default();
-        while let Ok((config, now, force, defer)) = request_rx.recv() {
+        while let Ok((generation, config, now, force, defer)) = request_rx.recv() {
             let (games, panic_payload) = discovery.recover_refresh(&config, now, force, defer);
             if !panic_payload.is_empty() {
                 crate::app::log(
@@ -640,6 +1627,7 @@ fn run(
             }
             if result_tx
                 .send((
+                    generation,
                     games,
                     discovery.errors.clone(),
                     discovery.steam_libraries.clone(),
@@ -655,24 +1643,59 @@ fn run(
     let mut last_status = Value::Null;
     let mut inventory_pending = false;
     let mut force_requested = false;
+    let mut generation = 0u64;
+    let mut minimum_inventory_generation = 0u64;
     let mut queued = None;
     let mut inventory_ready = false;
     let mut inventory_dirty = false;
     let mut steam_roots = vec![];
+    let mut last_candidate = 0;
     let mut monitor = Monitor::default();
     loop {
         let now = start.elapsed().as_secs_f64();
         if duration > 0. && now >= duration {
             break;
         }
+        let power_state = power.snapshot();
+        if power_state.generation != power_generation {
+            power_generation = power_state.generation;
+            accepted_power.store(power_generation, std::sync::atomic::Ordering::Release);
+            engine.resume_detected();
+            if power_state.suspended {
+                engine.message =
+                    "Windows is suspending; AI control held and saved recovery retained.".into();
+            }
+            scanner = Scanner::new(engine.config.clone())?;
+            force_requested = true;
+            inventory_ready = false;
+            minimum_inventory_generation = generation.saturating_add(1);
+            if let Ok(mut shared) = state.lock() {
+                shared.detection_ok = false;
+                shared.discovery_ready = false;
+                shared.restore_offer = None;
+                shared.coexistence = false;
+                shared.activity = Activity::DetectionUnavailable;
+                shared.doctor_report = None;
+                shared.message = engine.message.clone();
+            }
+        }
         let actions = queued.take().into_iter().chain(commands.try_iter());
         let mut quit = false;
         for action in actions {
+            if matches!(action, Action::PowerChanged) {
+                continue;
+            }
             if matches!(action, Action::Quit) {
                 quit = true;
                 break;
             }
-            if match apply_action(
+            if let Action::Tracked { id, action } = &action
+                && matches!(action.as_ref(), Action::Refresh)
+                && let Ok(mut shared) = state.lock()
+            {
+                shared.commands.bind_refresh(*id, generation + 1);
+            }
+            if match apply_action_detected(
                 action,
                 &mut engine,
                 &folder,
@@ -680,6 +1703,7 @@ fn run(
                 &games,
                 now,
                 &state,
+                Some(&detection),
             ) {
                 Ok(refresh) => refresh,
                 Err(e) => {
@@ -697,54 +1721,102 @@ fn run(
         if quit {
             break;
         }
+        if power.snapshot().suspended {
+            match commands.recv_timeout(Duration::from_secs_f64(engine.config.poll_seconds)) {
+                Ok(Action::Quit) => break,
+                Ok(action) => queued = Some(action),
+                Err(mpsc::RecvTimeoutError::Timeout) => (),
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+            continue;
+        }
         let tick = (|| -> Result<()> {
             let mut persistence_error = None;
-            if let Ok((updated, updated_errors, roots)) = result_rx.try_recv() {
-                inventory_ready = true;
-                steam_roots = roots;
-                games = updated;
-                errors = updated_errors;
-                inventory_pending = false;
-                inventory_dirty = true;
-                log(
-                    &folder,
-                    &format!("Inventory refreshed: {} installed locations", games.len()),
-                );
+            let inventory_result = result_rx.try_recv();
+            if matches!(inventory_result, Err(mpsc::TryRecvError::Disconnected)) {
                 if let Ok(mut shared) = state.lock() {
-                    shared.revision += 1;
-                    shared.discovery_ready = true;
+                    shared
+                        .commands
+                        .discovery_unavailable("Discovery worker stopped; refresh failed.".into());
+                }
+                bail!("Discovery worker stopped");
+            }
+            if let Ok((accepted_generation, updated, updated_errors, roots)) = inventory_result {
+                inventory_pending = false;
+                if accepted_generation < minimum_inventory_generation {
+                    force_requested = true;
+                } else {
+                    let changed = serde_json::to_value(&games)? != serde_json::to_value(&updated)?;
+                    inventory_ready = true;
+                    steam_roots = roots;
+                    games = updated;
+                    errors = updated_errors;
+                    inventory_pending = false;
+                    inventory_dirty = true;
+                    log(
+                        &folder,
+                        &format!("Inventory refreshed: {} installed locations", games.len()),
+                    );
+                    if let Ok(mut shared) = state.lock() {
+                        let error_text = errors
+                            .iter()
+                            .map(|(name, error)| format!("{name}: {error}"))
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        shared
+                            .commands
+                            .accept_inventory(accepted_generation, changed, &error_text);
+                        shared.revision += 1;
+                        shared.discovery_ready = true;
+                    }
                 }
             }
-            let scanned = scanner.scan(&games)?;
-            let new_candidate = scanner.new_game_candidate(&games, &steam_roots);
-            force_requested |= new_candidate;
             let guard_games = recovery_games(&engine, &games);
-            let all_active = if engine.state.is_some() {
-                recovery_scanner.scan(&guard_games)?
-            } else {
-                scanned.clone()
+            let guarded_scan = engine.pending() || engine.gameplay.active() || engine.manual_pause;
+            let detection_input = DetectionInput {
+                power: power.clone(),
+                power_generation,
+                config: engine.config.clone(),
+                games: games.clone(),
+                guard_games: guard_games.clone(),
+                steam_roots: steam_roots.clone(),
+                guarded: guarded_scan,
+                ready: inventory_ready && errors.is_empty(),
             };
-            let active = scanned
-                .into_iter()
-                .filter(|game| {
-                    !engine.config.ignored_games.iter().any(|path| {
-                        crate::discovery::canonical(path) == crate::discovery::canonical(&game.path)
-                    })
-                })
-                .collect::<Vec<_>>();
-            let gaming = !active.is_empty() || (engine.state.is_some() && !all_active.is_empty());
+            let frame = fresh_detection(&detection, detection_input.clone())?;
+            let new_candidate = frame.candidate != last_candidate;
+            last_candidate = frame.candidate;
+            force_requested |= new_candidate;
+            let all_active = frame.all;
+            let active = frame.active;
+            let gaming = !active.is_empty() || (engine.pending() && !all_active.is_empty());
+            let mut evidence = frame.evidence;
             if !inventory_pending && (force_requested || now >= next_inventory) {
-                request_tx.send((
-                    engine.config.clone(),
-                    now,
-                    force_requested,
-                    gaming || new_candidate,
-                ))?;
+                generation = generation
+                    .checked_add(1)
+                    .context("Discovery generation exhausted")?;
+                if request_tx
+                    .send((
+                        generation,
+                        engine.config.clone(),
+                        now,
+                        force_requested,
+                        gaming || new_candidate,
+                    ))
+                    .is_err()
+                {
+                    if let Ok(mut shared) = state.lock() {
+                        shared.commands.discovery_unavailable(
+                            "Discovery worker unavailable; refresh failed.".into(),
+                        );
+                    }
+                    bail!("Discovery worker unavailable");
+                }
                 inventory_pending = true;
                 force_requested = false;
                 next_inventory = now + engine.config.discovery_seconds;
             }
-            let records = games
+            let records = guard_games
                 .iter()
                 .filter(|g| {
                     all_active.iter().any(|a| {
@@ -754,44 +1826,89 @@ fn run(
                 .cloned()
                 .collect();
             engine.remember_games(records)?;
-            if inventory_ready {
-                engine.step(gaming, now, &mut || {
-                    recovery_scanner
-                        .scan(&guard_games)
-                        .map_or(true, |a| !a.is_empty())
+            if inventory_ready && errors.is_empty() {
+                let mut guard_input = detection_input.clone();
+                guard_input.guarded = true;
+                engine.step_games(evidence.clone(), now, &mut || {
+                    evidence = fresh_detection(&detection, guard_input.clone())
+                        .ok()
+                        .and_then(|frame| frame.evidence);
+                    evidence.clone()
                 });
             } else {
-                engine.message = "Discovering installed games — existing recovery is held until discovery finishes".into();
+                hold_for_discovery(&mut engine, inventory_ready);
+            }
+            if engine.awaiting_resume_detection() {
+                engine.gameplay.invalidate_offer();
+            } else {
+                engine.gameplay.refresh_offer(
+                    evidence.as_ref(),
+                    engine.pending()
+                        && engine.config.mode == "active"
+                        && !engine.disabled
+                        && !engine.activity.busy(),
+                );
             }
             if inventory_ready
-                && engine.state.is_none()
+                && errors.is_empty()
+                && evidence.as_ref().is_some_and(GameEvidence::reliable)
+                && !engine.pending()
                 && !gaming
+                && !engine.gameplay.active()
                 && engine.config.automation_enabled
                 && engine.config.mode != "observe"
-                && !scanner.lmstudio_running()
+                && engine.config.lm_enabled()
+                && !frame.lm_running
             {
+                engine.activity = Activity::Unavailable;
                 engine.message =
                     "Waiting for LM Studio — open it; automatic pausing will resume".into();
             }
-            let status = json!({"version":env!("CARGO_PKG_VERSION"),"implementation":"Rust","mode":engine.config.mode,"automation_enabled":engine.config.automation_enabled,"message":engine.message,"active_games":active,"installed_locations":games.len(),"detection_disabled":engine.disabled,"manual_pause":engine.manual_pause,"last_error":engine.last_error,"discovery_errors":errors,"inaccessible_processes":scanner.inaccessible,"recovery_pending":engine.state.is_some()});
+            let status = json!({"version":env!("CARGO_PKG_VERSION"),"implementation":"Rust","mode":engine.config.mode,"automation_enabled":engine.config.automation_enabled,"message":engine.message,"active_games":active,"installed_locations":games.len(),"detection_disabled":engine.disabled,"manual_pause":engine.manual_pause,"last_error":engine.last_error,"discovery_errors":errors,"inaccessible_processes":frame.inaccessible,"recovery_pending":engine.pending(),"provider_outcomes":engine.provider_statuses});
             if let Ok(mut shared) = state.lock() {
+                shared.restore_offer = engine.gameplay.offer();
+                shared.coexistence =
+                    engine.gameplay.active() && !engine.awaiting_resume_detection();
+                if let Some(feedback) = &mut shared.restore_feedback
+                    && feedback.tracking_recovery
+                {
+                    if !engine.pending() {
+                        feedback.restoration = "AI restoration completed and verified.".into();
+                        feedback.tracking_recovery = false;
+                    } else if !engine.gameplay.active() {
+                        feedback.restoration =
+                            "Gameplay approval ended; recovery retained under normal game guards."
+                                .into();
+                    } else if engine.activity == Activity::PartialFailure {
+                        feedback.restoration =
+                            format!("Restore failed: {}. Recovery retained.", engine.last_error);
+                    }
+                }
+                shared.activity = engine.activity;
                 shared.message = engine.message.clone();
                 shared.disabled = engine.disabled;
                 shared.manual_pause = engine.manual_pause;
                 shared.pause_completions = engine.pause_completions;
                 shared.restore_completions = engine.restore_completions;
-                shared.pending = engine.state.is_some();
+                shared.provider_statuses = engine.provider_statuses.clone();
+                shared.pending = engine.pending();
                 shared.active_mode = engine.config.mode == "active";
                 shared.config = engine.config.clone();
                 shared.games = games.clone();
-                shared.active_games = all_active;
-                // Only copy the running-app list while the dashboard asks for it.
-                shared.running_apps = if crate::dashboard::needs_running_apps() {
-                    scanner.running_apps()
-                } else {
-                    vec![]
-                };
                 shared.discovery_errors = errors.clone();
+                shared.commands.observe_engine(
+                    engine.pause_verified(),
+                    engine.pending(),
+                    if matches!(
+                        engine.activity,
+                        Activity::PartialFailure | Activity::WaitingForInference
+                    ) {
+                        &engine.last_error
+                    } else {
+                        ""
+                    },
+                    &engine.message,
+                );
             }
             if inventory_dirty {
                 match write_json(&folder.join("inventory.json"), &games) {
@@ -831,6 +1948,15 @@ fn run(
                 }
             }
             Err(err) => {
+                engine.gameplay.revoke();
+                engine.activity = Activity::DetectionUnavailable;
+                if let Ok(mut shared) = state.lock() {
+                    shared.activity = Activity::DetectionUnavailable;
+                    shared.detection_ok = false;
+                    shared.coexistence = false;
+                    shared.restore_offer = None;
+                    shared.message = "Game detection or state persistence failed; AI control is held until a successful tick.".into();
+                }
                 let msg = format!("{err:#}");
                 monitor.handle(&msg, &folder, &state);
             }
@@ -897,16 +2023,498 @@ pub fn log(folder: &std::path::Path, message: &str) {
 mod tests {
     use super::*;
     #[test]
+    fn provider_cli_status_preserves_prefix_and_escapes_cached_evidence() {
+        let baseline = json!({"version":"0.3.5","message":"AI recovery pending"});
+        let mut status = baseline.clone();
+        status["provider_outcomes"] = json!([
+            {"kind":"lmstudio","id":"lmstudio-main","state":"restored","guarantee":"captured_configuration","pending":false,"error":"","retry_seconds":null},
+            {"kind":"ollama","id":"ollama-main","state":"failed","guarantee":"supported_fields","pending":true,"error":"failure\nwith\tfields\\path","retry_seconds":10},
+            {"kind":"unexpected\nkey","id":"unsupported"}]);
+        let output = format_status(&status);
+        assert!(output.starts_with(&format!(
+            "{}\nprovider_evidence=cached_status\n",
+            format_status(&baseline)
+        )));
+        assert!(output.contains("provider.lmstudio.pending=no"));
+        assert!(output.contains("provider.ollama.pending=yes"));
+        assert!(output.contains("provider.ollama.error=failure\\nwith\\tfields\\\\path"));
+        assert!(!output.contains("unsupported"));
+        assert_eq!(output.lines().count(), 23);
+    }
+    #[test]
+    fn diagnostics_requests_coalesce_and_failed_dispatch_releases_pending() {
+        let state = Arc::new(Mutex::new(Shared::default()));
+        let (tx, rx) = mpsc::channel();
+        request_action(&state, &tx, Action::Doctor, "Diagnostics");
+        assert!(rx.try_recv().is_err());
+        state.lock().unwrap().config.advanced_settings_visible = true;
+        request_action(&state, &tx, Action::Doctor, "Diagnostics");
+        request_action(&state, &tx, Action::Doctor, "Diagnostics");
+        assert!(
+            matches!(rx.try_recv(), Ok(Action::Tracked { action, .. }) if matches!(*action, Action::Doctor))
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(state.lock().unwrap().doctor_pending);
+        state.lock().unwrap().doctor_pending = false;
+        drop(rx);
+        request_action(&state, &tx, Action::Doctor, "Diagnostics");
+        assert!(!state.lock().unwrap().doctor_pending);
+        assert_eq!(
+            state
+                .lock()
+                .unwrap()
+                .commands
+                .latest
+                .as_ref()
+                .unwrap()
+                .outcome,
+            Outcome::Failed
+        );
+    }
+    #[test]
+    fn manual_control_uses_background_guard_failure_instead_of_a_successful_fallback_scan() {
+        let config = Config::default();
+        let path = std::env::temp_dir().join(format!(
+            "gamepause-background-guard-{}-{}.json",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut engine = Engine::new(
+            config.clone(),
+            OptionalBackend {
+                claims: Default::default(),
+                backend: None,
+                folder: None,
+                config: config.clone(),
+            },
+            path,
+        )
+        .unwrap();
+        engine.activity = Activity::Watching;
+        let state = Arc::new(Mutex::new(Shared {
+            config: config.clone(),
+            discovery_ready: true,
+            detection_ok: true,
+            active_mode: true,
+            ..Default::default()
+        }));
+        let input = DetectionInput {
+            power: Default::default(),
+            power_generation: 0,
+            config: config.clone(),
+            games: vec![],
+            guard_games: vec![],
+            steam_roots: vec![],
+            guarded: true,
+            ready: true,
+        };
+        let worker = BackgroundDetection::start(
+            input,
+            |_| Duration::from_secs(10),
+            |_| Err("fixture detection failure".into()),
+            |_| {},
+        )
+        .unwrap();
+        let mut scanner = Scanner::new(config).unwrap();
+        apply_action_detected(
+            Action::Pause,
+            &mut engine,
+            &std::env::temp_dir(),
+            &mut scanner,
+            &[],
+            0.,
+            &state,
+            Some(&worker),
+        )
+        .unwrap();
+        assert!(!engine.manual_pause);
+        assert!(engine.backend.backend.is_none());
+        assert!(!state.lock().unwrap().settings_error.is_empty());
+    }
+    #[test]
+    fn background_detection_publishes_during_control_and_rejects_old_settings() {
+        let state = Arc::new(Mutex::new(Shared {
+            config: Config::default(),
+            ..Default::default()
+        }));
+        let game = crate::gameplay::fixtures::game(42, 10);
+        let mut frame = DetectionFrame {
+            power_generation: 0,
+            config: serde_json::to_value(Config::default()).unwrap(),
+            active: vec![game.clone()],
+            all: vec![game.clone()],
+            evidence: Some(crate::gameplay::fixtures::evidence(vec![game.clone()])),
+            inaccessible: 0,
+            candidate: 0,
+            lm_running: true,
+            running_apps: vec![],
+        };
+        state.lock().unwrap().activity = Activity::Restoring;
+        publish_detection(&state, &Ok(frame.clone()));
+        assert_eq!(state.lock().unwrap().active_games, vec![game]);
+        assert_eq!(state.lock().unwrap().activity, Activity::Restoring);
+        assert!(state.lock().unwrap().detection_ok);
+        state.lock().unwrap().power.notify(18);
+        state.lock().unwrap().detection_ok = false;
+        publish_detection(&state, &Ok(frame.clone()));
+        assert!(
+            !state.lock().unwrap().detection_ok,
+            "pre-resume scan cannot restore availability"
+        );
+        frame.power_generation = state.lock().unwrap().power.snapshot().generation;
+        publish_detection(&state, &Ok(frame.clone()));
+        assert!(state.lock().unwrap().detection_ok);
+        state.lock().unwrap().config.automation_enabled = false;
+        frame.all.clear();
+        publish_detection(&state, &Ok(frame));
+        assert_eq!(
+            state.lock().unwrap().active_games.len(),
+            1,
+            "old settings must not erase current detection"
+        );
+        publish_detection(&state, &Err("fixture scanner stopped".into()));
+        assert!(!state.lock().unwrap().detection_ok);
+        assert_eq!(
+            state.lock().unwrap().active_games.len(),
+            1,
+            "failed detection retains last seen games"
+        );
+    }
+    #[test]
+    fn power_change_during_fresh_detection_cannot_authorize_control() {
+        let signal = Arc::new(crate::power::Signal::default());
+        let input = DetectionInput {
+            power: signal.clone(),
+            power_generation: 0,
+            config: Config::default(),
+            games: vec![],
+            guard_games: vec![],
+            steam_roots: vec![],
+            guarded: true,
+            ready: true,
+        };
+        let worker = BackgroundDetection::start(
+            input.clone(),
+            |_| Duration::from_secs(30),
+            |input| {
+                input.power.notify(18);
+                Ok(DetectionFrame {
+                    power_generation: input.power_generation,
+                    config: serde_json::to_value(&input.config).unwrap(),
+                    active: vec![],
+                    all: vec![],
+                    evidence: Some(crate::gameplay::fixtures::evidence(vec![])),
+                    inaccessible: 0,
+                    candidate: 0,
+                    lm_running: false,
+                    running_apps: vec![],
+                })
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert!(fresh_detection(&worker, input).is_err());
+        assert!(!signal.permits(0));
+    }
+    #[test]
+    fn resume_inventory_wait_holds_approval_for_revalidation_but_discovery_failure_revokes() {
+        let config = Config::default();
+        let path = std::env::temp_dir().join(format!(
+            "gamepause-resume-hold-{}-{}.json",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut engine = Engine::new(
+            config.clone(),
+            OptionalBackend {
+                claims: Default::default(),
+                backend: None,
+                config: config.clone(),
+                folder: None,
+            },
+            path,
+        )
+        .unwrap();
+        let current =
+            crate::gameplay::fixtures::evidence(vec![crate::gameplay::fixtures::game(42, 10)]);
+        engine.gameplay.refresh_offer(Some(&current), true);
+        engine
+            .gameplay
+            .confirm(engine.gameplay.offer().unwrap().id, &current)
+            .unwrap();
+        engine.resume_detected();
+        hold_for_discovery(&mut engine, false);
+        assert!(engine.gameplay.active());
+        assert!(engine.awaiting_resume_detection());
+        assert_eq!(engine.activity, Activity::DetectionUnavailable);
+        assert!(engine.gameplay.offer().is_none());
+        hold_for_discovery(&mut engine, true);
+        assert!(!engine.gameplay.active());
+        assert!(engine.awaiting_resume_detection());
+        assert!(engine.message.contains("discovery has errors"));
+    }
+    #[test]
+    fn native_background_detection_scans_during_a_blocked_control_operation() {
+        let config = Config {
+            mode: "observe".into(),
+            ..Default::default()
+        };
+        let input = DetectionInput {
+            power: Default::default(),
+            power_generation: 0,
+            config: config.clone(),
+            games: vec![],
+            guard_games: vec![],
+            steam_roots: vec![],
+            guarded: false,
+            ready: true,
+        };
+        let mut native = NativeDetection::new(&config).unwrap();
+        let (published, frames) = mpsc::channel();
+        let worker = BackgroundDetection::start(
+            input.clone(),
+            |_| Duration::from_millis(20),
+            move |input| native.scan(input).map_err(|error| format!("{error:#}")),
+            move |frame| {
+                if let Some(frame) = frame {
+                    published.send((Instant::now(), frame.is_ok())).unwrap();
+                }
+            },
+        )
+        .unwrap();
+        fresh_detection(&worker, input).unwrap();
+        let (release, held) = mpsc::channel();
+        let control =
+            std::thread::spawn(move || held.recv_timeout(Duration::from_secs(3)).unwrap());
+        let mut observations = vec![];
+        while observations.len() < 6 {
+            let (time, valid) = frames.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(valid);
+            observations.push(time);
+        }
+        assert!(!control.is_finished());
+        let gap = observations
+            .windows(2)
+            .map(|pair| pair[1].duration_since(pair[0]))
+            .max()
+            .unwrap();
+        eprintln!(
+            "Native Toolhelp scans during blocked mock control: {} scans, maximum gap {:?}",
+            observations.len(),
+            gap
+        );
+        assert!(gap < Duration::from_secs(1));
+        release.send(()).unwrap();
+        control.join().unwrap();
+    }
+    #[test]
+    fn tracked_requests_do_not_publish_unsaved_settings_and_report_send_failures() {
+        let state = Arc::new(Mutex::new(Shared::default()));
+        let (tx, rx) = mpsc::channel();
+        let updated = Config {
+            restore_delay_seconds: 17.,
+            ..Default::default()
+        };
+        request_action(
+            &state,
+            &tx,
+            Action::Settings(Box::new(updated)),
+            "Save settings",
+        );
+        assert_eq!(state.lock().unwrap().config.restore_delay_seconds, 30.);
+        assert!(state.lock().unwrap().commands.settings_pending);
+        request_action(&state, &tx, Action::Disable, "Toggle");
+        assert_eq!(
+            state
+                .lock()
+                .unwrap()
+                .commands
+                .latest
+                .as_ref()
+                .unwrap()
+                .outcome,
+            Outcome::NoChange
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(Action::Tracked { action, .. }) if matches!(*action, Action::Settings(_)))
+        );
+        assert!(rx.try_recv().is_err());
+        drop(rx);
+        state.lock().unwrap().commands.settings_pending = false;
+        request_action(&state, &tx, Action::Refresh, "Refresh");
+        assert_eq!(
+            state
+                .lock()
+                .unwrap()
+                .commands
+                .latest
+                .as_ref()
+                .unwrap()
+                .outcome,
+            Outcome::Failed
+        );
+        assert!(state.lock().unwrap().commands.request_refresh().is_some());
+    }
+    #[test]
+    fn selected_custom_removal_saves_one_entry_and_preserves_recovery_on_failure() {
+        let folder =
+            std::env::temp_dir().join(format!("gamepause-selected-removal-{}", std::process::id()));
+        let config = Config {
+            extra_games: vec![
+                config::ExtraGame {
+                    name: "Fixture A".into(),
+                    path: r"D:\Fixture Games\a.exe".into(),
+                },
+                config::ExtraGame {
+                    name: "Fixture B".into(),
+                    path: r"D:\Fixture Games\b.exe".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let remembered = Game::new("Custom", "a", "Fixture A", &config.extra_games[0].path);
+        write_json(&folder.join("state.json"), &json!({"schema":2,"server":{"running":false,"port":1234},"server_stopped":false,"models":[],"pause_complete":true,"games":[remembered]})).unwrap();
+        write_json(&folder.join("config.json"), &config).unwrap();
+        let backend = OptionalBackend {
+            claims: Default::default(),
+            backend: None,
+            folder: None,
+            config: config.clone(),
+        };
+        let mut engine = Engine::new(config.clone(), backend, folder.join("state.json")).unwrap();
+        let journal = fs::read(folder.join("state.json")).unwrap();
+        let mut scanner = Scanner::new(config.clone()).unwrap();
+        let state = Arc::new(Mutex::new(Shared {
+            config: config.clone(),
+            ..Default::default()
+        }));
+        let (tx, rx) = mpsc::channel();
+        let launcher = Game::new(
+            "Steam",
+            "fixture",
+            "Fixture launcher game",
+            r"D:\Fixture Steam\game",
+        );
+        let games = vec![remembered.clone(), launcher.clone()];
+        request_action(
+            &state,
+            &tx,
+            Action::RemoveCustom {
+                path: config.extra_games[0].path.to_uppercase(),
+                name: "Fixture A".into(),
+            },
+            "Remove selected",
+        );
+        assert_eq!(state.lock().unwrap().config.extra_games.len(), 2);
+        assert!(
+            apply_action(
+                rx.recv().unwrap(),
+                &mut engine,
+                &folder,
+                &mut scanner,
+                &games,
+                0.,
+                &state
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            Config::load(&folder.join("config.json"))
+                .unwrap()
+                .extra_games[0]
+                .name,
+            "Fixture B"
+        );
+        assert_eq!(engine.config.extra_games.len(), 1);
+        assert_eq!(fs::read(folder.join("state.json")).unwrap(), journal);
+        assert_eq!(
+            recovery_games(&engine, &[launcher])[1].path,
+            remembered.path
+        );
+        assert_eq!(
+            state
+                .lock()
+                .unwrap()
+                .commands
+                .latest
+                .as_ref()
+                .unwrap()
+                .outcome,
+            Outcome::Completed
+        );
+        assert!(
+            state
+                .lock()
+                .unwrap()
+                .commands
+                .latest
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("Fixture A")
+        );
+        assert!(remove_custom(&engine.config, &games[1].path, &games[1].name).is_err());
+        assert!(remove_custom(&engine.config, &config.extra_games[0].path, "Fixture A").is_err());
+        fs::remove_file(folder.join("config.json")).unwrap();
+        fs::create_dir(folder.join("config.json")).unwrap();
+        request_action(
+            &state,
+            &tx,
+            Action::RemoveCustom {
+                path: config.extra_games[1].path.clone(),
+                name: "Fixture B".into(),
+            },
+            "Remove selected",
+        );
+        assert!(
+            !apply_action(
+                rx.recv().unwrap(),
+                &mut engine,
+                &folder,
+                &mut scanner,
+                &games,
+                0.,
+                &state
+            )
+            .unwrap()
+        );
+        assert_eq!(engine.config.extra_games.len(), 1);
+        assert_eq!(state.lock().unwrap().config.extra_games.len(), 1);
+        assert_eq!(
+            state
+                .lock()
+                .unwrap()
+                .commands
+                .latest
+                .as_ref()
+                .unwrap()
+                .outcome,
+            Outcome::Failed
+        );
+        assert_eq!(fs::read(folder.join("state.json")).unwrap(), journal);
+        fs::remove_dir(folder.join("config.json")).unwrap();
+        fs::remove_file(folder.join("state.json")).unwrap();
+        fs::remove_file(folder.join("state.v2.backup.json")).unwrap();
+        fs::remove_dir(folder).unwrap();
+    }
+    #[test]
     fn manual_restore_waits_for_first_discovery_and_retains_journal() {
         let folder =
             std::env::temp_dir().join(format!("gamepause-startup-recovery-{}", std::process::id()));
         let path = folder.join("state.json");
         write_json(&path,&json!({"schema":2,"server":{"running":false,"port":1234},"server_stopped":false,"models":[],"pause_complete":true})).unwrap();
-        let before = fs::read(&path).unwrap();
+        let legacy = fs::read(&path).unwrap();
         let config = Config::default();
         let mut engine = Engine::new(
             config.clone(),
             OptionalBackend {
+                claims: Default::default(),
                 backend: None,
                 folder: None,
                 config: config.clone(),
@@ -914,6 +2522,11 @@ mod tests {
             path.clone(),
         )
         .unwrap();
+        assert_eq!(
+            fs::read(folder.join("state.v2.backup.json")).unwrap(),
+            legacy
+        );
+        let before = fs::read(&path).unwrap();
         let mut scanner = Scanner::new(config).unwrap();
         let shared = Arc::new(Mutex::new(Shared::default()));
         apply_action(
@@ -926,9 +2539,233 @@ mod tests {
             &shared,
         )
         .unwrap();
-        assert!(engine.state.is_some());
+        assert!(engine.pending());
         assert_eq!(before, fs::read(&path).unwrap());
         fs::remove_file(path).unwrap();
+        fs::remove_file(folder.join("state.v2.backup.json")).unwrap();
+        fs::remove_dir(folder).unwrap();
+    }
+    #[test]
+    fn stale_pause_cannot_toggle_a_hold_or_change_completed_recovery() {
+        let folder =
+            std::env::temp_dir().join(format!("gamepause-command-policy-{}", std::process::id()));
+        let config = Config::default();
+        let mut engine = Engine::new(
+            config.clone(),
+            OptionalBackend {
+                claims: Default::default(),
+                backend: None,
+                folder: None,
+                config: config.clone(),
+            },
+            folder.join("state.json"),
+        )
+        .unwrap();
+        engine.activity = Activity::Watching;
+        let state = Arc::new(Mutex::new(Shared {
+            discovery_ready: true,
+            detection_ok: true,
+            active_mode: true,
+            activity: Activity::Watching,
+            ..Default::default()
+        }));
+        let mut scanner = Scanner::new(config).unwrap();
+        for _ in 0..2 {
+            apply_action(
+                Action::Pause,
+                &mut engine,
+                &folder,
+                &mut scanner,
+                &[],
+                0.,
+                &state,
+            )
+            .unwrap();
+        }
+        assert!(engine.manual_pause, "second Pause cannot release the hold");
+        engine.manual_pause = false;
+        engine.state = Some(crate::lmstudio::Snapshot {
+            schema: 2,
+            server: json!({"running":false,"port":1234}),
+            server_stopped: false,
+            models: vec![],
+            pause_complete: true,
+            games: vec![],
+        });
+        engine.activity = Activity::Paused;
+        apply_action(
+            Action::Pause,
+            &mut engine,
+            &folder,
+            &mut scanner,
+            &[],
+            1.,
+            &state,
+        )
+        .unwrap();
+        assert!(
+            !engine.manual_pause,
+            "stale enabled UI must not create a hidden hold"
+        );
+        assert!(engine.state.as_ref().unwrap().pause_complete);
+        assert!(
+            engine.backend.backend.is_none(),
+            "rejection performs no provider probe"
+        );
+        state.lock().unwrap().detection_ok = false;
+        apply_action(
+            Action::Restore,
+            &mut engine,
+            &folder,
+            &mut scanner,
+            &[],
+            2.,
+            &state,
+        )
+        .unwrap();
+        assert!(engine.pending());
+        assert!(engine.backend.backend.is_none());
+    }
+    #[test]
+    fn explicit_pause_revokes_coexistence_and_retains_removed_approved_registration() {
+        use crate::gameplay::fixtures::{evidence, game};
+        let current = evidence(vec![game(42, 10)]);
+        let config = Config::default();
+        let folder =
+            std::env::temp_dir().join(format!("gamepause-pause-revocation-{}", std::process::id()));
+        let mut engine = Engine::new(
+            config.clone(),
+            OptionalBackend {
+                claims: Default::default(),
+                backend: None,
+                folder: None,
+                config: config.clone(),
+            },
+            folder.join("state.json"),
+        )
+        .unwrap();
+        engine.gameplay.refresh_offer(Some(&current), true);
+        engine
+            .gameplay
+            .confirm(engine.gameplay.offer().unwrap().id, &current)
+            .unwrap();
+        engine.activity = Activity::Coexistence;
+        let state = Arc::new(Mutex::new(Shared {
+            active_mode: true,
+            discovery_ready: true,
+            detection_ok: true,
+            coexistence: true,
+            activity: Activity::Coexistence,
+            ..Default::default()
+        }));
+        let mut scanner = Scanner::new(config).unwrap();
+        apply_action(
+            Action::Pause,
+            &mut engine,
+            &folder,
+            &mut scanner,
+            &[],
+            0.,
+            &state,
+        )
+        .unwrap();
+        assert!(!engine.gameplay.active());
+        assert!(engine.manual_pause);
+        assert_eq!(recovery_games(&engine, &[])[0].path, current.all[0].path);
+        assert!(engine.backend.backend.is_none());
+    }
+    #[test]
+    fn ollama_only_core_actions_and_independent_recovery_edit_state() {
+        let mut shared = Shared {
+            active_mode: true,
+            discovery_ready: true,
+            detection_ok: true,
+            activity: Activity::Watching,
+            config: Config::default(),
+            ..Default::default()
+        };
+        for provider in &mut shared.config.providers {
+            match provider {
+                config::Provider::LMStudio { enabled, .. } => *enabled = false,
+                config::Provider::Ollama { enabled, .. } => *enabled = true,
+            }
+        }
+        shared.config.validate().unwrap();
+        assert!(shared.controls().availability().pause);
+        shared.pending = true;
+        shared.activity = Activity::Recovery;
+        assert!(
+            shared.provider_pending(crate::provider::Kind::LMStudio),
+            "unpublished recovery is conservative"
+        );
+        shared.provider_statuses.push(crate::coordinator::Report {
+            id: "ollama-main".into(),
+            kind: crate::provider::Kind::Ollama,
+            guarantee: crate::provider::Guarantee::SupportedFields,
+            state: crate::coordinator::State::Failed,
+            pending: true,
+            error: "fixture failure".into(),
+            retry_seconds: Some(10),
+        });
+        assert!(!shared.provider_pending(crate::provider::Kind::LMStudio));
+        assert!(shared.provider_pending(crate::provider::Kind::Ollama));
+        assert!(shared.controls().availability().restore);
+        shared.detection_ok = false;
+        assert!(!shared.controls().availability().restore);
+        shared.detection_ok = true;
+        for provider in &mut shared.config.providers {
+            if let config::Provider::Ollama { enabled, .. } = provider {
+                *enabled = false;
+            }
+        }
+        assert!(
+            shared.controls().availability().restore,
+            "pending recovery remains actionable with disabled providers"
+        );
+        assert!(!shared.controls().availability().pause);
+        shared.pending = false;
+        assert!(!shared.controls().availability().restore);
+    }
+    #[test]
+    fn shared_policy_rejects_busy_clicks_and_uses_explicit_resume() {
+        let state = Arc::new(Mutex::new(Shared {
+            active_mode: true,
+            discovery_ready: true,
+            detection_ok: true,
+            activity: Activity::Unloading,
+            pending: true,
+            ..Default::default()
+        }));
+        let (tx, rx) = mpsc::channel();
+        for command in [
+            CoreCommand::Pause,
+            CoreCommand::Resume,
+            CoreCommand::Restore,
+        ] {
+            request_core(&state, &tx, command);
+        }
+        assert!(rx.try_recv().is_err());
+        {
+            let mut shared = state.lock().unwrap();
+            shared.activity = Activity::ManualHold;
+            shared.manual_pause = true;
+        }
+        request_core(&state, &tx, CoreCommand::Pause);
+        assert!(rx.try_recv().is_err());
+        request_core(&state, &tx, CoreCommand::Resume);
+        assert!(
+            matches!(rx.try_recv(), Ok(Action::Tracked { action, .. }) if matches!(*action, Action::Resume))
+        );
+        state
+            .lock()
+            .unwrap()
+            .discovery_errors
+            .insert("fixture".into(), "unreadable metadata".into());
+        request_core(&state, &tx, CoreCommand::Restore);
+        assert!(
+            rx.try_recv().is_err(),
+            "partial discovery cannot establish safe restoration"
+        );
     }
     #[test]
     fn worker_survives_repeated_data_dir_failures_and_flags_attention() {
@@ -951,6 +2788,7 @@ mod tests {
         let engine = Engine::new(
             config.clone(),
             OptionalBackend {
+                claims: Default::default(),
                 backend: None,
                 folder: None,
                 config: config.clone(),
@@ -1012,11 +2850,114 @@ mod tests {
         fs::remove_dir_all(&base).unwrap();
     }
     #[test]
+    fn pending_recovery_rejects_provider_reassignment_but_saves_presentation_preferences() {
+        let folder =
+            std::env::temp_dir().join(format!("gamepause-provider-edit-{}", std::process::id()));
+        let config = Config::default();
+        write_json(&folder.join("config.json"), &config).unwrap();
+        write_json(&folder.join("state.json"), &json!({"schema":2,"server":{"running":false,"port":1234},"server_stopped":false,"models":[],"pause_complete":true})).unwrap();
+        let original = fs::read(folder.join("config.json")).unwrap();
+        let backend = OptionalBackend {
+            claims: Default::default(),
+            backend: None,
+            config: config.clone(),
+            folder: None,
+        };
+        let mut engine = Engine::new(config.clone(), backend, folder.join("state.json")).unwrap();
+        let ownership = engine.backend.claims.clone();
+        let journal = fs::read(folder.join("state.json")).unwrap();
+        let mut scanner = Scanner::new(config.clone()).unwrap();
+        let shared = Arc::new(Mutex::new(Shared {
+            config: config.clone(),
+            ..Default::default()
+        }));
+        for change in 0..4 {
+            let mut updated = config.clone();
+            match change {
+                0 => {
+                    if let config::Provider::LMStudio { enabled, .. } = &mut updated.providers[0] {
+                        *enabled = false;
+                    }
+                }
+                1 => {
+                    updated.providers.remove(0);
+                }
+                2 => {
+                    updated.lm_mut().unwrap().endpoint = "127.0.0.1:4321".into();
+                }
+                _ => {
+                    if let config::Provider::LMStudio { id, .. } = &mut updated.providers[0] {
+                        *id = "reassigned".into();
+                    }
+                }
+            }
+            assert!(
+                !apply_action(
+                    Action::Settings(Box::new(updated)),
+                    &mut engine,
+                    &folder,
+                    &mut scanner,
+                    &[],
+                    0.,
+                    &shared
+                )
+                .unwrap()
+            );
+            assert_eq!(fs::read(folder.join("config.json")).unwrap(), original);
+            assert_eq!(fs::read(folder.join("state.json")).unwrap(), journal);
+            assert_eq!(engine.config.providers, config.providers);
+            assert!(Arc::ptr_eq(&engine.backend.claims, &ownership));
+            assert!(
+                shared
+                    .lock()
+                    .unwrap()
+                    .settings_error
+                    .contains("recovery is pending")
+            );
+        }
+        let mut preferences = config.clone();
+        preferences.automation_enabled = false;
+        preferences.advanced_settings_visible = true;
+        preferences.sound_enabled = false;
+        preferences.lm_mut().unwrap().endpoint = "localhost:1234".into();
+        assert!(
+            apply_action(
+                Action::Settings(Box::new(preferences)),
+                &mut engine,
+                &folder,
+                &mut scanner,
+                &[],
+                0.,
+                &shared
+            )
+            .unwrap()
+        );
+        let saved = Config::load(&folder.join("config.json")).unwrap();
+        assert!(saved.advanced_settings_visible);
+        assert!(Arc::ptr_eq(&engine.backend.claims, &ownership));
+        assert!(!saved.sound_enabled && !saved.automation_enabled);
+        assert_eq!(fs::read(folder.join("state.json")).unwrap(), journal);
+        if let config::Provider::LMStudio { enabled, .. } = &mut engine.config.providers[0] {
+            *enabled = false;
+        }
+        write_json(&folder.join("config.json"), &engine.config).unwrap();
+        let backend = OptionalBackend {
+            claims: Default::default(),
+            backend: None,
+            config: engine.config.clone(),
+            folder: None,
+        };
+        assert!(Engine::new(engine.config.clone(), backend, folder.join("state.json")).is_err());
+        assert_eq!(fs::read(folder.join("state.json")).unwrap(), journal);
+        fs::remove_dir_all(folder).unwrap();
+    }
+    #[test]
     fn settings_apply_live_persist_and_invalid_updates_leave_previous_settings() {
         let folder =
             std::env::temp_dir().join(format!("gamepause-live-settings-{}", std::process::id()));
         let config = Config::default();
         let backend = OptionalBackend {
+            claims: Default::default(),
             backend: None,
             folder: None,
             config: config.clone(),
@@ -1047,7 +2988,7 @@ mod tests {
         assert_eq!(loaded.restore_delay_seconds, 17.);
         let bytes = fs::read(folder.join("config.json")).unwrap();
         let mut invalid = loaded;
-        invalid.api_host = "example.com:1234".into();
+        invalid.lm_mut().unwrap().endpoint = "example.com:1234".into();
         assert!(
             !apply_action(
                 Action::Settings(Box::new(invalid)),
@@ -1210,6 +3151,7 @@ mod tests {
         let mut engine = Engine::new(
             config.clone(),
             OptionalBackend {
+                claims: Default::default(),
                 backend: None,
                 config: config.clone(),
                 folder: None,
@@ -1238,16 +3180,314 @@ mod tests {
         );
     }
     #[test]
+    fn notification_preferences_save_independently_and_fail_without_optimistic_state() {
+        let folder = std::env::temp_dir().join(format!(
+            "gamepause-notification-settings-{}",
+            std::process::id()
+        ));
+        let config = Config {
+            advanced_settings_visible: true,
+            ..Default::default()
+        };
+        write_json(&folder.join("config.json"), &config).unwrap();
+        let backend = OptionalBackend {
+            claims: Default::default(),
+            backend: None,
+            config: config.clone(),
+            folder: None,
+        };
+        let mut engine = Engine::new(config.clone(), backend, folder.join("state.json")).unwrap();
+        let mut scanner = Scanner::new(config.clone()).unwrap();
+        let shared = Arc::new(Mutex::new(Shared {
+            config: config.clone(),
+            ..Default::default()
+        }));
+        for (visual, sound) in [(true, false), (false, false), (true, true), (false, true)] {
+            assert!(
+                apply_action(
+                    Action::NotificationPreferences { visual, sound },
+                    &mut engine,
+                    &folder,
+                    &mut scanner,
+                    &[],
+                    0.,
+                    &shared
+                )
+                .unwrap()
+            );
+            let saved = Config::load(&folder.join("config.json")).unwrap();
+            assert_eq!(
+                (saved.notifications_enabled, saved.sound_enabled),
+                (visual, sound)
+            );
+            assert_eq!(saved.providers, config.providers);
+            assert_eq!(saved.automation_enabled, config.automation_enabled);
+            assert!(!folder.join("state.json").exists());
+        }
+        fs::remove_file(folder.join("config.json")).unwrap();
+        fs::create_dir(folder.join("config.json")).unwrap();
+        assert!(
+            !apply_action(
+                Action::NotificationPreferences {
+                    visual: true,
+                    sound: false
+                },
+                &mut engine,
+                &folder,
+                &mut scanner,
+                &[],
+                0.,
+                &shared
+            )
+            .unwrap()
+        );
+        assert!(!engine.config.notifications_enabled && engine.config.sound_enabled);
+        assert!(!shared.lock().unwrap().config.notifications_enabled);
+        engine.config.advanced_settings_visible = false;
+        assert!(
+            apply_action(
+                Action::NotificationPreferences {
+                    visual: true,
+                    sound: false
+                },
+                &mut engine,
+                &folder,
+                &mut scanner,
+                &[],
+                0.,
+                &shared
+            )
+            .is_err()
+        );
+        fs::remove_dir_all(folder).unwrap();
+    }
+    #[test]
+    fn appearance_saves_without_changing_ai_and_failed_saves_keep_the_previous_choice() {
+        let folder =
+            std::env::temp_dir().join(format!("gamepause-appearance-{}", std::process::id()));
+        let config = Config {
+            advanced_settings_visible: true,
+            ..Default::default()
+        };
+        write_json(&folder.join("config.json"), &config).unwrap();
+        let backend = OptionalBackend {
+            claims: Default::default(),
+            backend: None,
+            config: config.clone(),
+            folder: None,
+        };
+        let mut engine = Engine::new(config.clone(), backend, folder.join("state.json")).unwrap();
+        let mut scanner = Scanner::new(config.clone()).unwrap();
+        let shared = Arc::new(Mutex::new(Shared {
+            config: config.clone(),
+            ..Default::default()
+        }));
+        engine.manual_pause = true;
+        for choice in [
+            crate::config::Appearance::Dark,
+            crate::config::Appearance::Light,
+        ] {
+            assert!(
+                !apply_action(
+                    Action::Appearance(choice),
+                    &mut engine,
+                    &folder,
+                    &mut scanner,
+                    &[],
+                    0.,
+                    &shared
+                )
+                .unwrap()
+            );
+            assert_eq!(
+                Config::load(&folder.join("config.json"))
+                    .unwrap()
+                    .appearance,
+                choice
+            );
+            assert_eq!(shared.lock().unwrap().config.appearance, choice);
+            assert!(engine.manual_pause);
+            assert!(!folder.join("state.json").exists());
+            assert_eq!(engine.config.providers, config.providers);
+            assert!(engine.backend.backend.is_none());
+        }
+        fs::remove_file(folder.join("config.json")).unwrap();
+        fs::create_dir(folder.join("config.json")).unwrap();
+        assert!(
+            apply_action(
+                Action::Appearance(crate::config::Appearance::Dark),
+                &mut engine,
+                &folder,
+                &mut scanner,
+                &[],
+                0.,
+                &shared
+            )
+            .is_err()
+        );
+        assert_eq!(
+            shared.lock().unwrap().config.appearance,
+            crate::config::Appearance::Light
+        );
+        engine.config.advanced_settings_visible = false;
+        assert!(
+            apply_action(
+                Action::Appearance(crate::config::Appearance::Dark),
+                &mut engine,
+                &folder,
+                &mut scanner,
+                &[],
+                0.,
+                &shared
+            )
+            .is_err()
+        );
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn advanced_visibility_persists_and_stale_tools_fail_without_changing_ai() {
+        let folder =
+            std::env::temp_dir().join(format!("gamepause-advanced-{}", std::process::id()));
+        let config = Config::default();
+        write_json(&folder.join("config.json"), &config).unwrap();
+        let backend = OptionalBackend {
+            claims: Default::default(),
+            backend: None,
+            config: config.clone(),
+            folder: None,
+        };
+        let mut engine = Engine::new(config.clone(), backend, folder.join("state.json")).unwrap();
+        let mut scanner = Scanner::new(config.clone()).unwrap();
+        let shared = Arc::new(Mutex::new(Shared {
+            config: config.clone(),
+            ..Default::default()
+        }));
+        assert!(
+            apply_action(
+                Action::AdvancedVisibility(true),
+                &mut engine,
+                &folder,
+                &mut scanner,
+                &[],
+                0.,
+                &shared
+            )
+            .unwrap()
+        );
+        let mut stale = engine.config.clone();
+        stale.restore_delay_seconds = 12.;
+        assert!(
+            Config::load(&folder.join("config.json"))
+                .unwrap()
+                .advanced_settings_visible
+        );
+        assert_eq!(engine.config.providers, config.providers);
+        assert!(engine.config.automation_enabled);
+        assert!(
+            apply_action(
+                Action::AdvancedVisibility(false),
+                &mut engine,
+                &folder,
+                &mut scanner,
+                &[],
+                0.,
+                &shared
+            )
+            .unwrap()
+        );
+        let bytes = fs::read(folder.join("config.json")).unwrap();
+        for action in [
+            Action::AdvancedSettings(Box::new(stale)),
+            Action::Verify,
+            Action::Doctor,
+        ] {
+            assert!(
+                apply_action(action, &mut engine, &folder, &mut scanner, &[], 0., &shared).is_err()
+            );
+            assert_eq!(fs::read(folder.join("config.json")).unwrap(), bytes);
+            assert!(!folder.join("state.json").exists());
+            assert!(engine.backend.backend.is_none());
+        }
+        let (tx, rx) = mpsc::channel();
+        request_verify(&shared, &tx);
+        assert!(rx.try_recv().is_err());
+        shared.lock().unwrap().verifying = true;
+        assert!(
+            apply_action(
+                Action::Tracked {
+                    id: 900,
+                    action: Box::new(Action::Verify)
+                },
+                &mut engine,
+                &folder,
+                &mut scanner,
+                &[],
+                0.,
+                &shared
+            )
+            .is_err()
+        );
+        assert!(!shared.lock().unwrap().verifying);
+        shared.lock().unwrap().doctor_pending = true;
+        assert!(
+            apply_action(
+                Action::Tracked {
+                    id: 901,
+                    action: Box::new(Action::Doctor)
+                },
+                &mut engine,
+                &folder,
+                &mut scanner,
+                &[],
+                0.,
+                &shared
+            )
+            .is_err()
+        );
+        assert!(!shared.lock().unwrap().doctor_pending);
+        assert!(shared.lock().unwrap().doctor_report.is_none());
+        assert!(!crate::ui_commands::allowed(
+            &shared,
+            crate::ui_commands::Command::OpenFolder
+        ));
+        assert!(!crate::ui_commands::allowed(
+            &shared,
+            crate::ui_commands::Command::Startup
+        ));
+        fs::remove_file(folder.join("config.json")).unwrap();
+        fs::create_dir(folder.join("config.json")).unwrap();
+        assert!(
+            !apply_action(
+                Action::AdvancedVisibility(true),
+                &mut engine,
+                &folder,
+                &mut scanner,
+                &[],
+                0.,
+                &shared
+            )
+            .unwrap()
+        );
+        assert!(!engine.config.advanced_settings_visible);
+        assert!(!shared.lock().unwrap().config.advanced_settings_visible);
+        fs::remove_dir_all(folder).unwrap();
+    }
+    #[test]
     fn verify_request_rejects_duplicates_and_unsafe_shared_states() {
         let state = Arc::new(Mutex::new(Shared {
+            detection_ok: true,
             active_mode: true,
             discovery_ready: true,
             ..Default::default()
         }));
         let (tx, rx) = mpsc::channel();
+        state.lock().unwrap().config.advanced_settings_visible = true;
         request_verify(&state, &tx);
         request_verify(&state, &tx);
-        assert!(matches!(rx.try_recv(), Ok(Action::Verify)));
+        assert!(
+            matches!(rx.try_recv(), Ok(Action::Tracked { action, .. }) if matches!(*action, Action::Verify))
+        );
         assert!(rx.try_recv().is_err());
         state.lock().unwrap().verifying = false;
         state.lock().unwrap().pending = true;

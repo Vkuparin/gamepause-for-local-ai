@@ -11,7 +11,7 @@ use std::{
 };
 use winreg::{RegKey, enums::*};
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Game {
     pub launcher: String,
     pub identity: String,

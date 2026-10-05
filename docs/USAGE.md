@@ -14,21 +14,57 @@ Additional games share the original snapshot. Alt-tabbing keeps the session acti
 
 Left-click the tray icon or open GamePause from Start. Closing the window leaves monitoring running in the tray. Right-click the tray icon for quick actions; **Quit** stops the watcher and keeps pending recovery.
 
+The footer shows the actual build version. Command feedback appears directly below the help text. Separate text areas list running games and each enabled provider's state, next step and worker detail. If detection is unavailable, game entries are marked as last seen rather than confirmed current. Long lists and messages can be scrolled and copied. The tray shows the same summary. Enabled Ollama is labelled experimental and not live-tested.
+
+**Games**, **Running apps** and **Ignored** are native tabs. Use Left/Right arrows while the tabs have focus. Actions use ordinary buttons. Tab moves between controls; focusing an action shows its description, and F1 moves to the help text. Buttons also have tooltips. Game rows use text for running/ignored state; the tray retains its state colors.
+
+The dashboard can be resized or maximized. It initially fits the primary monitor's work area. Scrollbars appear only when the window or text is too small for its content; keyboard navigation brings the focused control into view. Showing settings preserves the current window size. Captions keep their measured size at the current DPI.
+
+The dashboard's accent is blue while watching or running AI alongside approved games, orange while paused or held (including the recovery countdown), and mellow yellow during transitions or uncertain states. The text explains the actual state; idle loaded models are not inferred from the color. Automatic pausing **on** is blue and **off** is orange in game rows and selection details. Light mode uses darker shades for readable text.
+
+Choose **Appearance** under Advanced settings to use **Follow Windows**, **Light**, or **Dark**. The choice is saved immediately and applies to the dashboard and tray's right-click menu. High contrast uses Windows colors. If saving fails, the previous appearance stays active. Changing appearance does not change AI control or release a manual hold.
+
+The dashboard follows Windows' light/dark app preference. Dark colors cover text, buttons, checkboxes, groups, navigation and game selections; high contrast uses Windows' colors and native controls. Theme changes preserve selection, text and focus. Scrollbars, control borders and Windows-owned dialogs keep OS rendering; the tray menu follows the saved Appearance choice. The owner reported human tests passed for 1.0.0. Detailed screen-reader coverage was not supplied.
+
 - **Games:** search discovered installations, see running status and recognition source, and ignore or enable an entry. New recognized games are enabled automatically.
 - **Running apps:** select a missed game and click **Add selected as game**. Accessible running applications are listed only while this page is open. Select the actual game executable, not a launcher.
 - **Add game…:** browse for a standalone game's executable. Its full path is saved; the installation directory is not broadly classified.
+- **Remove selected:** removes only the selected game you added yourself. The confirmation names the game and defaults to Cancel. Launcher entries use Ignore instead. Failed saves leave the entry unchanged; removing a running game does not erase its pending recovery guard.
 - **Ignored:** re-enable games or saved path exclusions. Built-in launcher/helper exclusions remain automatic.
-- **Refresh now:** request discovery immediately. Routine use does not require it.
+- **Refresh now:** request discovery immediately. Feedback reports queued work, completion, no changes or errors after the discovery result arrives. Repeated requests share the pending refresh. Routine use does not require it.
 - **Automatically pause AI while gaming:** takes effect without restarting and is remembered. Turning it off does not discard captured models: an existing session waits for recognized games to exit, then restores normally.
-- **Start when I sign in to Windows:** controls per-user startup. Sign-in starts quietly in the tray.
-- **Settings:** reveal optional **Restore after (seconds)** and **Local API** fields, saved with **Save settings**. **Locate lms…** handles unusual CLI installations. Normal launcher/LM Studio setups need no edits.
-- **Test round-trip:** exercises the full pause/restore cycle without a game — captures loaded models, unloads them, confirms the server is empty, restores them, and compares the read-back settings field by field. The result appears in the feedback line, naming the failing step and field when something does not round-trip. Use it after upgrading LM Studio or after an odd restore.
+- **Advanced settings:** a saved checkbox, initially off. It shows connection/delay settings, provider details, Test round-trip, logs/status folder and Windows startup controls in the dashboard and corresponding tools in the tray. Hiding it leaves automation, enabled providers and pending recovery unchanged. Hidden tools leave the keyboard tab order.
+- **Quit:** stops the watcher and retains pending recovery. Closing the dashboard alone keeps monitoring running.
 
 Selected rows show their path and why they are recognized. Discovery and save errors appear in the window. A missing LM Studio connection retains models/recovery and is retried automatically.
 
+Action feedback stays visible until another action replaces it. Timer updates and older command results do not replace it with a generic hint or an old test report. Settings appear as saved only after persistence succeeds. Cancelled pickers leave settings unchanged and report cancellation. Folder-opening and Windows startup failures also appear in feedback.
+
 ## Manual actions
 
-**Pause / resume AI manually** holds the session open without a game. Release it to allow restoration after the delay. **Restore AI now** removes the delay; recognized games still prevent restoring. **Test round-trip** (dashboard and tray) runs the whole capture → unload → restore cycle on purpose and reports each step; it is a test, not a session, and needs no game running. The tray menu exposes the same actions.
+Under Advanced settings, **Windows notifications** controls visual completion/failure messages and **Sound for notifications** controls their sound. With visuals enabled, Windows provides the only sound. With visuals off and sound on, GamePause uses one standalone system sound. Turn both off for silence. Windows may suppress visual notifications or sounds; the dashboard and tray remain the persistent state record.
+
+Verified success messages use an initial two-second delay on the existing tray timer; this does not delay pausing or restoration. Rapid restore replaces a queued pause message. New work, partial failure or an old message after a stalled UI discards stale success. Failure notices are immediate and coalesced through retries until a healthy state returns. These timing values are initial acceptance choices and may be adjusted after desktop testing. Delivery is not guaranteed over fullscreen games or with notification suppression enabled.
+
+Under Advanced settings, **Restore after (seconds)** and **Local API** are saved with **Save settings**. **Locate lms…** handles unusual CLI installations. **Enable LM Studio control** cannot be unchecked while its own recovery is unfinished; restore that saved AI first. A completed provider can be disabled while another provider retains recovery. Provider details explain this restriction. **Start when I sign in to Windows** controls per-user startup. **Open logs and status folder** is available in both dashboard and tray. The checkbox and tools use saved preferences; a failed save retains the previous view. An advanced action queued before the tools were hidden is rejected.
+
+**Pause AI** creates a manual hold. **Resume AI** releases that hold and immediately resumes captured AI when recovery is pending. If nothing was captured, it simply releases the hold. A completed automatic pause disables redundant Pause; clicking Pause again cannot create or release a hidden hold. Capture, unload, restore and test operations disable incompatible requests in both the dashboard and tray. The worker checks requests again before acting.
+
+**Resume AI** removes the delay when recovery is pending, detection has succeeded and recognized games are absent. During gameplay, **Restore AI…** opens a warning: restoring models can compete with the game for VRAM. Cancel is the default. Confirming restores immediately and temporarily overrides automatic pausing for the listed running game instances. A new nonignored game, a game relaunch, any approved game exiting, unknown detection, **Pause AI**, or restarting GamePause ends that approval. Pause creates a manual hold. Failed loads retain recovery; **Retry resume** uses the same approval while it remains valid.
+
+The warning also offers separate, initially unchecked **Ignore in future** choices. Only selected executable paths are saved. Saving exclusions and restoring AI have separate results: a failed preference save does not cancel your explicit restore choice. Ignoring a game alone never restores AI, and remembered games still guard ordinary recovery. CLI Restore and Test round-trip retain their normal game guards.
+
+**Test round-trip** runs the capture, unload and restore cycle on purpose and reports each step. It requires confirmation and no running game or pending recovery.
+
+The status distinguishes work in progress, confirmed pause, restoration countdown, manual hold, inference deferral and failure. A recovery journal alone does not mean AI has been unloaded. Watching without a provider probe does not establish LM Studio availability. Partial failures retain recovery and never report a completed pause or restore.
+
+Basic dashboard and tray summaries show enabled providers separately, including pending recovery and errors. Advanced settings is not required to see a failure. A verified restoration describes completed work; current residency is not polled afterward. Retry backoff values describe the last update. Automatic retries leave completed healthy-provider work alone. CLI `status.json` includes the same evidence under `provider_outcomes`.
+
+Game detection continues while AI capture or loading is busy. If a recognized game starts during restoration, GamePause defers remaining loads after the current operation returns. A failed or timed-out fresh scan holds recovery. The dashboard can update detected games before the ongoing model operation finishes.
+
+After Windows resumes, GamePause refreshes discovery and process caches before controlling AI. Old scans and dialog approvals cannot authorize recovery. If a provider operation was already running when power changed, it can finish, but the next operation is held. Original captured settings and unfinished recovery remain saved. When a fresh, reliable scan confirms no games are running, the full configured recovery delay starts again; sleep time does not finish that delay. Manual holds remain in effect.
+
+A previous gameplay coexistence choice is held while discovery refreshes and is used again only after the same live process instances are verified. A new/relaunched game or failed/unknown detection revokes it. Restarting GamePause always revokes it. Observation mode leaves pending recovery bytes unchanged after resume. These rules have fixture and injected native-event coverage; actual computer sleep/wake and live provider restarts remain untested.
 
 ## CLI scripting
 
@@ -47,17 +83,45 @@ Selected rows show their path and why they are recognized. Discovery and save er
 
 `--status` checks the instance lock and prints `status=absent` after quit/crash, even if an old status file remains. `--games` reads cached inventory and returns `games=absent` only when that file is missing. Permission/I/O errors and corrupt cached files are errors. Text fields escape backslashes, tabs, carriage returns and newlines as `\\`, `\t`, `\r`, `\n`; paths use the same escaping. `active_games` is a JSON array on one status line.
 
-`--verify` unloads/reloads all current models through a durable schema-2 recovery journal. Close the GUI and games and finish inference first. It rejects observation mode, discovery errors and existing recovery. A temporary server is used if needed, then returned to its original state after successful recovery. A game appearing between steps defers remaining loads. Failure/cancellation exits nonzero; unresolved models stay recoverable. The GUI action asks for confirmation and is unavailable during pause/recovery. `verify-unloaded` means an empty model inventory, not a stopped server.
+`--verify` unloads/reloads all current models through a durable schema-3 journal containing the original LM snapshot. Close the GUI and games and finish inference first. It rejects observation mode, discovery errors and existing recovery. A temporary server is used if needed, then returned to its original state after successful recovery. A game appearing between steps defers remaining loads. Failure/cancellation exits nonzero; unresolved models stay recoverable. The GUI action asks for confirmation and is unavailable during pause/recovery. `verify-unloaded` means an empty model inventory, not a stopped server.
 
-`--doctor` performs independent read-only LM Studio probes and also works while the GUI is open. It never starts/stops the server or loads/unloads models. A stopped server or no loaded model leaves the WS compatibility probe unknown. Reports/logs and a writability probe are local filesystem writes. An embedded dashboard doctor view is deferred; use CLI JSON output.
+**Read-only diagnostics** in Advanced settings probes enabled providers on the control worker. The scrollable provider details show the saved endpoint, guarantee, recovery state/action and cached probe timestamp. Repeat diagnostics after provider changes. Changing the saved provider connection marks earlier evidence stale. Disabled providers are not probed. Test round-trip remains a separate, confirmed LM Studio operation.
+
+`--doctor` uses the same independent read-only probes and also works while the GUI is open. It preserves the existing LM Studio JSON fields and adds a `providers` array with endpoints and observation timestamps. Ollama version and resident inventory are probed separately; their success does not establish recovery compatibility or live-tested support. A stopped LM server or no loaded model leaves its WS compatibility probe unknown. Doctor never starts/stops services or loads/unloads models. Reports/logs and a writability probe are local filesystem writes; settings and recovery journals are left intact.
+
+`--status` keeps its existing escaped fields and appends `provider.<kind>.id`, `state`, `guarantee`, `pending`, `error` and `retry_seconds` when provider outcomes are present. `provider_evidence=cached_status` identifies the running app's saved status, which can differ from current service state. Doctor's `read_only_probe` evidence describes the time of the probe, not a continuous availability check.
+
+## Settings migration
+
+Settings now use version 3. On startup, GamePause validates older settings and maps the LM address, CLI path and server-stop choice into the `lmstudio-main` provider entry. Games, exclusions, delays and explicit automation choices remain. Version-2 observation mode remains observation; unversioned settings keep the existing one-time migration to active mode. The original file is saved as `config.v2.backup.json` before atomic replacement. Invalid settings, backup conflicts or save failures leave the source intact and report an error. Doctor reads older settings without migrating them.
+
+The [example settings](../config.example.json) show the format. LM is enabled by default; experimental Ollama is off by default and requires explicit opt-in. IDs are stable names, and endpoints must be local host/port pairs. While a provider's recovery is unfinished, settings cannot disable/remove it or reassign its ID/endpoint. If a manual file edit disables pending Ollama, its recovery stays pending while healthy LM recovery can finish; re-enable the original entry before retrying. Unsupported or reassigned unfinished bindings are refused and retained.
+
+Older builds cannot read version-3 settings. Before downgrading, restore pending AI with this build, quit GamePause, and keep a copy of the current settings. Then restore the original backup as `config.json` for the older build. The backup reflects migration time; carry later compatible game/preferences changes over deliberately. Never restore a backup over a running instance or use it to bypass pending recovery. Startup registration and data-directory paths are unchanged.
+
+Advanced visibility, visual notifications and sound preferences are persisted. Notification controls are under Advanced; turning them off does not hide errors or change AI control/recovery.
+
+Recovery journals now use schema 3. Active startup validates a supported schema-2 LM journal, saves its exact original bytes as `state.v2.backup.json`, then atomically replaces it. Model identities, raw settings, stages, server lifecycle and remembered games survive migration. Observation mode and Doctor leave the journal unchanged. Invalid or unknown payloads, changed provider bindings, conflicting backups and failed writes retain the authoritative journal and refuse control.
+
+Older builds cannot recover schema-3 journals. Complete pending recovery with this build before downgrading. Never put the migration backup back over a later journal: it records an earlier transaction state. Backups are not used for automatic recovery. This build retains typed LM and Ollama recovery obligations together. Completed entries survive restart and retire atomically before a new pause when their provider is disabled or reassigned. Unfinished original snapshots remain authoritative.
 
 ## Background AI applications
+
+Ollama is experimental and off by default. It has source and isolated protocol/recovery evidence, and is not tested with a live Ollama installation. No live version compatibility is claimed. Under Advanced settings, **Enable experimental Ollama (not live-tested)** shows a Cancel-default disclosure naming the saved endpoint. **Save Ollama endpoint** saves a loopback host/port independently of LM settings and does not enable control or start a service. Editing the Ollama entry to `"enabled": true` is also an explicit opt-in; read these limits first.
+
+The supported subset is local GGUF completion models with verified identity/digest, supported context and a finite observed expiry no more than 24 hours away at capture. Restoration uses the remaining observed deadline, including time spent paused. It does not preserve all live load options, parallelism, conversations or KV cache. Embedding/cloud models, unknown formats/capabilities and unsupported evidence are refused before control. The user-owned service stays running; GamePause never downloads models or fights later client reloads. Tag changes, expiry or final-set eviction retain recovery or resolve verified expiry as appropriate.
+
+**Test round-trip** and `--verify` remain LM Studio tests; enabled Ollama is left untouched. Source/fixture results do not establish vendor inference safety or expiry timing. [Contributions](../CONTRIBUTING.md) with fixes and sanitized live evidence are welcome; the Advanced contribution button opens the same project guidance in a browser.
 
 Clients using LM Studio's HTTP server are unavailable during gaming. Pause agents that independently restart the server or explicitly load models. With `stop_server_during_gaming: false`, a client using JIT loading can reload models immediately. GamePause does not prevent every later model load.
 
 Busy inference defers capture and unloading until idle. Continuous background inference can therefore delay VRAM release.
 
+If another client loads a new model during pausing, GamePause keeps the original recovery snapshot and reports incomplete protection. It does not replace that snapshot or unload the newly added model. Pause the client that is loading models, then retry or allow ordinary recovery after gaming. A completed pause does not continually query for later client reloads.
+
 ## Recovery
+
+Only one cooperating GamePause instance may control a provider route, even when instances use different data directories. A conflict refuses capture/control and reports that another instance owns the route. Quit that instance or use its data directory, especially if it has pending recovery. LM Studio also has one service-wide claim because its CLI controls the service independently of the configured port. Observation and read-only diagnostics do not claim control. These claims cannot prevent other applications or older GamePause builds from changing models.
 
 The durable journal is `%LOCALAPPDATA%\GamePause\state.json`. It records intention before model/server changes and retains the session's game paths even if an entry is removed or ignored. Relaunching waits for discovery before resuming an existing session, including when automatic pausing has been turned off; the models are restored after recognized games exit. Observation (`--observe`) is an advanced diagnostic override and never controls models or executes recovery.
 

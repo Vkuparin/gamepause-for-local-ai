@@ -1,5 +1,62 @@
 # Validation
 
+## Owner acceptance - 2026-10-05
+
+The owner reported "Human tests passed" and explicitly authorized pushing and publishing v1.0.0. This approval applies to the final appearance review build below. The installer and ZIP are published unchanged. Later versions will focus on further UI and UX improvements.
+
+- Installer SHA-256: `2fe1061702516eec3227d408ea988ca57e934cd04176ee0c705122e0fcd0f1b6`.
+- ZIP SHA-256: `8fc85ed1e29e5ccf2851f8903760cf5416d784cb1f265bec0b67ff36f35eae0f`.
+- Source fingerprint: `59cf957fde1eae66594731c5ff02dfff7100bc1f2ce094e213a4a08ba036c3a9`.
+
+The owner did not provide a scenario-by-scenario report or environment details. Do not infer specific provider versions, model identities, accessibility, power, startup or installer-upgrade coverage from this approval. Ollama remains experimental and off by default, with no live compatibility range claimed. Earlier pending-review entries below record the state before this approval and do not override it. Bundled candidate documentation and BUILD-INFO describe the build-time review status; this record and the release acceptance asset record the subsequent approval.
+
+
+## State accents and appearance feedback - 2026-10-05
+
+The dashboard now uses a blue accent for watching/coexistence, orange for confirmed pause/manual hold/countdown, and mellow yellow for transitions or uncertain evidence. State text remains authoritative; watching does not assert that idle models are loaded. Only the metadata words on/off receive blue/orange in list and selection details. Light mode uses darker text shades. Feedback is below help; the version is in the footer.
+
+Advanced Appearance offers Follow Windows (default), Light and Dark. Existing settings default to Windows. Its dedicated atomic save updates only appearance after persistence; failed saves and hidden Advanced requests retain the prior choice. Provider configuration, transports, scanner state, manual hold and recovery are left intact. High contrast takes precedence. Native tray menus retain labels, IDs, checks, disabled flags and keyboard handling while using the saved palette and state accent.
+
+Push buttons in both palettes use owner drawing rather than mixed theme-animation drawing. Group boxes fill their uncovered background in both palettes. Child movement is deferred, with a complete fallback after failed batches, and one final redraw; the composited parent clips children. Scroll-only movement does not toggle text scrollbars. Selection details use the built-in Windows Rich Edit control with selection/scroll preservation and metadata-only colors. The gameplay warning and optional Ignore help use plain English and fit measured 96/144/192 DPI fonts.
+
+Validation: 82 focused tests passed (dashboard 23, theme three, tray 12, application 27, config ten, native menu one, Rich Edit two, restore dialog four). Three individually selected interactive fixtures passed: rendered dashboard/scrolling, DPI/GDI relayout and real popup/timer reentry alternating appearance. The rendered fixture exercises 30 Advanced down/up cycles, hover/pressed states, appearance dispatch awaiting persistence, mode switching, list/selection and bounds. Final measured GDI counts were 101/101 after 98 warmups and 49 relayouts. Light/dark captures were inspected; the stale dark group backgrounds are corrected. Formatting, Clippy/all targets and diff checks passed. The full suite was not repeated for this feedback ticket.
+
+Human appearance/accessibility and live recovery acceptance remain pending. No installed application, real journal, provider/model/server, startup registration or game was changed. This build remains unpublished and requires further human feedback before release.
+
+## UI feedback correction � 2026-10-05
+
+The human screenshot exposed group boxes above overlapping sibling controls. The corrected dashboard moves group boxes to the bottom of the sibling order, keeps native controls and dark painting, removes frames from read-only summaries and shows scrollbars only for actual overflow. Both axes account for the space required by the other bar. Long text retains wrapping, keyboard scrolling and selection.
+
+Pause AI always creates a hold. The single Resume AI action releases the hold and immediately retries saved recovery; with no saved recovery, it only releases the hold. Gameplay still requires the existing Cancel-default confirmation and process-instance approval. Retry resume preserves the same approval. Internal restore actions, CLI and journal formats remain unchanged.
+
+Focused checks: dashboard 23 passed (three interactive cases excluded), tray 12 passed (one excluded), restore dialog three passed, presentation five passed, application 26 passed and command tracking four passed. The individually selected rendered-dashboard and DPI/GDI tests passed. The rendered fixture checks sibling hit testing, composited button pixels, overflow/refit, selection preservation and guarded Resume dispatch with a private mock state and no provider worker. Dark/light captures were inspected. GDI plateau remained 102/102. The full suite was not repeated for this ticket; the earlier full-suite result below predates these fixes. Formatting, Clippy/all targets and diff checks passed. Human appearance and live recovery acceptance remain pending.
+
+## v1.0.0 candidate — 2026-10-05
+
+This candidate is prepared for human review and remains unpublished. Use its final `SHA256SUMS.txt` and `BUILD-INFO.json` to identify installer/ZIP hashes and the compiled-source fingerprint. The [acceptance checklist](ACCEPTANCE.md) records pending appearance, comprehension, live LM recovery, actual power, installer/startup and complete performance acceptance. No live Ollama version range is claimed.
+
+- Rust 1.99.0, committed lockfile: final integrated `cargo test --locked` passed 267 unit tests and ten CLI integration tests, with six ignored. The full suite ran once at candidate validation; the later tooltip-only adjustment used focused tests. Formatting, Clippy/all targets, diff checks, normal release build and release panic probe passed. The panic probe contained its expected injected discovery panic and retained subsequent refresh/logging.
+- Dashboard/theme/tray focused checks passed: 23/two/11 tests respectively, with interactive tests excluded from those counts. Individually selected native dashboard resource/DPI, popup timer reentry, Ollama opt-in dialog and headless power-registration tests passed. The expanded light/dark drawing fixture warmed both themes at all DPI fonts for 98 relayouts, then measured another 49 at GDI count 102 before/after. Initial 49-warmup attempts had not reached that cache plateau. The measured growth tolerance was unchanged.
+- Selection fixtures now draw actual text with leading whitespace to detect opaque backgrounds inside selected text extents. Both palettes restore DC state; native check/text/tab state, disabled colors and edit selection survive theme/resize changes. These checks do not establish physical monitor or screen-reader behavior. OS scrollbars, control borders, menus and Windows-owned dialogs retain OS rendering.
+- Installer and portable ZIP compiled with signature-verified official Inno Setup 6.7.3 in private portable-tool mode. Package verification passes hashes, executable/CLI version 1.0.0, version-3 defaults, off-by-default experimental Ollama/Advanced, dependency declarations/license texts and absence of internal plans/reviews/runtime files. The initial all-platform license check found an irrelevant `r-efi` dependency; packaging now uses the resolved Windows target graph. The installer was compiled, not installed or executed.
+
+### Private observation samples of the earlier candidate
+
+Three startup-inclusive headless samples per variant requested 12 seconds and lasted 12.39–12.47 seconds. Parent CPU, working set and private memory were read every 250 ms on a 16-logical-CPU Windows PC. CPU share is parent CPU seconds / measured wall seconds / 16 × 100. All samples explicitly used observation, automatic control/notifications off, new private data directories, an absent fixture CLI and uncontacted loopback endpoints. No model/server request, game launch or recovery journal occurred. Real launcher metadata/process enumeration still contributed local discovery work.
+
+Baseline is source `dc29db8`/0.3.5 rebuilt with the same Rust 1.99.0 compiler to compare source changes, not the historical distributed binary. Candidate CLI SHA-256 is `a1ae3e056d07774c6097f2021bcd0eac48395530c634d347a881357388e327a5`; baseline is `102c6f54df5a305aa2aeef2b1bd0a27800155a7d1a51184f870e1a84836ac376`. The measurement script retains raw private samples under ignored build output; only aggregate evidence is bundled.
+
+| Variant (three samples each) | Total CPU share range | Peak working set range | Peak private memory range |
+| --- | --- | --- | --- |
+| Baseline, one unavailable LM route | 0.0865–0.0866% | 9.66–10.55 MiB | 2.32–2.52 MiB |
+| Candidate, no enabled providers | 0.0865–0.1497% | 10.29–10.51 MiB | 2.66–3.32 MiB |
+| Candidate, one unavailable LM route | 0.1102–0.1332% | 10.20–12.61 MiB | 2.75–3.19 MiB |
+| Candidate, two configured uncontacted routes | 0.1102–0.1260% | 10.27–10.50 MiB | 2.91–3.25 MiB |
+
+Both candidate executables are 3,597,824 bytes; baseline CLI is 2,835,456 bytes. Short parent-only samples are not steady-state budgets, healthy-provider control measurements or FPS evidence. Dashboard-open costs, native scan-gap/wakeup instrumentation, child-process CPU, simulated/actual gaming/restoration and the full paired performance matrix remain unmeasured here. Earlier provider/scanner fixtures establish bounded decisions and cooperative scheduling, not a hard native scan latency guarantee.
+
+Human state comprehension, theme/accessibility, notifications under games/Windows suppression, live LM settings/server fidelity, actual sleep/wake, installer upgrade/uninstall and reboot/sign-in remain pending. Ollama is experimental with source/fixture evidence only. No release, tag, push, live provider/game, startup registration or application installation was performed.
+
 ## v0.3.5 stabilisation checks — 2026-10-04
 
 - Windows x64, pinned Rust 1.98.1: 108 unit tests and 5 CLI process integration tests passed (four tests are ignored by default: two interactive tests and two subprocess fixtures exercised by ordinary regressions). The two interactive tests also passed explicitly. Checks include locked tests, formatting, Clippy (all targets/features), release build and feature-gated release panic probe. The probe catches an injected discovery panic, retains inventory, services a later refresh and confirms panic logging under the actual release profile.

@@ -1,6 +1,9 @@
 use crate::{
     app::{Action, SharedState},
-    dashboard, wide,
+    control::{Activity, CoreCommand},
+    dashboard,
+    ui_commands::Command,
+    wide,
 };
 use anyhow::{Context, Result};
 use std::{
@@ -20,11 +23,7 @@ use windows_sys::Win32::{
     },
     System::Diagnostics::Debug::MessageBeep,
     System::LibraryLoader::GetModuleHandleW,
-    UI::{
-        Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW},
-        Shell::*,
-        WindowsAndMessaging::*,
-    },
+    UI::{Shell::*, WindowsAndMessaging::*},
 };
 use winreg::{RegKey, enums::*};
 
@@ -76,9 +75,8 @@ struct UI {
     icons: Icons,
     taskbar_message: u32,
     last_error: String,
-    last_kind: StateKind,
-    last_pause: u64,
-    last_restore: u64,
+    notifications: crate::notifications::Queue,
+    clock: std::time::Instant,
     menu_open: bool,
 }
 thread_local! {static UI_STATE:RefCell<Option<UI>>=const{RefCell::new(None)};}
@@ -197,7 +195,7 @@ pub fn shell_execute_failed(return_value: *mut core::ffi::c_void) -> bool {
 
 /// Open a folder in the default file manager. A `ShellExecuteW` failure is
 /// surfaced as a visible error instead of being silently swallowed (P1-7).
-pub fn open_path(path: &Path) {
+pub fn open_path(path: &Path) -> Result<()> {
     let operation = wide("open");
     let display = path.to_string_lossy();
     let path_w = wide(&display);
@@ -212,8 +210,158 @@ pub fn open_path(path: &Path) {
         )
     };
     if shell_execute_failed(result) {
-        error(&format!("Could not open this folder: {display}"));
+        anyhow::bail!(
+            "Could not open this folder: {display} (shell code {})",
+            result as isize
+        );
     }
+    Ok(())
+}
+pub fn request_startup(state: &SharedState, enabled: bool, folder: &Path) {
+    if !crate::ui_commands::allowed(state, Command::Startup) {
+        return;
+    }
+    use crate::commands::Outcome;
+    if startup_enabled() == enabled {
+        crate::app::local_result(
+            state,
+            Outcome::NoChange,
+            "Windows startup preference unchanged.",
+        );
+        return;
+    }
+    match set_startup(enabled, folder) {
+        Ok(()) => crate::app::local_result(
+            state,
+            Outcome::Completed,
+            if enabled {
+                "Start with Windows enabled."
+            } else {
+                "Start with Windows disabled."
+            },
+        ),
+        Err(error) => crate::app::local_result(
+            state,
+            Outcome::Failed,
+            format!("Could not save Windows startup preference: {error:#}"),
+        ),
+    }
+}
+pub fn request_folder(state: &SharedState, folder: &Path) {
+    if !crate::ui_commands::allowed(state, Command::OpenFolder) {
+        return;
+    }
+    match open_path(folder) {
+        Ok(()) => crate::app::local_result(
+            state,
+            crate::commands::Outcome::Completed,
+            "Logs and status folder opened.",
+        ),
+        Err(error) => crate::app::local_result(
+            state,
+            crate::commands::Outcome::Failed,
+            format!("Could not open logs folder: {error:#}"),
+        ),
+    }
+}
+
+fn command_items(state: &crate::app::Shared, startup: bool) -> Vec<(usize, String, u32)> {
+    let availability = state.controls().availability();
+    let mut items = vec![
+        (Command::OpenDashboard as usize, "Open GamePause".into(), 0),
+        (0, String::new(), MF_SEPARATOR),
+        (
+            Command::Automation as usize,
+            "Automatically pause AI while gaming".into(),
+            if state.config.automation_enabled {
+                MF_CHECKED
+            } else {
+                0
+            },
+        ),
+        (
+            Command::Pause as usize,
+            "Pause AI".into(),
+            if availability.pause { 0 } else { MF_GRAYED },
+        ),
+        (
+            Command::Resume as usize,
+            crate::restore_dialog::resume_label(
+                !state.active_games.is_empty(),
+                state.coexistence,
+                state.pending,
+            )
+            .into(),
+            if availability.restore || availability.resume {
+                0
+            } else {
+                MF_GRAYED
+            },
+        ),
+        (0, String::new(), MF_SEPARATOR),
+        (Command::Refresh as usize, "Refresh games".into(), 0),
+    ];
+    if state.config.advanced_settings_visible {
+        items.extend([
+            (0, String::new(), MF_SEPARATOR),
+            (
+                0,
+                format!(
+                    "LM Studio: {}. Endpoint: {}",
+                    if state.config.lm_enabled() {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    },
+                    state.config.lm_endpoint()
+                ),
+                MF_GRAYED,
+            ),
+            (
+                0,
+                "Guarantee: captured settings and original server-state verification".into(),
+                MF_GRAYED,
+            ),
+            (
+                0,
+                if state.provider_pending(crate::provider::Kind::LMStudio) {
+                    "Recovery pending: restore before disabling or changing the endpoint".into()
+                } else {
+                    "No pending LM recovery".into()
+                },
+                MF_GRAYED,
+            ),
+            (
+                Command::Doctor as usize,
+                "Read-only provider diagnostics".into(),
+                if state.doctor_pending { MF_GRAYED } else { 0 },
+            ),
+            (
+                Command::Verify as usize,
+                "Test round-trip".into(),
+                if crate::ui_commands::verify_available(state) {
+                    0
+                } else {
+                    MF_GRAYED
+                },
+            ),
+            (
+                Command::OpenFolder as usize,
+                "Open logs and status folder".into(),
+                0,
+            ),
+            (
+                Command::Startup as usize,
+                "Start when I sign in to Windows".into(),
+                if startup { MF_CHECKED } else { 0 },
+            ),
+        ]);
+    }
+    items.extend([
+        (0, String::new(), MF_SEPARATOR),
+        (Command::Quit as usize, "Quit".into(), 0),
+    ]);
+    items
 }
 /// The tray glyph's solid fill color per state. Pure + unit-testable: this is
 /// the "state -> icon variant" mapping P1-6 wants asserted without Win32.
@@ -221,7 +369,7 @@ pub fn open_path(path: &Path) {
 /// a warning red that pops against the dark tray.
 pub fn icon_tint(kind: StateKind) -> [u8; 3] {
     match kind {
-        StateKind::Idle => [117, 94, 21],
+        StateKind::Idle => [220, 168, 72],
         StateKind::Paused => [56, 132, 255],
         StateKind::Attention => [230, 62, 62],
     }
@@ -248,16 +396,15 @@ pub fn system_is_dark() -> bool {
 /// caller is responsible for not leaking an unowned handle.
 pub unsafe fn apply_theme(hwnd: HWND) {
     unsafe {
-        let mut contrast: HIGHCONTRASTW = std::mem::zeroed();
-        contrast.cbSize = size_of::<HIGHCONTRASTW>() as u32;
-        SystemParametersInfoW(
-            SPI_GETHIGHCONTRAST,
-            contrast.cbSize,
-            &mut contrast as *mut _ as *mut _,
-            0,
-        );
-        let use_dark: u32 =
-            u32::from(system_is_dark() && contrast.dwFlags & HCF_HIGHCONTRASTON == 0);
+        let choice = ui_snapshot()
+            .and_then(|ui| ui.shared.lock().ok().map(|s| s.config.appearance))
+            .unwrap_or_default();
+        apply_theme_mode(hwnd, crate::theme::effective_dark(choice));
+    }
+}
+pub(crate) unsafe fn apply_theme_mode(hwnd: HWND, dark: bool) {
+    unsafe {
+        let use_dark = u32::from(dark);
         let _ = DwmSetWindowAttribute(
             hwnd,
             DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
@@ -299,12 +446,12 @@ unsafe fn icon(color: [u8; 3]) -> HICON {
 }
 unsafe fn notification(hwnd: HWND, operation: u32, ui: &UI) {
     unsafe {
-        let (message, manual_pause, pending) = ui
+        let (message, activity) = ui
             .shared
             .lock()
-            .map(|s| (s.message.clone(), s.manual_pause, s.pending))
-            .unwrap_or_else(|_| ("GamePause".into(), false, false));
-        let kind = display_kind(&message, manual_pause, pending);
+            .map(|s| (s.message.clone(), s.activity))
+            .unwrap_or_else(|_| ("GamePause".into(), Activity::Unknown));
+        let kind = activity_kind(activity);
         let mut data: NOTIFYICONDATAW = std::mem::zeroed();
         data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
         data.hWnd = hwnd;
@@ -320,9 +467,7 @@ unsafe fn notification(hwnd: HWND, operation: u32, ui: &UI) {
         Shell_NotifyIconW(operation, &data);
     }
 }
-/// The engine's user-facing state, classified from the current status message
-/// plus the manual-pause flag. Single source of truth for the toast (P1-5) and
-/// the state-colored tray icon (P1-6).
+/// Tray appearance follows typed worker evidence. Recovery alone is not a pause.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum StateKind {
     /// Healthy / idle — the base icon. A successful restore lands here ("AI restored").
@@ -333,41 +478,14 @@ pub enum StateKind {
     /// transient errors).
     Attention,
 }
-pub fn state_kind(message: &str, manual_pause: bool) -> StateKind {
-    // Attention wins: a restore failure or repeated transient error must be
-    // surfaced even if a pause message is also present.
-    if message.starts_with("Restore failed") || message.starts_with("Needs attention") {
-        return StateKind::Attention;
-    }
-    if message.starts_with("AI paused") || manual_pause {
-        return StateKind::Paused;
-    }
-    StateKind::Idle
-}
-fn display_kind(message: &str, manual_pause: bool, pending: bool) -> StateKind {
-    let kind = state_kind(message, manual_pause);
-    if pending && kind == StateKind::Idle {
-        StateKind::Paused
-    } else {
-        kind
-    }
-}
-fn completion_notification(
-    last_pause: u64,
-    last_restore: u64,
-    pause: u64,
-    restore: u64,
-    old: StateKind,
-    kind: StateKind,
-) -> Option<StateKind> {
-    if restore != last_restore {
-        Some(StateKind::Idle)
-    } else if pause != last_pause {
-        Some(StateKind::Paused)
-    } else if kind == StateKind::Attention && old != kind {
-        Some(kind)
-    } else {
-        None
+fn activity_kind(activity: Activity) -> StateKind {
+    match activity {
+        Activity::Paused | Activity::ManualHold | Activity::Countdown => StateKind::Paused,
+        Activity::PartialFailure
+        | Activity::DetectionUnavailable
+        | Activity::Recovery
+        | Activity::Unavailable => StateKind::Attention,
+        _ => StateKind::Idle,
     }
 }
 /// Toast severity. Pure data so the mapping is unit-testable (P1-5 acceptance).
@@ -378,9 +496,8 @@ pub enum Severity {
     /// Any failure — the warning system sound.
     Error,
 }
-/// The toast title + severity for a given state (the "mapping table" the plan
-/// wants asserted). The body is always the engine's own message, so the user
-/// sees exactly what the engine said.
+/// Titles and severity for typed completion/failure events. The bounded queue
+/// supplies factual completion text or the current failure message.
 pub struct ToastSpec {
     pub title: &'static str,
     pub severity: Severity,
@@ -401,8 +518,7 @@ pub fn toast_spec(kind: StateKind) -> ToastSpec {
         },
     }
 }
-/// The system sound for a state. The "tiny indirection" the plan asks for:
-/// tests assert this mapping instead of calling a live `MessageBeep`.
+/// Sound-only mode uses this system sound. Visual notifications use Windows sound.
 pub fn beep_code(kind: StateKind) -> u32 {
     match kind {
         StateKind::Attention => MB_ICONASTERISK,
@@ -410,84 +526,92 @@ pub fn beep_code(kind: StateKind) -> u32 {
         StateKind::Idle | StateKind::Paused => MB_OK,
     }
 }
-unsafe fn state_toast(hwnd: HWND, message: &str, kind: StateKind) {
+fn notification_flags(kind: StateKind, sound: bool) -> u32 {
+    (if kind == StateKind::Attention {
+        NIIF_ERROR
+    } else {
+        NIIF_INFO
+    }) | NIIF_RESPECT_QUIET_TIME
+        | if sound { 0 } else { NIIF_NOSOUND }
+}
+unsafe fn state_toast(hwnd: HWND, message: &str, kind: StateKind, sound: bool) -> bool {
     unsafe {
         let spec = toast_spec(kind);
         let mut data: NOTIFYICONDATAW = std::mem::zeroed();
         data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
         data.hWnd = hwnd;
         data.uID = 1;
-        data.uFlags = NIF_INFO;
-        data.dwInfoFlags = if spec.severity == Severity::Error {
-            NIIF_ERROR
-        } else {
-            NIIF_INFO
-        };
+        // Completion state can become stale while another application's toast is visible.
+        data.uFlags = NIF_INFO | NIF_REALTIME;
+        data.dwInfoFlags = notification_flags(kind, sound);
         let title: Vec<_> = spec.title.encode_utf16().collect();
         data.szInfoTitle[..title.len()].copy_from_slice(&title);
         let info: Vec<_> = message.encode_utf16().take(255).collect();
         data.szInfo[..info.len()].copy_from_slice(&info);
-        Shell_NotifyIconW(NIM_MODIFY, &data);
-        MessageBeep(beep_code(kind));
+        Shell_NotifyIconW(NIM_MODIFY, &data) != 0
+    }
+}
+struct NativeNotifications {
+    hwnd: HWND,
+}
+fn notification_kind(kind: crate::notifications::Kind) -> StateKind {
+    match kind {
+        crate::notifications::Kind::Paused => StateKind::Paused,
+        crate::notifications::Kind::Restored => StateKind::Idle,
+        crate::notifications::Kind::Failure => StateKind::Attention,
+    }
+}
+impl crate::notifications::Sink for NativeNotifications {
+    fn toast(&mut self, event: &crate::notifications::Event, sound: bool) -> bool {
+        unsafe { state_toast(self.hwnd, &event.text, notification_kind(event.kind), sound) }
+    }
+    fn sound(&mut self, event: &crate::notifications::Event) -> bool {
+        unsafe { MessageBeep(beep_code(notification_kind(event.kind))) != 0 }
     }
 }
 unsafe fn menu(hwnd: HWND, ui: &UI) {
     unsafe {
-        let menu = CreatePopupMenu();
         let state = ui.shared.lock().unwrap();
-        let items = [
-            (0, state.message.clone(), MF_GRAYED),
-            (9, "Open GamePause".into(), 0),
-            (
-                1,
-                "Pause AI manually".into(),
-                if !state.active_mode {
-                    MF_GRAYED
-                } else if state.manual_pause {
-                    MF_CHECKED
-                } else {
-                    0
-                },
-            ),
-            (
-                2,
-                "Restore AI now".into(),
-                if state.active_mode && state.pending {
-                    0
-                } else {
-                    MF_GRAYED
-                },
-            ),
-            (
-                3,
-                "Automatically pause AI while gaming".into(),
-                if state.config.automation_enabled {
-                    MF_CHECKED
-                } else {
-                    0
-                },
-            ),
-            (4, "Refresh installed games".into(), 0),
-            (10, "Test round-trip (verify AI)".into(), 0),
-            (5, "Settings and games".into(), 0),
-            (6, "Open logs and status folder".into(), 0),
-            (
-                7,
-                "Start with Windows".into(),
-                if startup_enabled() { MF_CHECKED } else { 0 },
-            ),
-            (8, "Quit (keeps recovery state)".into(), 0),
-        ];
+        let summary = crate::presentation::summarize(&state);
+        let mut items = vec![(
+            0,
+            format!("GamePause v{}", env!("CARGO_PKG_VERSION")),
+            MF_GRAYED,
+        )];
+        items.extend(
+            summary
+                .tray_lines()
+                .into_iter()
+                .map(|line| (0, line, MF_GRAYED)),
+        );
+        items.extend([(
+            0,
+            state
+                .commands
+                .latest
+                .as_ref()
+                .map(|result| result.message.clone())
+                .or_else(|| {
+                    state
+                        .restore_feedback
+                        .as_ref()
+                        .map(|feedback| feedback.text())
+                })
+                .unwrap_or_default(),
+            MF_GRAYED,
+        )]);
+        items.extend(command_items(&state, startup_enabled()));
+        let dark = crate::theme::effective_dark(state.config.appearance);
+        let activity = state.activity;
         drop(state);
-        for (id, label, flags) in items {
-            let text = wide(&label);
-            AppendMenuW(menu, MF_STRING | flags, id, text.as_ptr());
-        }
+        let Some(menu) = crate::native_menu::create(hwnd, items, dark, activity) else {
+            return;
+        };
         let mut point: POINT = std::mem::zeroed();
         GetCursorPos(&mut point);
         SetForegroundWindow(hwnd);
         let id = TrackPopupMenu(
-            menu,
+            menu.handle,
             TPM_RETURNCMD | TPM_RIGHTBUTTON,
             point.x,
             point.y,
@@ -495,48 +619,80 @@ unsafe fn menu(hwnd: HWND, ui: &UI) {
             hwnd,
             null(),
         );
-        DestroyMenu(menu);
-        // P1-7: gate "Restore AI now" on discovery readiness (mirror the
+        drop(menu);
+        // P1-7: gate "Resume AI" on discovery readiness (mirror the
         // dashboard) and surface feedback instead of the worker no-opping
         // silently. The worker keeps its own gate as the safety net.
-        let action = match id {
-            1 => Some(Action::Pause),
-            2 => {
-                let (enabled, reason) = {
-                    let s = ui.shared.lock().unwrap();
-                    crate::dashboard::restore_gate(s.discovery_ready, s.active_mode, s.pending)
-                };
-                if enabled {
-                    Some(Action::Restore)
-                } else {
-                    error(reason);
-                    None
-                }
+        let Some(command) = Command::from_id(id) else {
+            return;
+        };
+        if !crate::ui_commands::allowed(&ui.shared, command) {
+            return;
+        }
+        let action = match command {
+            Command::Pause => {
+                crate::app::request_core(&ui.shared, &ui.tx, CoreCommand::Pause);
+                None
             }
-            3 => Some(Action::Disable),
-            4 => Some(Action::Refresh),
-            10 => {
+            Command::Resume => {
+                crate::restore_dialog::request(hwnd, &ui.shared, &ui.tx);
+                None
+            }
+            Command::Automation => {
+                crate::app::request_action(
+                    &ui.shared,
+                    &ui.tx,
+                    Action::Disable,
+                    "Change automatic pausing",
+                );
+                None
+            }
+            Command::Refresh => {
+                crate::app::request_action(
+                    &ui.shared,
+                    &ui.tx,
+                    Action::Refresh,
+                    "Discovery refresh",
+                );
+                None
+            }
+            Command::Doctor => {
+                crate::app::request_action(
+                    &ui.shared,
+                    &ui.tx,
+                    Action::Doctor,
+                    "Read-only diagnostics",
+                );
+                None
+            }
+            Command::Verify => {
                 if confirm_verify(hwnd) {
                     crate::app::request_verify(&ui.shared, &ui.tx);
+                } else {
+                    crate::app::local_result(
+                        &ui.shared,
+                        crate::commands::Outcome::Cancelled,
+                        "Test round-trip cancelled; AI unchanged.",
+                    );
                 }
                 None
             }
-            8 => Some(Action::Quit),
-            5 | 9 => {
+            Command::Quit => {
+                crate::app::request_quit(&ui.shared, &ui.tx);
+                None
+            }
+            Command::OpenDashboard => {
                 dashboard::show(ui.shared.clone(), ui.tx.clone(), ui.folder.clone());
                 None
             }
-            6 => {
-                open_path(&ui.folder);
+            Command::OpenFolder => {
+                request_folder(&ui.shared, &ui.folder);
                 None
             }
-            7 => {
-                if let Err(e) = set_startup(!startup_enabled(), &ui.folder) {
-                    error(&format!("Startup setup failed: {e:#}"));
-                }
+            Command::Startup => {
+                request_startup(&ui.shared, !startup_enabled(), &ui.folder);
                 None
             }
-            _ => None,
         };
         if let Some(action) = action {
             let _ = ui.tx.send(action);
@@ -558,6 +714,25 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, w: WPARAM, l: LP
 }
 unsafe fn window_proc_inner(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     match message {
+        WM_MEASUREITEM if unsafe { crate::native_menu::measure(l) } => 1,
+        WM_DRAWITEM if unsafe { crate::native_menu::draw(l) } => 1,
+        WM_POWERBROADCAST => {
+            if let Some(ui) = ui_snapshot() {
+                let signal = ui.shared.lock().ok().map(|shared| shared.power.clone());
+                if signal.is_some_and(|signal| signal.notify(w)) {
+                    if let Ok(mut shared) = ui.shared.lock() {
+                        shared.detection_ok = false;
+                        shared.restore_offer = None;
+                        shared.coexistence = false;
+                        shared.provider_statuses.clear();
+                        shared.activity = crate::control::Activity::DetectionUnavailable;
+                        shared.message = "Power state changed; fresh game detection is required before AI control.".into();
+                    }
+                    let _ = ui.tx.send(Action::PowerChanged);
+                }
+            }
+            1
+        }
         WM_SETTINGCHANGE | WM_THEMECHANGED => {
             unsafe {
                 apply_theme(hwnd);
@@ -586,7 +761,6 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> L
                     .map(|s| s.message.clone())
                     .unwrap_or_default();
                 let pending = ui.shared.lock().map(|s| s.pending).unwrap_or(true);
-                let manual_pause = ui.shared.lock().map(|s| s.manual_pause).unwrap_or(false);
                 // Keep the tray tooltip's "current attention" line in sync with
                 // the state. This display bookkeeping is asserted by
                 // `timer_can_reenter_while_menu_context_is_alive`: set the line
@@ -604,39 +778,36 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> L
                         current.last_error.clear();
                     }
                 });
-                let (pause, restore) = ui
-                    .shared
-                    .lock()
-                    .map(|s| (s.pause_completions, s.restore_completions))
-                    .unwrap_or((0, 0));
-                let kind = display_kind(&text, manual_pause, pending);
-                let event = UI_STATE.with(|state| {
-                    let mut state = state.borrow_mut();
-                    let current = state.as_mut()?;
-                    let event = completion_notification(
-                        current.last_pause,
-                        current.last_restore,
-                        pause,
-                        restore,
-                        current.last_kind,
-                        kind,
-                    );
-                    current.last_kind = kind;
-                    current.last_pause = pause;
-                    current.last_restore = restore;
-                    event
-                });
-                // Shell calls can reenter the callback: release all state borrows first.
-                if let Some(event) = event {
-                    unsafe {
-                        state_toast(
-                            hwnd,
-                            match event {
-                                StateKind::Idle => "AI restored — configuration verified",
-                                StateKind::Paused => "AI paused — recovery snapshot saved",
-                                StateKind::Attention => &text,
+                let snapshot = ui.shared.lock().map(|s| s.clone()).ok();
+                if let Some(snapshot) = snapshot {
+                    let failure = activity_kind(snapshot.activity) == StateKind::Attention
+                        || snapshot.message.starts_with("Needs attention:");
+                    let delivery = UI_STATE.with(|state| {
+                        let mut state = state.borrow_mut();
+                        let current = state.as_mut()?;
+                        current.notifications.poll(
+                            current.clock.elapsed(),
+                            crate::notifications::Input {
+                                pause: snapshot.pause_completions,
+                                restore: snapshot.restore_completions,
+                                activity: snapshot.activity,
+                                pending: snapshot.pending,
+                                failure: failure.then_some(snapshot.message.as_str()),
                             },
-                            event,
+                            snapshot.config.notifications_enabled,
+                            snapshot.config.sound_enabled,
+                        )
+                    });
+                    // Release every state borrow before shell calls that can reenter.
+                    if let Some(delivery) = delivery
+                        && !crate::notifications::deliver(
+                            &delivery,
+                            &mut NativeNotifications { hwnd },
+                        )
+                    {
+                        crate::app::log(
+                            &ui.folder,
+                            "Windows notification delivery failed; persistent dashboard/tray state is retained.",
                         );
                     }
                 }
@@ -726,9 +897,9 @@ pub fn run(shared: SharedState, tx: Sender<Action>, folder: PathBuf, show: bool)
             },
             taskbar_message: RegisterWindowMessageW(taskbar.as_ptr()),
             last_error: String::new(),
-            last_kind: StateKind::Idle,
-            last_pause: 0,
-            last_restore: 0,
+            notifications: crate::notifications::Queue::default(),
+            clock: std::time::Instant::now(),
+
             menu_open: false,
         };
         UI_STATE.with(|state| *state.borrow_mut() = Some(ui));
@@ -792,31 +963,102 @@ fn bail_message() -> Result<()> {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn manual_hold_has_one_resume_action_and_no_restore_or_duplicate_resume() {
+        let state = crate::app::Shared {
+            active_mode: true,
+            discovery_ready: true,
+            detection_ok: true,
+            manual_pause: true,
+            pending: true,
+            activity: Activity::ManualHold,
+            ..Default::default()
+        };
+        let items = command_items(&state, false);
+        assert_eq!(items.iter().filter(|item| item.1 == "Resume AI").count(), 1);
+        assert!(!items.iter().any(|item| item.1.contains("Restore")));
+        assert_eq!(
+            items
+                .iter()
+                .find(|item| item.0 == Command::Pause as usize)
+                .unwrap()
+                .2,
+            MF_GRAYED
+        );
+        assert_eq!(
+            items
+                .iter()
+                .find(|item| item.0 == Command::Resume as usize)
+                .unwrap()
+                .2,
+            0
+        );
+    }
+
+    #[test]
+    fn advanced_menu_matches_dashboard_commands_and_retains_core_order() {
+        let mut state = crate::app::Shared::default();
+        for advanced in [false, true] {
+            state.config.advanced_settings_visible = advanced;
+            let items = super::command_items(&state, false);
+            let ids = items
+                .iter()
+                .filter_map(|item| crate::ui_commands::Command::from_id(item.0 as i32))
+                .collect::<Vec<_>>();
+            let mut tray = ids
+                .iter()
+                .filter(|command| **command != crate::ui_commands::Command::OpenDashboard)
+                .map(|command| *command as i32)
+                .collect::<Vec<_>>();
+            let mut dashboard = crate::dashboard::shared_command_ids(advanced);
+            tray.sort();
+            dashboard.sort();
+            assert_eq!(tray, dashboard);
+            assert_eq!(
+                &ids[..6],
+                &[
+                    crate::ui_commands::Command::OpenDashboard,
+                    crate::ui_commands::Command::Automation,
+                    crate::ui_commands::Command::Pause,
+                    crate::ui_commands::Command::Resume,
+                    crate::ui_commands::Command::Refresh,
+                    if advanced {
+                        crate::ui_commands::Command::Doctor
+                    } else {
+                        crate::ui_commands::Command::Quit
+                    }
+                ]
+            );
+            assert_eq!(items.last().unwrap().1, "Quit");
+            if advanced {
+                assert!(
+                    items
+                        .iter()
+                        .position(|item| item.1.contains("Endpoint:"))
+                        .unwrap()
+                        < items
+                            .iter()
+                            .position(|item| item.0 == crate::ui_commands::Command::Verify as usize)
+                            .unwrap()
+                );
+            }
+            assert!(!items.iter().any(|item| item.1 == "Settings and games"));
+        }
+    }
     use super::*;
     #[test]
-    fn state_kind_maps_engine_messages_to_states() {
-        // Pause-success moment.
-        assert_eq!(state_kind("AI paused for gaming", false), StateKind::Paused);
-        assert_eq!(state_kind("AI paused for gaming", true), StateKind::Paused);
-        // Restore-success moment: a successful restore lands idle.
-        assert_eq!(state_kind("AI restored", false), StateKind::Idle);
-        assert_eq!(state_kind("AI available", false), StateKind::Idle);
-        // Restore-failure and pause-failure both need attention.
+    fn tray_uses_confirmed_activity_not_pending_recovery() {
+        assert_eq!(activity_kind(Activity::Paused), StateKind::Paused);
+        assert_eq!(activity_kind(Activity::ManualHold), StateKind::Paused);
+        assert_eq!(activity_kind(Activity::Countdown), StateKind::Paused);
+        assert_eq!(activity_kind(Activity::Recovery), StateKind::Attention);
         assert_eq!(
-            state_kind("Restore failed — AI not restored: embed", false),
+            activity_kind(Activity::PartialFailure),
             StateKind::Attention
         );
-        assert_eq!(
-            state_kind("Needs attention: embed", false),
-            StateKind::Attention
-        );
-        // A failure beats a concurrent pause flag: attention wins.
-        assert_eq!(
-            state_kind("Needs attention: embed", true),
-            StateKind::Attention
-        );
-        // Manual pause with no failure message.
-        assert_eq!(state_kind("AI available", true), StateKind::Paused);
+        assert_eq!(activity_kind(Activity::Unloading), StateKind::Idle);
+        assert_eq!(activity_kind(Activity::Capturing), StateKind::Idle);
+        assert_eq!(activity_kind(Activity::Watching), StateKind::Idle);
     }
     #[test]
     fn toast_spec_returns_right_title_and_severity_per_state() {
@@ -861,18 +1103,24 @@ mod tests {
         assert_ne!(idle, paused, "idle and paused icons must differ");
         assert_ne!(idle, attention, "idle and attention icons must differ");
         assert_ne!(paused, attention, "paused and attention icons must differ");
-        // Each tint is a 3-byte RGB; the attention color is a warning red
+        // Each tint supplies three DIB color bytes; the attention color is a warning red
         // (high R, low G/B) so it pops against the dark tray.
         assert!(attention[0] > 180 && attention[1] < 120 && attention[2] < 120);
-        // Paused reads as a calm blue (B dominant).
+        // DIB pixels are BGR: paused uses orange with a dominant red byte.
         assert!(paused[2] > paused[0] && paused[2] > paused[1]);
     }
     #[test]
     fn timer_can_reenter_while_menu_context_is_alive() {
         use crate::app::Shared;
         use std::sync::{Arc, Mutex, mpsc};
-        let (tx, _) = mpsc::channel();
+        let (tx, rx) = mpsc::channel();
         let shared = Arc::new(Mutex::new(Shared {
+            commands: Default::default(),
+            activity: Activity::PartialFailure,
+            restore_offer: None,
+            coexistence: false,
+            restore_feedback: None,
+            detection_ok: false,
             message: "Needs attention: simulated failure".into(),
             disabled: false,
             manual_pause: false,
@@ -890,7 +1138,16 @@ mod tests {
             verifying: false,
             pause_completions: 0,
             restore_completions: 0,
+            provider_statuses: vec![],
+            doctor_report: None,
+            doctor_pending: false,
+            power: Default::default(),
         }));
+        {
+            let mut state = shared.lock().unwrap();
+            state.config.notifications_enabled = false;
+            state.config.sound_enabled = false;
+        }
         UI_STATE.with(|state| {
             *state.borrow_mut() = Some(UI {
                 shared: shared.clone(),
@@ -903,9 +1160,9 @@ mod tests {
                 },
                 taskbar_message: WM_APP + 9,
                 last_error: String::new(),
-                last_kind: StateKind::Idle,
-                last_pause: 0,
-                last_restore: 0,
+                notifications: crate::notifications::Queue::default(),
+                clock: std::time::Instant::now(),
+
                 menu_open: false,
             })
         });
@@ -930,6 +1187,32 @@ mod tests {
         assert!(ui_snapshot().unwrap().last_error.is_empty());
         drop(session);
         assert!(begin_menu().is_some(), "menu opens again after dismissal");
+        shared.lock().unwrap().detection_ok = true;
+        assert_eq!(
+            unsafe { window_proc_inner(null_mut(), WM_POWERBROADCAST, 4, 0) },
+            1
+        );
+        assert!(shared.lock().unwrap().power.snapshot().suspended);
+        assert!(!shared.lock().unwrap().detection_ok);
+        assert!(matches!(rx.try_recv(), Ok(Action::PowerChanged)));
+        assert_eq!(
+            unsafe { window_proc_inner(null_mut(), WM_POWERBROADCAST, 18, 0) },
+            1
+        );
+        assert!(!shared.lock().unwrap().power.snapshot().suspended);
+        let generation = shared.lock().unwrap().power.snapshot().generation;
+        assert!(matches!(rx.try_recv(), Ok(Action::PowerChanged)));
+        unsafe {
+            window_proc_inner(null_mut(), WM_POWERBROADCAST, 7, 0);
+        }
+        assert_eq!(
+            shared.lock().unwrap().power.snapshot().generation,
+            generation
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "user-interaction resume must not reset grace a second time"
+        );
         UI_STATE.with(|state| state.borrow_mut().take());
     }
     #[test]
@@ -942,6 +1225,12 @@ mod tests {
         MENU_TIMER_TICKS.store(0, Ordering::Relaxed);
         MENU_OPENINGS.store(0, Ordering::Relaxed);
         let shared = Arc::new(Mutex::new(Shared {
+            commands: Default::default(),
+            activity: Activity::Observation,
+            restore_offer: None,
+            coexistence: false,
+            restore_feedback: None,
+            detection_ok: false,
             message: "Tray regression test (observation only)".into(),
             disabled: false,
             manual_pause: false,
@@ -959,21 +1248,54 @@ mod tests {
             verifying: false,
             pause_completions: 0,
             restore_completions: 0,
+            provider_statuses: vec![],
+            doctor_report: None,
+            doctor_pending: false,
+            power: Default::default(),
         }));
         let (tx, _rx) = mpsc::channel();
-        let driver = std::thread::spawn(|| {
+        {
+            let mut state = shared.lock().unwrap();
+            state.config.notifications_enabled = false;
+            state.config.sound_enabled = false;
+        }
+        let driver_state = shared.clone();
+        let driver = std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(10);
             while WINDOW.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(20));
             }
             let hwnd = WINDOW.load(Ordering::Relaxed) as HWND;
             assert!(!hwnd.is_null(), "test window did not initialize");
+            unsafe {
+                SendMessageW(hwnd, WM_POWERBROADCAST, 4, 0);
+            }
+            assert!(driver_state.lock().unwrap().power.snapshot().suspended);
+            unsafe {
+                SendMessageW(hwnd, WM_POWERBROADCAST, 18, 0);
+            }
+            let resumed = driver_state.lock().unwrap().power.snapshot();
+            assert!(!resumed.suspended);
+            unsafe {
+                SendMessageW(hwnd, WM_POWERBROADCAST, 7, 0);
+            }
+            assert_eq!(driver_state.lock().unwrap().power.snapshot(), resumed);
             let mut counts = Vec::new();
-            for _ in 0..3 {
+            for iteration in 0..3 {
                 let before = MENU_TIMER_TICKS.load(Ordering::Relaxed);
                 unsafe {
                     PostMessageW(hwnd, CALLBACK, 0, WM_RBUTTONUP as LPARAM);
                 }
+                driver_state
+                    .lock()
+                    .unwrap()
+                    .config
+                    .advanced_settings_visible = iteration % 2 == 0;
+                driver_state.lock().unwrap().config.appearance = if iteration % 2 == 0 {
+                    crate::config::Appearance::Dark
+                } else {
+                    crate::config::Appearance::Light
+                };
                 let deadline = Instant::now() + Duration::from_secs(10);
                 while MENU_TIMER_TICKS.load(Ordering::Relaxed) < before + 2
                     && Instant::now() < deadline
@@ -1048,24 +1370,16 @@ mod tests {
     #[test]
     fn notifications_follow_completions_not_countdowns_or_retry_states() {
         assert_eq!(
-            display_kind("Restoring AI in 30s", false, true),
-            StateKind::Paused
+            notification_flags(StateKind::Paused, false) & NIIF_NOSOUND,
+            NIIF_NOSOUND
         );
-        assert_eq!(
-            completion_notification(0, 0, 1, 0, StateKind::Idle, StateKind::Paused),
-            Some(StateKind::Paused)
+        assert_eq!(notification_flags(StateKind::Idle, true) & NIIF_NOSOUND, 0);
+        assert_ne!(
+            notification_flags(StateKind::Attention, true) & NIIF_ERROR,
+            0
         );
-        assert_eq!(
-            completion_notification(1, 0, 1, 0, StateKind::Paused, StateKind::Idle),
-            None
-        );
-        assert_eq!(
-            completion_notification(1, 0, 1, 1, StateKind::Paused, StateKind::Idle),
-            Some(StateKind::Idle)
-        );
-        assert_eq!(
-            completion_notification(1, 0, 1, 0, StateKind::Attention, StateKind::Idle),
-            None
-        );
+        for kind in [StateKind::Paused, StateKind::Idle, StateKind::Attention] {
+            assert_ne!(notification_flags(kind, true) & NIIF_RESPECT_QUIET_TIME, 0);
+        }
     }
 }

@@ -12,7 +12,10 @@ use std::{
 };
 use tungstenite::{Message, WebSocket};
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+pub use crate::provider::InferenceBusy;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Model {
     pub identifier: String,
     pub model_key: String,
@@ -23,7 +26,8 @@ pub struct Model {
     pub native_config: Value,
     pub stage: String,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Snapshot {
     pub schema: u32,
     pub server: Value,
@@ -49,6 +53,173 @@ pub trait Backend {
     /// captured snapshot. Backends that cannot read config back report a
     /// "read-back unavailable" error for that model instead of panicking.
     fn read_config(&mut self, model: &Model) -> Result<Value>;
+    fn server_state(&mut self) -> Result<Value> {
+        bail!("LM Studio server verification is unavailable; recovery retained")
+    }
+    /// Read-back only. This must never load a missing model.
+    fn verify_restored(&mut self, _model: &Model) -> Result<()> {
+        bail!("LM Studio model verification is unavailable; recovery retained")
+    }
+    /// Select/claim the captured route without starting the service.
+    fn select_control_port(&mut self, _port: u16) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Bridge existing LM transports and mocks to the neutral operation interface.
+impl<B: Backend + ?Sized> Backend for &mut B {
+    fn snapshot(&mut self) -> Result<Snapshot> {
+        (**self).snapshot()
+    }
+    fn loaded(&mut self) -> Result<Vec<Value>> {
+        (**self).loaded()
+    }
+    fn stop_server(&mut self) -> Result<()> {
+        (**self).stop_server()
+    }
+    fn start_server(&mut self, port: u16) -> Result<()> {
+        (**self).start_server(port)
+    }
+    fn ensure_server(&mut self, port: u16) -> Result<()> {
+        (**self).ensure_server(port)
+    }
+    fn unload(&mut self, id: &str) -> Result<()> {
+        (**self).unload(id)
+    }
+    fn restore(&mut self, model: &Model) -> Result<()> {
+        (**self).restore(model)
+    }
+    fn read_config(&mut self, model: &Model) -> Result<Value> {
+        (**self).read_config(model)
+    }
+    fn server_state(&mut self) -> Result<Value> {
+        (**self).server_state()
+    }
+    fn verify_restored(&mut self, model: &Model) -> Result<()> {
+        (**self).verify_restored(model)
+    }
+    fn select_control_port(&mut self, port: u16) -> Result<()> {
+        (**self).select_control_port(port)
+    }
+}
+/// Bridge existing LM transports and mocks to the neutral operation interface.
+/// Legacy server/diagnostic methods remain LM-owned, never imposed on Ollama.
+impl<T: Backend> crate::provider::Backend for T {
+    type Snapshot = Snapshot;
+    type CapturedModel = Model;
+    fn kind(&self) -> crate::provider::Kind {
+        crate::provider::Kind::LMStudio
+    }
+    fn guarantee(&self) -> crate::provider::Guarantee {
+        crate::provider::Guarantee::CapturedConfiguration
+    }
+    fn capture(&mut self) -> Result<Snapshot> {
+        self.snapshot()
+    }
+    fn resident_keys(&mut self) -> Result<Vec<String>> {
+        resident_keys(&self.loaded()?)
+    }
+    fn unload_captured(&mut self, model: &Model) -> Result<()> {
+        self.unload(&model.identifier)
+    }
+    fn restore_captured(&mut self, model: &Model, verify_raw: bool) -> Result<()> {
+        self.restore(model)?;
+        if verify_raw {
+            compare_fields(&model.load_config, &self.read_config(model)?)?;
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn resident_keys(models: &[Value]) -> Result<Vec<String>> {
+    let mut seen = std::collections::HashSet::new();
+    models
+        .iter()
+        .map(|model| {
+            let key = model["identifier"]
+                .as_str()
+                .filter(|key| !key.trim().is_empty())
+                .context("Loaded LM model has no identifier; residency is unknown")?;
+            if !seen.insert(key) {
+                bail!("Duplicate loaded LM model identifier; residency is unknown");
+            }
+            Ok(key.to_owned())
+        })
+        .collect()
+}
+
+impl Model {
+    pub fn recovery_key(&self) -> &str {
+        &self.identifier
+    }
+}
+
+impl Snapshot {
+    pub fn normalize_legacy(&mut self, config: &Config) {
+        // Supported schema-2 empty snapshots once omitted a stopped-server port.
+        if self.server["running"] == false
+            && self.models.is_empty()
+            && self.server.get("port").is_none()
+        {
+            self.server["port"] = json!(
+                config
+                    .lm_endpoint()
+                    .rsplit_once(':')
+                    .and_then(|(_, port)| port.parse::<u16>().ok())
+                    .unwrap_or(1234)
+            );
+        }
+    }
+    pub fn validate_recovery(&self) -> Result<()> {
+        if !self.server["running"].is_boolean()
+            || self.server["port"]
+                .as_u64()
+                .is_none_or(|port| port == 0 || port > 65535)
+        {
+            bail!("Invalid recovery server settings; recovery retained");
+        }
+        if self.schema != 2 {
+            bail!("Unsupported recovery format; preserve state.json and inspect manually");
+        }
+        if self
+            .games
+            .iter()
+            .any(|g| g.name.is_empty() || !Path::new(&g.path).is_absolute())
+        {
+            bail!("Invalid recovery game location; recovery retained");
+        }
+        let mut identifiers = std::collections::BTreeSet::new();
+        for model in &self.models {
+            if model.identifier.is_empty()
+                || model.model_key.is_empty()
+                || model.base_key.is_empty()
+                || !identifiers.insert(&model.identifier)
+                || !["llm", "embedding"].contains(&model.namespace.as_str())
+                || !["planned", "unloading", "unloaded", "restoring", "restored"]
+                    .contains(&model.stage.as_str())
+                || !model.load_config["fields"].is_array()
+                || !model.native_config.is_object()
+            {
+                bail!("Invalid recovery model; preserve state.json and inspect manually");
+            }
+        }
+        Ok(())
+    }
+    pub fn pause_service_required(&self, stop_during_gaming: bool) -> bool {
+        stop_during_gaming && (self.server["running"] == true || self.server_stopped)
+    }
+    /// Mutates intent only. The engine must persist it before a native operation.
+    pub fn prepare_restore_service(&mut self) -> Option<u16> {
+        if self.server_stopped || !self.models.is_empty() {
+            self.server_stopped = true;
+            Some(self.server["port"].as_u64().unwrap_or(1234) as u16)
+        } else {
+            None
+        }
+    }
+    pub fn close_restored_service(&self) -> bool {
+        self.server["running"] != true && self.server_stopped
+    }
 }
 fn capture_with_server<B: Backend, T>(
     backend: &mut B,
@@ -125,14 +296,19 @@ fn control_port(server: &Value, api_host: &str) -> Result<u16> {
 pub struct LMStudio {
     pub config: Config,
     pub lms: PathBuf,
+    configured_endpoint: String,
+    claims: crate::ownership::SharedClaims,
     log_folder: Option<PathBuf>,
     cli_version: std::sync::OnceLock<String>,
 }
 impl LMStudio {
     pub fn new(config: Config) -> Result<Self> {
+        if !config.lm_enabled() {
+            bail!("LM Studio provider is disabled or not configured");
+        }
         let mut candidates = vec![];
-        if !config.lms_path.is_empty() {
-            candidates.push(PathBuf::from(&config.lms_path));
+        if !config.lms_path().is_empty() {
+            candidates.push(PathBuf::from(config.lms_path()));
         } else {
             if let Some(paths) = std::env::var_os("PATH") {
                 candidates.extend(std::env::split_paths(&paths).map(|p| p.join("lms.exe")));
@@ -155,6 +331,8 @@ impl LMStudio {
             .find(|p| p.is_file())
             .context("Waiting for LM Studio: its CLI could not be found. Open LM Studio and install its CLI, or use Locate lms in GamePause")?;
         Ok(Self {
+            configured_endpoint: config.lm_endpoint().into(),
+            claims: Default::default(),
             config,
             lms,
             log_folder: None,
@@ -163,6 +341,32 @@ impl LMStudio {
     }
     pub fn set_log_folder(&mut self, folder: PathBuf) {
         self.log_folder = Some(folder);
+    }
+    pub(crate) fn use_claims(&mut self, claims: crate::ownership::SharedClaims) {
+        self.claims = claims;
+    }
+    fn claim_control(&self, port: Option<u16>) -> Result<()> {
+        if self.config.mode != "active" || !self.config.lm_enabled() {
+            bail!("LM Studio control is disabled; no ownership or mutation was started");
+        }
+        let owner = self
+            .config
+            .providers
+            .iter()
+            .find(|provider| provider.kind() == crate::provider::Kind::LMStudio)
+            .context("LM Studio provider identity is missing")?
+            .id();
+        let actual = port
+            .map(|port| format!("127.0.0.1:{port}"))
+            .unwrap_or_else(|| self.config.lm_endpoint().into());
+        self.claims
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Provider ownership state is unavailable"))?
+            .claim(
+                owner,
+                crate::provider::Kind::LMStudio,
+                &[&self.configured_endpoint, &actual],
+            )
     }
     fn logged<T>(&self, step: &str, operation: impl FnOnce() -> Result<T>) -> Result<T> {
         let result = operation();
@@ -246,7 +450,7 @@ impl LMStudio {
             m["status"].as_str().is_some_and(|s| s != "idle")
                 || m["queued"].as_u64().unwrap_or(0) > 0
         }) {
-            bail!("AI is busy; pause deferred until idle");
+            return Err(InferenceBusy.into());
         }
         let native = self.native()?;
         for info in &loaded {
@@ -308,7 +512,7 @@ impl LMStudio {
         }
     }
     fn native(&self) -> Result<Value> {
-        let url = format!("http://{}/api/v1/models", self.config.api_host);
+        let url = format!("http://{}/api/v1/models", self.config.lm_endpoint());
         let mut request = ureq::get(&url).timeout(Duration::from_secs(10));
         if let Ok(token) = std::env::var("GAMEPAUSE_LM_API_TOKEN") {
             request = request.set("Authorization", &format!("Bearer {token}"));
@@ -322,16 +526,18 @@ impl LMStudio {
     fn socket(&self, namespace: &str) -> Result<WebSocket<TcpStream>> {
         let address = self
             .config
-            .api_host
+            .lm_endpoint()
             .to_socket_addrs()?
             .next()
             .context("No local server address")?;
         let stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))?;
         stream.set_read_timeout(Some(Duration::from_secs(15)))?;
         stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-        let (mut socket, _) =
-            tungstenite::client(format!("ws://{}/{namespace}", self.config.api_host), stream)
-                .map_err(|e| anyhow::anyhow!("LM Studio WebSocket handshake failed: {e}"))?;
+        let (mut socket, _) = tungstenite::client(
+            format!("ws://{}/{namespace}", self.config.lm_endpoint()),
+            stream,
+        )
+        .map_err(|e| anyhow::anyhow!("LM Studio WebSocket handshake failed: {e}"))?;
         let stamp = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)?
             .as_nanos();
@@ -653,17 +859,19 @@ impl Backend for LMStudio {
             .context("Unexpected lms inventory")
     }
     fn snapshot(&mut self) -> Result<Snapshot> {
+        self.claim_control(None)?;
         let loaded = self.loaded()?;
         let mut server = self.cli(&["server", "status", "--json"])?;
         if loaded.iter().any(|m| {
             m["status"].as_str().is_some_and(|s| s != "idle")
                 || m["queued"].as_u64().unwrap_or(0) > 0
         }) {
-            bail!("AI is busy; pause deferred until idle");
+            return Err(InferenceBusy.into());
         }
         let temporary = server["running"] != true;
-        let port = control_port(&server, &self.config.api_host)?;
-        self.config.api_host = format!("127.0.0.1:{port}");
+        let port = control_port(&server, self.config.lm_endpoint())?;
+        self.claim_control(Some(port))?;
+        self.config.lm_mut()?.endpoint = format!("127.0.0.1:{port}");
         server["port"] = json!(port);
         if loaded.is_empty() {
             return self.capture_snapshot(loaded, server);
@@ -673,15 +881,18 @@ impl Backend for LMStudio {
         })
     }
     fn stop_server(&mut self) -> Result<()> {
+        self.claim_control(None)?;
         self.cli(&["server", "stop"])?;
         Ok(())
     }
     fn start_server(&mut self, port: u16) -> Result<()> {
-        self.config.api_host = format!("127.0.0.1:{port}");
+        self.claim_control(Some(port))?;
+        self.config.lm_mut()?.endpoint = format!("127.0.0.1:{port}");
         self.cli(&["server", "start", "--port", &port.to_string()])?;
         Ok(())
     }
     fn ensure_server(&mut self, port: u16) -> Result<()> {
+        self.claim_control(Some(port))?;
         let status = self.cli(&["server", "status", "--json"])?;
         if !status["running"]
             .as_bool()
@@ -695,10 +906,11 @@ impl Backend for LMStudio {
         if actual != u64::from(port) {
             bail!("Server port changed; recovery retained");
         }
-        self.config.api_host = format!("127.0.0.1:{port}");
+        self.config.lm_mut()?.endpoint = format!("127.0.0.1:{port}");
         Ok(())
     }
     fn unload(&mut self, id: &str) -> Result<()> {
+        self.claim_control(None)?;
         self.cli(&["unload", id])?;
         if self.loaded()?.iter().any(|m| m["identifier"] == id) {
             bail!("Model still loaded after unload");
@@ -706,6 +918,7 @@ impl Backend for LMStudio {
         Ok(())
     }
     fn restore(&mut self, model: &Model) -> Result<()> {
+        self.claim_control(None)?;
         if let Some(info) = self
             .loaded()?
             .iter()
@@ -727,6 +940,25 @@ impl Backend for LMStudio {
     }
     fn read_config(&mut self, model: &Model) -> Result<Value> {
         self.raw_config(&model.namespace, &model.identifier)
+    }
+    fn server_state(&mut self) -> Result<Value> {
+        self.cli(&["server", "status", "--json"])
+    }
+    fn select_control_port(&mut self, port: u16) -> Result<()> {
+        self.claim_control(Some(port))?;
+        self.config.lm_mut()?.endpoint = format!("127.0.0.1:{port}");
+        Ok(())
+    }
+    fn verify_restored(&mut self, model: &Model) -> Result<()> {
+        let loaded = self.loaded()?;
+        resident_keys(&loaded)?;
+        let info = loaded
+            .iter()
+            .find(|info| info["identifier"] == model.identifier)
+            .context("Captured model disappeared before final verification; recovery retained")?;
+        self.logged(&format!("final-verify:{}", model.identifier), || {
+            self.verify(model, info)
+        })
     }
 }
 pub fn run_command(program: &str, args: &[&str], timeout: Duration) -> Result<Vec<u8>> {
@@ -814,11 +1046,145 @@ pub fn run_command(program: &str, args: &[&str], timeout: Duration) -> Result<Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn neutral_inventory_refuses_unknown_residency() {
+        assert!(resident_keys(&[]).unwrap().is_empty());
+        assert_eq!(
+            resident_keys(&[json!({"identifier":"chat"}), json!({"identifier":"embed"})]).unwrap(),
+            vec!["chat", "embed"]
+        );
+        for invalid in [
+            json!({}),
+            json!({"identifier":3}),
+            json!({"identifier":" "}),
+        ] {
+            assert!(resident_keys(&[json!({"identifier":"chat"}), invalid]).is_err());
+        }
+        assert!(
+            resident_keys(&[json!({"identifier":"chat"}), json!({"identifier":"chat"})]).is_err()
+        );
+    }
     #[derive(Default)]
     struct ServerOnly {
         events: Vec<&'static str>,
         fail_start: bool,
         fail_stop: bool,
+    }
+    #[test]
+    fn control_ownership_precedes_every_lm_mutation_and_survives_transport_replacement() {
+        let claims =
+            std::sync::Arc::new(std::sync::Mutex::new(crate::ownership::Claims::isolated()));
+        claims
+            .lock()
+            .unwrap()
+            .claim(
+                "other",
+                crate::provider::Kind::LMStudio,
+                &["localhost:4321"],
+            )
+            .unwrap();
+        let mut backend = LMStudio {
+            configured_endpoint: "127.0.0.1:1234".into(),
+            claims: claims.clone(),
+            config: Config::default(),
+            lms: PathBuf::new(),
+            log_folder: None,
+            cli_version: std::sync::OnceLock::new(),
+        };
+        let model = Model {
+            identifier: "fixture".into(),
+            model_key: "fixture/chat".into(),
+            base_key: "fixture/chat".into(),
+            namespace: "llm".into(),
+            ttl_ms: None,
+            load_config: json!({"fields":[]}),
+            native_config: json!({}),
+            stage: "unloaded".into(),
+        };
+        for result in [
+            backend.snapshot().map(|_| ()),
+            backend.start_server(1234),
+            backend.ensure_server(1234),
+            backend.stop_server(),
+            backend.unload("fixture"),
+            backend.restore(&model),
+        ] {
+            assert!(format!("{:#}", result.unwrap_err()).contains("already owned"));
+        }
+        // Only read-only calls could reach this invalid CLI; all mutations fail at ownership.
+        assert!(backend.loaded().is_err());
+        drop(backend);
+        assert!(
+            claims
+                .lock()
+                .unwrap()
+                .claim(
+                    "replacement",
+                    crate::provider::Kind::LMStudio,
+                    &["localhost:5555"]
+                )
+                .is_err()
+        );
+        claims
+            .lock()
+            .unwrap()
+            .claim(
+                "other",
+                crate::provider::Kind::LMStudio,
+                &["localhost:4321"],
+            )
+            .unwrap();
+    }
+    #[test]
+    fn observation_refuses_control_without_claiming_the_provider() {
+        let claims =
+            std::sync::Arc::new(std::sync::Mutex::new(crate::ownership::Claims::isolated()));
+        let backend = LMStudio {
+            configured_endpoint: "127.0.0.1:1234".into(),
+            claims: claims.clone(),
+            config: Config {
+                mode: "observe".into(),
+                ..Default::default()
+            },
+            lms: PathBuf::new(),
+            log_folder: None,
+            cli_version: std::sync::OnceLock::new(),
+        };
+        assert!(backend.claim_control(None).is_err());
+        claims
+            .lock()
+            .unwrap()
+            .claim(
+                "other",
+                crate::provider::Kind::LMStudio,
+                &["localhost:1234"],
+            )
+            .unwrap();
+    }
+    #[test]
+    fn captured_route_selection_retains_both_claims_without_starting_a_server() {
+        let claims =
+            std::sync::Arc::new(std::sync::Mutex::new(crate::ownership::Claims::isolated()));
+        let mut backend = LMStudio {
+            configured_endpoint: "127.0.0.1:1234".into(),
+            claims: claims.clone(),
+            config: Config::default(),
+            lms: PathBuf::new(),
+            log_folder: None,
+            cli_version: std::sync::OnceLock::new(),
+        };
+        backend.select_control_port(4321).unwrap();
+        assert_eq!(backend.config.lm_endpoint(), "127.0.0.1:4321");
+        backend.claim_control(None).unwrap();
+        for endpoint in ["localhost:1234", "localhost:4321"] {
+            assert!(
+                claims
+                    .lock()
+                    .unwrap()
+                    .claim("other", crate::provider::Kind::Ollama, &[endpoint])
+                    .is_err()
+            );
+        }
     }
     impl Backend for ServerOnly {
         fn snapshot(&mut self) -> Result<Snapshot> {
@@ -1096,6 +1462,8 @@ mod tests {
     #[test]
     fn protocol_operation_logging_records_failure_without_leaking_payload() {
         let mut backend = LMStudio {
+            configured_endpoint: Config::default().lm_endpoint().into(),
+            claims: Default::default(),
             config: Config::default(),
             lms: PathBuf::new(),
             log_folder: None,
@@ -1184,11 +1552,12 @@ mod tests {
                 std::process::id()
             ));
             std::fs::create_dir_all(&folder).unwrap();
+            let mut config = Config::default();
+            config.lm_mut().unwrap().endpoint = address.to_string();
             let backend = LMStudio {
-                config: Config {
-                    api_host: address.to_string(),
-                    ..Default::default()
-                },
+                configured_endpoint: config.lm_endpoint().into(),
+                claims: Default::default(),
+                config,
                 lms: PathBuf::new(),
                 log_folder: Some(folder.clone()),
                 cli_version: std::sync::OnceLock::new(),

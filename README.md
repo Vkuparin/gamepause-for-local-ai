@@ -1,4 +1,4 @@
-# GamePause for LM Studio
+# GamePause
 
 [![CI](https://github.com/Vkuparin/gamepause-lmstudio/actions/workflows/ci.yml/badge.svg)](https://github.com/Vkuparin/gamepause-lmstudio/actions/workflows/ci.yml)
 [![MIT](https://img.shields.io/badge/license-MIT-155e75.svg)](LICENSE)
@@ -6,7 +6,9 @@
 
 **Give your games room. Bring your local AI back afterward.**
 
-GamePause is a small native Rust app for Windows. It notices when a game starts, saves the models currently loaded in LM Studio, unloads them, and restores them afterward. The model name can change: there is no fixed model list to maintain.
+GamePause is a small native Rust app for Windows. It notices when a game starts, saves the models currently loaded in LM Studio, unloads them, and restores them afterward. Experimental Ollama control is available by explicit opt-in and is off by default. The model name can change: there is no fixed model list to maintain.
+
+GamePause **1.0.0** passed owner-reported human tests and was approved for publication on 2026-10-05. Download the installer or portable ZIP from [Releases](https://github.com/Vkuparin/gamepause-lmstudio/releases/tag/v1.0.0). See [Acceptance](docs/ACCEPTANCE.md) for the approved build and evidence limits.
 
 ## Features
 
@@ -16,6 +18,9 @@ GamePause is a small native Rust app for Windows. It notices when a game starts,
 - Stops LM Studio's HTTP server during gaming by default to prevent HTTP clients from immediately loading models again.
 - Waits 30 seconds after the last game exits. Starting another game cancels the delay; alt-tabbing keeps AI paused.
 - Keeps a durable recovery journal through partial failures and restarts.
+- Shows detected games, separate enabled-provider outcomes and command results. Confirmed gameplay Restore applies only to the approved live game instances.
+- Offers saved Advanced visibility, read-only provider diagnostics, separate sound/notification preferences, and native dark/light/high-contrast behavior.
+- Coordinates independent provider recovery while periodic game detection continues during blocked model operations.
 - Tests the full pause/restore round-trip on demand, with durable recovery on failure: capture, unload, confirm the server emptied, restore, and field-compare the read-back settings — from the dashboard, tray, or `GamePauseCLI.exe --verify`.
 - Escaped one-line-per-item CLI output for scripting: `--status` (key=value state), `--games` (name/launcher/path), plus read-only `--doctor` and disruptive `--verify`. Status, cached games, and doctor work alongside the GUI; verify requires it to be closed.
 - Includes a native dashboard, searchable games, live settings, tray controls, automatic startup at Windows sign-in, a per-user installer, and a portable ZIP.
@@ -55,7 +60,9 @@ GamePause keeps a durable recovery journal for every model it unloads, and that 
 
 On one Windows 11 / RTX 5090 PC with 16 logical CPUs, the installed v0.2.0 watcher used **14.1 MiB RAM** and **0.055% of total CPU capacity** during a 46-second Witcher 3 menu sample, including an inventory refresh. The dashboard was closed. This measures the watcher, not FPS or all machines. See [Validation](docs/VALIDATION.md).
 
-This is a **0.3.5 stabilisation preview**. Discovery is best effort. Protected processes and unconventional installations can require registering a game through the dashboard. Only the Steam / Witcher 3 lifecycle has been tested live. Other adapters have been checked against local installed metadata, not complete gameplay sessions.
+GamePause **1.0.0** is the stable release. Discovery is best effort. Protected processes and unconventional installations can require registering a game through the dashboard. Earlier Steam / Witcher 3 measurements remain historical; the owner reported human tests passed for the final 1.0.0 build. Other launcher adapters have metadata/fixture evidence, not complete gameplay sessions.
+
+Ollama has source and private protocol-fixture evidence, with no live-tested version range. Its supported subset is local GGUF completion models with verified identity/digest/context and finite observed expiry. It does not preserve all load options, parallelism, conversations or KV cache, start the service, download models or prevent later client reloads. [Limits and opt-in](docs/USAGE.md#background-ai-applications) and sanitized contributor live evidence remain explicit.
 
 Complete settings preservation currently requires LM Studio's internal WebSocket protocol alongside its CLI and native REST API. Protocol changes can require a GamePause update. Run `GamePauseCLI.exe --doctor` after upgrading LM Studio. If a recoverable snapshot cannot be captured, GamePause refuses to unload. It does not launch LM Studio or supervise clients that independently restart its server.
 

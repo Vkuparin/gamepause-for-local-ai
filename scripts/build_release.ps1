@@ -5,10 +5,22 @@ Push-Location $taskRoot
 try {
     cargo build --locked --release
     if ($LASTEXITCODE -ne 0) { throw 'Rust release build failed' }
-    $taskMetadata = cargo metadata --locked --format-version 1 | ConvertFrom-Json
+    $taskMetadata = cargo metadata --locked --format-version 1 --filter-platform x86_64-pc-windows-msvc | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0) { throw 'Dependency metadata failed' }
     $taskVersion = ($taskMetadata.packages | Where-Object name -eq 'gamepause-lmstudio').version
     $taskBundle = Join-Path $taskRoot 'dist\GamePause'
+    # Rebuild staging from scratch so removed docs/licenses cannot leak into a
+    # later candidate. Refuse redirected directories before recursive removal.
+    $taskDist = Join-Path $taskRoot 'dist'
+    if (Test-Path -LiteralPath $taskDist) {
+        if ((Get-Item -LiteralPath $taskDist -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Refusing redirected dist directory' }
+    }
+    if (Test-Path -LiteralPath $taskBundle) {
+        $taskResolvedBundle = (Resolve-Path -LiteralPath $taskBundle).Path
+        if ($taskResolvedBundle -ne (Join-Path $taskRoot 'dist\GamePause')) { throw 'Unexpected staging path' }
+        if ((Get-Item -LiteralPath $taskBundle -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Refusing redirected staging directory' }
+        Remove-Item -LiteralPath $taskResolvedBundle -Recurse -Force
+    }
     New-Item -ItemType Directory -Path $taskBundle -Force | Out-Null
     Copy-Item -LiteralPath 'target\release\GamePause.exe','target\release\GamePauseCLI.exe' -Destination $taskBundle -Force
     foreach ($taskFile in @('README.md','LICENSE','CHANGELOG.md','config.example.json')) { Copy-Item -LiteralPath $taskFile -Destination $taskBundle -Force }
@@ -38,5 +50,29 @@ try {
     $taskInstaller = Join-Path $taskRoot "dist\GamePause-$taskVersion-Setup.exe"
     $taskChecksums = foreach ($taskArtifact in @($taskArchive,$taskInstaller)) { $taskHash = (Get-FileHash -LiteralPath $taskArtifact -Algorithm SHA256).Hash.ToLowerInvariant(); "$taskHash  $(Split-Path -Leaf $taskArtifact)" }
     $taskChecksums | Set-Content -LiteralPath 'dist\SHA256SUMS.txt' -Encoding ascii
+    $taskSourceFiles = @('Cargo.toml','Cargo.lock','build.rs','rust-toolchain.toml') | ForEach-Object { Get-Item -LiteralPath $_ }
+    $taskSourceFiles += Get-ChildItem -LiteralPath 'src','assets','.cargo' -File -Recurse
+    $taskSourceHashes = foreach ($taskSourceFile in ($taskSourceFiles | Sort-Object FullName)) {
+        $taskRelativePath = $taskSourceFile.FullName.Substring($taskRoot.Length + 1).Replace('\','/')
+        $taskHash = (Get-FileHash -LiteralPath $taskSourceFile.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        "$taskHash  $taskRelativePath"
+    }
+    $taskHasher = [Security.Cryptography.SHA256]::Create()
+    try { $taskFingerprint = -join ($taskHasher.ComputeHash([Text.Encoding]::UTF8.GetBytes(($taskSourceHashes -join "`n"))) | ForEach-Object { $_.ToString('x2') }) }
+    finally { $taskHasher.Dispose() }
+    $taskArtifacts = foreach ($taskArtifact in @($taskArchive,$taskInstaller)) {
+        [ordered]@{name=(Split-Path -Leaf $taskArtifact); bytes=(Get-Item -LiteralPath $taskArtifact).Length; sha256=(Get-FileHash -LiteralPath $taskArtifact -Algorithm SHA256).Hash.ToLowerInvariant()}
+    }
+    [ordered]@{
+        version=$taskVersion
+        built_at_utc=[DateTime]::UtcNow.ToString('o')
+        rustc=(& rustc --version)
+        source_fingerprint_sha256=$taskFingerprint
+        source_files=$taskSourceHashes
+        artifacts=@($taskArtifacts)
+        signing='unsigned'
+        human_acceptance='pending'
+        publication='requires human review, feedback and a separate publishing instruction'
+    } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath 'dist\BUILD-INFO.json' -Encoding utf8
     $taskChecksums
 } finally { Pop-Location }

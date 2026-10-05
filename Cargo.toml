@@ -1,9 +1,9 @@
 [package]
 name = "gamepause-lmstudio"
-version = "0.3.5"
+version = "1.0.0"
 edition = "2024"
 license = "MIT"
-description = "A native Windows tray app that gives games room by pausing LM Studio models."
+description = "A native Windows tray app that pauses local AI for games, with LM Studio and experimental Ollama support."
 repository = "https://github.com/Vkuparin/gamepause-lmstudio"
 
 [dependencies]
@@ -15,7 +15,7 @@ roxmltree = "0.21"
 ureq = { version = "2.12", default-features = false, features = ["json"] }
 tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
 winreg = "0.55"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Diagnostics_Debug", "Win32_System_Threading", "Win32_System_Pipes", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_Security", "Win32_UI_Controls_Dialogs", "Win32_UI_Accessibility", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_HiDpi"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Storage_Xps", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Diagnostics_Debug", "Win32_System_Threading", "Win32_System_Time", "Win32_System_Power", "Win32_System_Pipes", "Win32_System_LibraryLoader", "Win32_System_SystemServices", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_Security", "Win32_UI_Controls_Dialogs", "Win32_UI_Accessibility", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_HiDpi"] }
 
 [profile.release]
 opt-level = "s"

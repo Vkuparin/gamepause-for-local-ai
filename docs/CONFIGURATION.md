@@ -7,15 +7,16 @@ The complete starting configuration is [config.example.json](../config.example.j
 |---|---|---|
 | `mode` | `active` | Advanced diagnostic mode; ordinary users use the automatic-pausing switch |
 | `automation_enabled` | `true` | Automatically pause for games; existing recovery still completes when off |
-| `settings_version` | `2` | Configuration format/migration marker; do not edit |
+| `settings_version` | `3` | Configuration format/migration marker; do not edit |
 | `ignored_games` | `[]` | Installation/executable paths disabled through the dashboard |
 | `poll_seconds` | `2` | Process check interval, minimum 0.5 seconds |
 | `discovery_seconds` | `30` | Local inventory refresh, minimum 10 seconds |
 | `restore_delay_seconds` | `30` | Grace period after the last detected game exits; 0 disables delay |
-| `retry_seconds` | `30` | Backoff after LM Studio failures, minimum 5 seconds |
-| `stop_server_during_gaming` | `true` | Stop HTTP clients from JIT-loading models during gaming |
-| `lms_path` | `""` | Optional full path to `lms.exe`; otherwise autodetect |
-| `api_host` | `127.0.0.1:1234` | Local control/REST address; remote hosts are intentionally refused |
+| `retry_seconds` | `30` | Independent provider retry backoff, minimum 5 seconds |
+| `providers` | LM enabled, Ollama disabled | Typed provider entries; see below |
+| `advanced_settings_visible` | `false` | Show noncore settings/tools in dashboard and tray |
+| `notifications_enabled` | `true` | Windows completion/failure notifications |
+| `sound_enabled` | `true` | One sound source per event; independent of visuals |
 | `steam_roots` | `[]` | Extra Steam client/library roots containing `steamapps` |
 | `epic_manifest_dirs` | `[]` | Extra directories containing Epic `.item` manifests |
 | `game_roots` | `[]` | Parent folders whose immediate subfolders are individual games |
@@ -26,6 +27,14 @@ The complete starting configuration is [config.example.json](../config.example.j
 CLI `--active` and `--observe` override `mode` for that run without modifying config.
 Other switches: `--background` (quiet tray startup), `--headless`, `--duration N`, `--discover`, `--doctor`, `--restore`,
 `--data-dir DIRECTORY`, `--version`.
+
+## Provider entries
+
+Each entry has a stable `id`, a `kind` (`lmstudio` or `ollama`) and an `enabled` boolean. IDs, kinds and normalized endpoints must be unique. Endpoints accept only `localhost` or `127.0.0.1` with a valid port. Remote control is refused.
+
+LM Studio stores `endpoint` (default `127.0.0.1:1234`), `lms_path` (empty for autodetection) and `stop_server_during_gaming` (default `true`) inside `connection`. Ollama stores `endpoint` (default `127.0.0.1:11434`) directly on its entry and is disabled by default. Enabling it is explicit experimental opt-in; read the [supported subset and limits](USAGE.md#background-ai-applications). GamePause does not start Ollama or download models.
+
+Unfinished recovery blocks disabling/removing its provider or changing its ID/endpoint. Complete that provider's recovery first. A completed provider can be edited while another remains pending. Legacy flat LM fields are accepted only through guarded migration; new version-3 files must use provider entries. See [migration and downgrade](USAGE.md#settings-migration).
 
 ## Standalone or missed installations
 
@@ -48,4 +57,7 @@ Launcher clients, common installers, crash reporters, Lossless Scaling, Wallpape
 and known anti-cheat services are excluded by default. Unusual helpers need explicit exclusions.
 Unknown configuration keys are errors so a misspelling doesn't silently change behaviour.
 
-All timing values must be finite, respect their documented minimums, and be at most 86400 seconds (one day). Observation mode refuses manual restore and round-trip verification. Existing recovery is protected against game removal/exclusions for GUI, automatic and CLI restore. Notification sounds currently follow completion/error events and are always enabled; there is no sound preference in this preview.
+All timing values must be finite, respect their documented minimums, and be at most 86400 seconds (one day). Observation mode refuses manual restore and round-trip verification. Existing recovery is protected against game removal/exclusions for GUI, automatic and CLI restore. Visual notifications and sounds have separate saved preferences. With visuals enabled, Windows owns the sound; sound-only mode uses one system sound. Windows may suppress delivery.
+
+
+`appearance` accepts `"system"` (default), `"light"` or `"dark"`. Existing version-3 settings without this field follow Windows. Advanced settings saves the preference for the dashboard and tray menu; high contrast takes precedence. The setting does not change provider control or recovery.

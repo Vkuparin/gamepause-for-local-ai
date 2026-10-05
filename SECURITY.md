@@ -1,7 +1,7 @@
 # Security and privacy
 
 GamePause reads local launcher metadata and process paths. It communicates only with the
-configured local LM Studio address. There is no telemetry, store authentication, or cloud API.
+configured loopback LM Studio and explicitly enabled experimental Ollama addresses. There is no telemetry, store authentication, or cloud API.
 The app does not change game files or filesystem permissions.
 
 Local configuration, inventory, status, recovery state, and rotated logs live under
@@ -14,5 +14,6 @@ problem, use GitHub's private vulnerability reporting when available, or contact
 maintainer privately through the repository owner's profile. Public issues are suitable
 for ordinary compatibility problems with sanitized examples.
 
-The v0.1 preview is the currently supported release line. Downloads are unsigned and
-accompanied by SHA-256 checksums. CI builds executable archives from the tagged source.
+The owner approved v1.0.0 for publication after human tests passed on 2026-10-05. Downloads are unsigned and
+accompanied by SHA-256 checksums. CI builds executable archives from the tagged source;
+artifact preparation does not authorize publication.

@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.0.0 — 2026-10-05
+
+- Add state accents, colored game pausing words, feedback below help and a version footer. Add a saved Appearance choice for the dashboard and tray menu. Fix dark button hover, Advanced scrolling and stale group backgrounds after switching to Light; clarify the gameplay Resume warning.
+- Fix dashboard group boxes covering buttons, checks and tabs. Hide window/text scrollbars when content fits and remove frames around read-only summaries. Consolidate the tray/dashboard action as Resume AI, which releases the manual hold and resumes saved AI immediately; gameplay still requires confirmation.
+- Show detected games, enabled-provider outcomes, reasons and next steps in the core dashboard and tray. Share guarded Pause/Resume availability and persistent command feedback.
+- Confirm immediate restoration during gaming for the listed live process instances, with separate optional Ignore choices. New games, relaunches, unknown detection and app restart revoke that approval.
+- Persist default-off Advanced visibility, independent notification/sound choices and selected custom-game removal. Use one sound source and coalesce delayed success notifications.
+- Add resizable native layouts, measured DPI captions, keyboard help, tooltips and dark dashboard drawing with system-color high-contrast fallback. Preserve native control classes and input handling.
+- Migrate settings and recovery to guarded version-3 formats with byte-preserving older-file backups. Retain original LM settings/server state, independent provider recovery and atomic intent before mutations.
+- Add off-by-default experimental Ollama control for supported local GGUF completion models, verified identity/context and remaining finite observed residency deadlines. No live compatibility is claimed; unsupported capabilities/options remain refused.
+- Keep periodic detection independent of blocked control, refuse competing provider ownership, add read-only Advanced diagnostics and preserve existing CLI fields with provider-qualified evidence.
+- Reconcile power events with fresh discovery/process evidence and a new full recovery delay. Preserve manual holds and original recovery data.
+
+The owner reported human tests passed and approved publication on 2026-10-05. The reviewed installer and ZIP are published unchanged. [Acceptance](docs/ACCEPTANCE.md) records their hashes and evidence limits. Further UI and UX improvements are planned for later versions.
+
 ## 0.3.5 — 2026-10-04 (stabilisation preview)
 
 - Make release discovery panics recoverable with unwinding; bound launcher metadata/nesting and contain native callback panics. Add a production-profile panic regression.

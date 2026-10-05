@@ -1,19 +1,38 @@
 {
   "mode": "active",
+  "appearance": "system",
   "poll_seconds": 2,
   "discovery_seconds": 30,
   "restore_delay_seconds": 30,
   "retry_seconds": 30,
-  "stop_server_during_gaming": true,
-  "lms_path": "",
-  "api_host": "127.0.0.1:1234",
+  "providers": [
+    {
+      "kind": "lmstudio",
+      "id": "lmstudio-main",
+      "enabled": true,
+      "connection": {
+        "endpoint": "127.0.0.1:1234",
+        "lms_path": "",
+        "stop_server_during_gaming": true
+      }
+    },
+    {
+      "kind": "ollama",
+      "id": "ollama-main",
+      "enabled": false,
+      "endpoint": "127.0.0.1:11434"
+    }
+  ],
+  "advanced_settings_visible": false,
+  "notifications_enabled": true,
+  "sound_enabled": true,
   "steam_roots": [],
   "epic_manifest_dirs": [],
   "game_roots": [],
   "extra_games": [],
   "excluded_executables": [],
   "excluded_paths": [],
-  "settings_version": 2,
+  "settings_version": 3,
   "automation_enabled": true,
   "ignored_games": []
 }

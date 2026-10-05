@@ -6,7 +6,7 @@ use anyhow::Result;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, FILETIME, INVALID_HANDLE_VALUE},
+    Foundation::{CloseHandle, ERROR_NO_MORE_FILES, FILETIME, GetLastError, INVALID_HANDLE_VALUE},
     System::{
         Diagnostics::ToolHelp::{
             CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
@@ -63,6 +63,10 @@ pub const HELPERS: &[&str] = &[
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct ActiveGame {
     pub pid: u32,
+    #[serde(skip_serializing)]
+    pub created_at: u64,
+    #[serde(skip_serializing)]
+    pub executable: String,
     pub game: String,
     pub launcher: String,
     pub path: String,
@@ -76,6 +80,7 @@ pub struct Scanner {
     cache: HashMap<(u32, u64), String>,
     candidates_seen: HashSet<(u32, u64)>,
     pub inaccessible: usize,
+    pub uncertain_games: bool,
     config: Config,
     patterns: Vec<regex::Regex>,
 }
@@ -101,6 +106,7 @@ impl Scanner {
             cache: HashMap::new(),
             candidates_seen: HashSet::new(),
             inaccessible: 0,
+            uncertain_games: false,
             config,
             patterns,
         })
@@ -130,7 +136,24 @@ impl Scanner {
     pub fn scan(&mut self, games: &[Game]) -> Result<Vec<ActiveGame>> {
         let mut active = vec![];
         let mut live = HashSet::new();
+        let mut uncertain_pids = HashSet::new();
         self.inaccessible = 0;
+        self.uncertain_games = false;
+        let known_pids: HashSet<u32> = self
+            .cache
+            .iter()
+            .filter_map(|((pid, _), path)| self.match_path(path, games).map(|_| *pid))
+            .collect();
+        let known_names: HashSet<String> = games
+            .iter()
+            .filter_map(|game| {
+                game.path
+                    .rsplit(['\\', '/'])
+                    .next()
+                    .filter(|name| name.to_ascii_lowercase().ends_with(".exe"))
+                    .map(str::to_lowercase)
+            })
+            .collect();
         // Handles are owned only within this enumeration; every successful open is closed.
         unsafe {
             let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -149,10 +172,14 @@ impl Scanner {
                         .unwrap_or(entry.szExeFile.len())],
                 );
                 if !HELPERS.contains(&name.to_lowercase().as_str()) && entry.th32ProcessID != 0 {
+                    let known_game = known_pids.contains(&entry.th32ProcessID)
+                        || known_names.contains(&name.to_lowercase());
                     let process =
                         OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, entry.th32ProcessID);
                     if process.is_null() {
+                        uncertain_pids.insert(entry.th32ProcessID);
                         self.inaccessible += 1;
+                        self.uncertain_games |= known_game;
                     } else {
                         let mut created: FILETIME = std::mem::zeroed();
                         let mut exit = created;
@@ -182,6 +209,7 @@ impl Scanner {
                                     v.insert(String::from_utf16_lossy(&path[..size as usize]));
                                 } else {
                                     self.inaccessible += 1;
+                                    self.uncertain_games |= known_game;
                                 }
                             }
                             if let Some(path) = self.cache.get(&key)
@@ -189,22 +217,31 @@ impl Scanner {
                             {
                                 active.push(ActiveGame {
                                     pid: key.0,
+                                    created_at: key.1,
+                                    executable: path.clone(),
                                     game: game.name.clone(),
                                     launcher: game.launcher.clone(),
                                     path: game.path.clone(),
                                 });
                             }
                         } else {
+                            uncertain_pids.insert(entry.th32ProcessID);
                             self.inaccessible += 1;
+                            self.uncertain_games |= known_game;
                         }
                         CloseHandle(process);
                     }
                 }
                 present = Process32NextW(snapshot, &mut entry);
             }
+            let enumeration_error = GetLastError();
             CloseHandle(snapshot);
+            if enumeration_error != ERROR_NO_MORE_FILES {
+                return Err(std::io::Error::from_raw_os_error(enumeration_error as i32).into());
+            }
         }
-        self.cache.retain(|key, _| live.contains(key));
+        self.cache
+            .retain(|key, _| live.contains(key) || uncertain_pids.contains(&key.0));
         Ok(active)
     }
     pub fn running_apps(&self) -> Vec<RunningApp> {
