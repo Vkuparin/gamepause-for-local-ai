@@ -1,5 +1,13 @@
 # Candidate acceptance
 
+## v1.6.0 owner publication request - 2026-10-06
+
+The owner instructed "commit, and publish v1.6.0 according to the repo instructions" after receiving the restyled dashboard, its fixture renders and the list of unexercised behavior. This authorizes committing and publishing v1.6.0. The owner did not supply a test report for this build, so this record is a publication request, not a statement that the owner ran it.
+
+Automated checks passed: 261 library tests and 10 CLI integration tests, formatting, Clippy and the release build. The isolated rendering fixture and the dashboard lifecycle fixture passed individually with fictional state. The package verifier passed.
+
+Not exercised for v1.6.0: the real application against LM Studio or Ollama, real games, executable-icon display for real game installations beyond a unit test against a Windows system executable, the visible title-bar tint, Windows 10, the installer's tray-only launch, upgrade/uninstall, startup, sleep/wake, multi-monitor and screen-reader behavior. Ollama remains experimental and off by default. Published SHA256SUMS.txt and BUILD-INFO.json identify the packaged artifacts; the release acceptance asset records this request separately from build-time review status. Earlier records below are historical.
+
 ## v1.5.0 owner acceptance - 2026-10-05
 
 The owner reported "OK, commit and publish, it seems to work now" after checking the redesigned app. This authorizes committing and publishing v1.5.0. Automated checks passed: 257 library tests and 10 CLI integration tests, formatting, Clippy and the release build. The isolated rendering and dashboard lifecycle fixtures also passed individually.

@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.6.0 — 2026-10-06
+
+- Restyle the dashboard after the three state mockups: blue **AI RUNNING**, orange **AI PAUSED**, yellow **LOADING** and red **AI NEEDS ATTENTION**, with a glowing state ring, a state-colored main button, attached tabs, a tinted title bar (Windows 11) and a state-colored window icon. Light and high-contrast modes are kept.
+- Shorten status text. Every worker state folds into one of the four looks; provider lines read **Ready**, **Pausing AI**, **Models unloaded successfully**, **Resuming AI** or **Models restored**. Idle model residency is still not polled.
+- Show each game's own executable icon, loaded only while the dashboard is open through a bounded lookup, and GamePause's own launcher marks. No artwork is downloaded and no vendor logos are bundled.
+- Remove the Status column, make table columns sortable, and move Refresh to Advanced > Detection (it stays in the tray menu).
+- The installer now starts GamePause in the system tray instead of opening the dashboard, and its texts say so.
+- The owner requested publication. No owner test report for this build was supplied, and no new live provider, installer or physical accessibility coverage is claimed. See [Acceptance](docs/ACCEPTANCE.md).
+
 ## 1.5.0 — 2026-10-05
 
 - Replace the dashboard with Rust-native eframe/egui, matching the charcoal/orange mockup with a concise status hero, searchable game/application tables and selected-entry cards.

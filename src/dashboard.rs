@@ -1,5 +1,7 @@
 //! Rust-native dashboard. Engine work stays on the existing worker channel.
-use crate::dashboard_theme::{self as design, Checkbox, CheckboxUi, Icon, Palette};
+use crate::dashboard_theme::{
+    self as design, Checkbox, CheckboxUi, Emphasis, Icon, Look, Palette, Push,
+};
 use crate::{
     app::{Action, Shared, SharedState},
     commands::Outcome,
@@ -233,9 +235,11 @@ pub fn show(shared: SharedState, tx: Sender<Action>, folder: PathBuf) {
 fn native_options() -> eframe::NativeOptions {
     eframe::NativeOptions {
         viewport: ViewportBuilder::default()
-            .with_inner_size([1120.0, 920.0])
+            .with_inner_size([1114.0, 848.0])
             .with_min_inner_size([620.0, 580.0])
-            .with_icon(app_icon()),
+            .with_icon(app_icon(
+                Palette::for_mode(true, false, Look::default()).accent,
+            )),
         renderer: eframe::Renderer::Glow,
         event_loop_builder: Some(Box::new(|builder| {
             builder.with_any_thread(true);
@@ -243,12 +247,13 @@ fn native_options() -> eframe::NativeOptions {
         ..Default::default()
     }
 }
-fn app_icon() -> IconData {
+/// The window icon is the pause mark in the current state color.
+fn app_icon(color: Color32) -> IconData {
     let mut rgba = vec![0; 32 * 32 * 4];
     for y in 4..28 {
         for x in (7..13).chain(19..25) {
             let i = (y * 32 + x) * 4;
-            rgba[i..i + 4].copy_from_slice(&[255, 133, 48, 255]);
+            rgba[i..i + 4].copy_from_slice(&[color.r(), color.g(), color.b(), 255]);
         }
     }
     IconData {
@@ -256,6 +261,23 @@ fn app_icon() -> IconData {
         width: 32,
         height: 32,
     }
+}
+/// Tint the native caption. Windows 10 ignores the color attributes and keeps its own bar.
+fn caption(hwnd: HWND, palette: Palette, dark: bool) {
+    use windows_sys::Win32::Graphics::Dwm::*;
+    const SYSTEM: u32 = 0xFFFF_FFFF;
+    let set = |attribute: DWMWINDOWATTRIBUTE, value: u32| unsafe {
+        DwmSetWindowAttribute(hwnd, attribute as u32, (&raw const value).cast(), 4);
+    };
+    let (bar, text) = palette.caption.map_or((SYSTEM, SYSTEM), |c| {
+        (
+            c.r() as u32 | (c.g() as u32) << 8 | (c.b() as u32) << 16,
+            0x00FF_FFFF,
+        )
+    });
+    set(DWMWA_USE_IMMERSIVE_DARK_MODE, dark as u32);
+    set(DWMWA_CAPTION_COLOR, bar);
+    set(DWMWA_TEXT_COLOR, text);
 }
 /// The native tray routes gameplay confirmation into the same themed modal.
 pub fn request_resume(shared: SharedState, tx: Sender<Action>) {
@@ -291,7 +313,6 @@ struct Row {
     platform: String,
     custom: bool,
     ignored: bool,
-    running: bool,
     pid: Option<u32>,
 }
 fn ignored(config: &Config, path: &str) -> bool {
@@ -317,7 +338,6 @@ fn rows(shared: &Shared, page: Page, query: &str) -> Vec<Row> {
                 platform: g.launcher.clone(),
                 custom: g.launcher == "Custom",
                 ignored: ignored(&shared.config, &g.path),
-                running: status(&g.path).is_some(),
                 pid: status(&g.path).map(|g| g.pid),
             })
             .collect(),
@@ -337,7 +357,6 @@ fn rows(shared: &Shared, page: Page, query: &str) -> Vec<Row> {
                         .into(),
                     custom: false,
                     ignored: ignored(&shared.config, &a.path),
-                    running: true,
                     pid: status(&a.path).map(|g| g.pid),
                 }
             })
@@ -363,7 +382,6 @@ fn rows(shared: &Shared, page: Page, query: &str) -> Vec<Row> {
                         .into(),
                     custom: game.is_some_and(|g| g.launcher == "Custom"),
                     ignored: true,
-                    running: status(path).is_some(),
                     pid: status(path).map(|g| g.pid),
                 }
             })
@@ -382,181 +400,171 @@ fn rows(shared: &Shared, page: Page, query: &str) -> Vec<Row> {
     rows
 }
 
+/// `ascending` keeps the name order from `rows` within equal keys.
+fn sort_rows(rows: &mut [Row], (column, ascending): (usize, bool), by_pid: bool) {
+    match column {
+        1 => rows.sort_by_cached_key(|r| r.platform.to_lowercase()),
+        2 if by_pid => rows.sort_by_key(|r| r.pid),
+        2 => rows.sort_by_key(|r| r.ignored),
+        _ => (),
+    }
+    if !ascending {
+        rows.reverse();
+    }
+}
+fn running_executable<'a>(s: &'a Shared, path: &str) -> Option<&'a str> {
+    s.active_games
+        .iter()
+        .find(|g| canonical(&g.path) == canonical(path))
+        .map(|g| g.executable.as_str())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tone {
     Neutral,
-    Paused,
+    Busy,
     Success,
     Error,
 }
 struct Hero {
     title: &'static str,
-    reason: String,
+    game: Option<String>,
     hint: &'static str,
-    tone: Tone,
-    paused: bool,
+    look: Look,
+    glyph: Icon,
 }
+/// Every worker activity folds into one of four looks with short, plain text.
+/// "AI RUNNING" means GamePause is not holding AI paused. Idle residency is not polled.
 fn hero(s: &Shared) -> Hero {
     use crate::control::Activity::*;
     let activity = if s.verifying { Verifying } else { s.activity };
-    let (title, hint, tone, paused) = match activity {
-        Unknown => (
-            "CHECKING GAMES",
-            "Waiting for reliable detection before controlling AI.",
-            Tone::Neutral,
-            false,
-        ),
-        Watching => (
-            if s.config.automation_enabled {
-                "READY FOR GAMING"
-            } else {
-                "AUTO PAUSE OFF"
-            },
-            "AI is unchanged. Current model residency is not polled.",
-            Tone::Neutral,
-            false,
-        ),
+    let (title, hint, look) = match activity {
+        Unknown => ("LOADING", "Checking for running games...", Look::Loading),
+        Watching if s.config.automation_enabled => {
+            ("AI RUNNING", "Watching for game launches", Look::Running)
+        }
+        Watching => ("AI RUNNING", "Automatic pausing is off", Look::Running),
         Observation => (
-            "OBSERVATION MODE",
-            "Detection only. AI and saved recovery are unchanged.",
-            Tone::Neutral,
-            false,
+            "AI RUNNING",
+            "Observation mode. Games are detected and AI is left alone.",
+            Look::Running,
         ),
-        Unavailable => (
-            "AI UNAVAILABLE",
-            "Open your AI provider or check its connection in Advanced.",
-            Tone::Error,
-            false,
-        ),
-        DetectionUnavailable => (
-            "DETECTION UNAVAILABLE",
-            "AI control is held until game detection succeeds.",
-            Tone::Error,
-            false,
-        ),
-        Capturing => (
-            "PAUSING AI",
-            "Saving original model settings before unloading.",
-            Tone::Paused,
-            false,
-        ),
-        WaitingForInference => (
-            "WAITING TO PAUSE",
-            "Waiting for inference to finish. Pause is not complete.",
-            Tone::Paused,
-            false,
-        ),
-        Unloading => (
-            "UNLOADING AI",
-            "Removing captured models. Waiting for verification.",
-            Tone::Paused,
-            false,
+        Coexistence => (
+            "AI RUNNING",
+            "Resumed while a game is running. Pause AI to free memory.",
+            Look::Running,
         ),
         Paused => (
             "AI PAUSED",
-            "AI paused for gaming. Resume to restore captured models.",
-            Tone::Paused,
-            true,
+            "AI paused for gaming. Resume to load your model.",
+            Look::Paused,
         ),
         ManualHold => (
             "AI PAUSED",
-            "You paused AI manually. Resume to release the hold.",
-            Tone::Paused,
-            true,
+            "You paused AI. Resume when you are ready.",
+            Look::Paused,
         ),
         Countdown => (
-            "RESUME SCHEDULED",
-            "Waiting for the configured delay before restoring AI.",
-            Tone::Paused,
-            true,
+            "AI PAUSED",
+            "Game closed. AI resumes shortly.",
+            Look::Paused,
         ),
-        Restoring => (
-            "RESTORING AI",
-            "Reloading captured models and verifying restoration.",
-            Tone::Paused,
-            false,
+        Capturing | Unloading | Restoring => ("LOADING", "Processing request...", Look::Loading),
+        WaitingForInference => (
+            "LOADING",
+            "Waiting for the current response to finish.",
+            Look::Loading,
+        ),
+        Verifying => ("LOADING", "Testing pause and resume...", Look::Loading),
+        Unavailable => (
+            "AI NEEDS ATTENTION",
+            "AI is not reachable. Open your AI app or check Advanced.",
+            Look::Attention,
+        ),
+        DetectionUnavailable => (
+            "AI NEEDS ATTENTION",
+            "Game detection is not working. AI is left alone until it recovers.",
+            Look::Attention,
         ),
         Recovery => (
-            "RECOVERY PENDING",
-            "Saved recovery is retained. Resume to retry when available.",
-            Tone::Error,
-            false,
+            "AI NEEDS ATTENTION",
+            "Your models are saved but not loaded. Resume to try again.",
+            Look::Attention,
         ),
         PartialFailure => (
             "AI NEEDS ATTENTION",
-            "An operation failed or is incomplete. Open Activity for details.",
-            Tone::Error,
-            false,
-        ),
-        Verifying => (
-            "TESTING RECOVERY",
-            "Testing capture, unload and restoration. Please wait.",
-            Tone::Paused,
-            false,
-        ),
-        Coexistence => (
-            "AI RESUMED",
-            "Restoration verified during gameplay. Pause AI to end approval.",
-            Tone::Success,
-            false,
+            "Something did not finish. Open Activity for details.",
+            Look::Attention,
         ),
     };
     let reliable =
         s.discovery_ready && s.detection_ok && !s.disabled && s.discovery_errors.is_empty();
-    let reason = if !reliable {
-        "Running games are not yet confirmed".into()
-    } else if let Some(first) = s.active_games.first() {
+    let game = s.active_games.first().filter(|_| reliable).map(|first| {
         if s.active_games.len() == 1 {
             format!("{} is running", first.game)
         } else {
             format!(
-                "{} and {} other games are running",
+                "{} and {} more are running",
                 first.game,
                 s.active_games.len() - 1
             )
         }
-    } else if s.manual_pause {
-        "Manual pause is in effect".into()
-    } else {
-        "No recognized game is running".into()
-    };
+    });
     Hero {
         title,
-        reason,
+        game,
         hint,
-        tone,
-        paused,
+        look,
+        glyph: match look {
+            Look::Running => Icon::Play,
+            Look::Paused => Icon::Pause,
+            Look::Loading => Icon::Dots,
+            Look::Attention => Icon::Alert,
+        },
     }
 }
-fn provider_status(s: &Shared) -> Vec<(String, Tone)> {
+/// One line per enabled provider: name, short outcome, dot tone.
+fn provider_status(s: &Shared) -> Vec<(String, &'static str, Tone)> {
+    use crate::control::Activity;
     use crate::coordinator::State;
+    let activity = if s.verifying {
+        Activity::Verifying
+    } else {
+        s.activity
+    };
     s.config
         .providers
         .iter()
         .filter(|p| p.enabled())
         .map(|p| {
-            let report = s
+            let state = s
                 .provider_statuses
                 .iter()
-                .find(|r| r.id == p.id() && r.kind == p.kind());
-            let (text, tone) = match report.map(|r| r.state) {
-                Some(State::Paused) => ("Captured-model unload verified", Tone::Success),
-                Some(State::Restored) => (
-                    "Restoration verified; current residency unpolled",
-                    Tone::Success,
-                ),
-                Some(State::Pausing) => ("Unloading captured models", Tone::Paused),
-                Some(State::Restoring) => ("Restoring captured models", Tone::Paused),
-                Some(State::Failed) => ("Operation failed; check Activity", Tone::Error),
-                Some(State::Deferred) => ("Waiting; operation incomplete", Tone::Paused),
-                _ if s.activity == crate::control::Activity::Unavailable => {
-                    ("Unavailable or connection refused", Tone::Error)
+                .find(|r| r.id == p.id() && r.kind == p.kind())
+                .map(|r| r.state);
+            let (text, tone) = match (state, activity) {
+                (Some(State::Failed), _) => ("Something went wrong", Tone::Error),
+                (Some(State::Deferred), _) => ("Waiting", Tone::Busy),
+                (Some(State::Pausing), _) => ("Pausing AI", Tone::Busy),
+                (Some(State::Restoring), _) => ("Resuming AI", Tone::Busy),
+                // A report from the previous session can outlive the start of new work.
+                (
+                    None | Some(State::Restored),
+                    Activity::Capturing | Activity::WaitingForInference | Activity::Unloading,
+                ) => ("Pausing AI", Tone::Busy),
+                (None | Some(State::Paused), Activity::Restoring) => ("Resuming AI", Tone::Busy),
+                (_, Activity::Verifying) => ("Testing", Tone::Busy),
+                (Some(State::Paused), _) => ("Models unloaded successfully", Tone::Success),
+                (Some(State::Restored), _) => ("Models restored", Tone::Success),
+                (_, Activity::Unavailable) => ("Not reachable", Tone::Error),
+                (_, Activity::Unknown | Activity::DetectionUnavailable) => {
+                    ("Waiting for game detection", Tone::Neutral)
                 }
-                _ => ("Current model state unpolled", Tone::Neutral),
+                _ => ("Ready", Tone::Success),
             };
             (
                 format!(
-                    "{}: {text}{}",
+                    "{}{}:",
                     p.kind().name(),
                     if p.kind() == crate::provider::Kind::Ollama {
                         " (experimental)"
@@ -564,10 +572,27 @@ fn provider_status(s: &Shared) -> Vec<(String, Tone)> {
                         ""
                     }
                 ),
+                text,
                 tone,
             )
         })
         .collect()
+}
+fn game_tile(ui: &Ui, rect: Rect, texture: Option<TextureHandle>, fallback: Icon, p: Palette) {
+    match texture {
+        Some(texture) => egui::Image::new(&texture)
+            .corner_radius(5)
+            .paint_at(ui, rect),
+        None => {
+            ui.painter().rect_filled(rect, 5, p.elevated);
+            design::icon(
+                ui.painter(),
+                rect.shrink(rect.width() * 0.16),
+                fallback,
+                p.accent,
+            );
+        }
+    }
 }
 
 struct ActivityLog {
@@ -650,6 +675,7 @@ struct Dashboard {
     settings_page: SettingsPage,
     query: String,
     selected: Option<String>,
+    sort: (usize, bool),
     modal: Option<Modal>,
     modal_active: bool,
     owner: HWND,
@@ -661,7 +687,10 @@ struct Dashboard {
     toast: Toast,
     visible: bool,
     stopping: bool,
-    theme: Option<(bool, bool)>,
+    theme: Option<(bool, bool, Look)>,
+    chrome: Option<(bool, bool)>,
+    window_icon: Option<Color32>,
+    icons: crate::game_icons::Cache,
     worker_log: Option<String>,
 }
 impl Dashboard {
@@ -681,6 +710,7 @@ impl Dashboard {
             settings_page: SettingsPage::General,
             query: String::new(),
             selected: None,
+            sort: (0, true),
             modal: None,
             modal_active: false,
             owner: null_mut(),
@@ -693,6 +723,9 @@ impl Dashboard {
             visible: true,
             stopping: false,
             theme: None,
+            chrome: None,
+            window_icon: None,
+            icons: Default::default(),
             worker_log: None,
         }
     }
@@ -734,77 +767,96 @@ impl Dashboard {
         self.page = page;
         self.query.clear();
         self.selected = None;
+        self.sort = (0, true);
         RUNNING_REQUESTED.store(self.visible && page == Page::Running, Ordering::Relaxed);
     }
     fn tone(p: Palette, t: Tone) -> Color32 {
         match t {
             Tone::Neutral => p.muted,
-            Tone::Paused => p.accent,
+            Tone::Busy => p.busy,
             Tone::Success => p.success,
             Tone::Error => p.error,
         }
     }
-    fn hero(&mut self, ui: &mut Ui, s: &Shared, p: Palette) {
-        let h = hero(s);
-        let accent = Self::tone(p, h.tone);
-        p.card().inner_margin(18).show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 4.0;
-            ui.set_min_width(ui.available_width());
-            let narrow = ui.available_width() < 780.0;
-            ui.horizontal(|ui| {
-                if ui.available_width() > 650.0 {
-                    let (rect, _) = ui.allocate_exact_size(vec2(108.0, 108.0), Sense::hover());
-                    ui.painter()
-                        .circle_stroke(rect.center(), 47.0, Stroke::new(5.0_f32, accent));
-                    design::icon(
-                        ui.painter(),
-                        rect.shrink(23.0),
-                        if h.paused { Icon::Pause } else { Icon::Play },
-                        accent,
-                    );
-                    ui.add_space(10.0);
-                }
-                let right = if narrow { 0.0 } else { 190.0 };
-                let width = (ui.available_width() - right - design::GAP).max(220.0);
-                ui.allocate_ui_with_layout(
-                    vec2(width, 110.0),
-                    Layout::top_down(Align::Min),
-                    |ui| {
-                        ui.set_min_width(width);
-                        ui.label(
-                            RichText::new(h.title)
-                                .size(design::HERO_FONT)
-                                .family(FontFamily::Name("heading".into()))
-                                .color(accent),
-                        );
-                        ui.add(Label::new(RichText::new(&h.reason).size(23.0)).truncate())
-                            .on_hover_text(&h.reason);
-                        for (text, tone) in provider_status(s) {
+    fn hero(&mut self, ui: &mut Ui, s: &Shared, h: &Hero, p: Palette) {
+        p.card()
+            .inner_margin(Margin::symmetric(24, 20))
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 6.0;
+                ui.set_min_width(ui.available_width());
+                let narrow = ui.available_width() < 780.0;
+                ui.horizontal(|ui| {
+                    if ui.available_width() > 650.0 {
+                        let (rect, _) = ui.allocate_exact_size(vec2(112.0, 112.0), Sense::hover());
+                        design::ring(ui.painter(), rect, h.glyph, p);
+                        ui.add_space(14.0);
+                    }
+                    let right = if narrow {
+                        0.0
+                    } else {
+                        design::HERO_ACTION.x + design::GAP
+                    };
+                    let width = (ui.available_width() - right - design::GAP).max(220.0);
+                    ui.allocate_ui_with_layout(
+                        vec2(width, 112.0),
+                        Layout::top_down(Align::Min),
+                        |ui| {
+                            ui.set_min_width(width);
+                            // Text rows keep their own height instead of control height.
+                            ui.spacing_mut().interact_size.y = 0.0;
+                            ui.label(
+                                RichText::new(h.title)
+                                    .size(design::HERO_FONT)
+                                    .line_height(Some(design::HERO_FONT + 6.0))
+                                    .family(design::hero())
+                                    .color(p.accent),
+                            );
+                            if let Some(game) = &h.game {
+                                ui.add(Label::new(RichText::new(game).size(23.0)).truncate())
+                                    .on_hover_text(game);
+                            }
+                            for (name, text, tone) in provider_status(s) {
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 7.0;
+                                    let (dot, _) =
+                                        ui.allocate_exact_size(vec2(20.0, 26.0), Sense::hover());
+                                    ui.painter().circle_filled(
+                                        dot.center(),
+                                        6.5,
+                                        Self::tone(p, tone),
+                                    );
+                                    ui.label(
+                                        RichText::new(name).size(19.0).family(design::heading()),
+                                    );
+                                    ui.add(Label::new(RichText::new(text).size(19.0)).truncate());
+                                });
+                            }
+                            if !s.config.any_provider_enabled() {
+                                ui.colored_label(p.muted, "No AI provider is enabled");
+                            }
                             ui.horizontal(|ui| {
-                                let (dot, _) =
-                                    ui.allocate_exact_size(vec2(12.0, 18.0), Sense::hover());
-                                ui.painter()
-                                    .circle_filled(dot.center(), 4.0, Self::tone(p, tone));
-                                ui.add(Label::new(text).truncate());
+                                ui.add_space(27.0);
+                                ui.add(
+                                    Label::new(RichText::new(h.hint).size(17.5).color(p.muted))
+                                        .wrap(),
+                                );
                             });
-                        }
-                        if !s.config.any_provider_enabled() {
-                            ui.colored_label(p.muted, "No AI provider is enabled");
-                        }
-                        ui.add(Label::new(RichText::new(h.hint).size(15.0).color(p.muted)).wrap());
-                    },
-                );
-                if !narrow {
-                    self.primary(ui, s, p);
+                        },
+                    );
+                    if !narrow {
+                        ui.vertical(|ui| {
+                            ui.add_space(24.0);
+                            self.primary(ui, s, h, p);
+                        });
+                    }
+                });
+                if narrow {
+                    ui.add_space(10.0);
+                    self.primary(ui, s, h, p);
                 }
             });
-            if narrow {
-                ui.add_space(10.0);
-                self.primary(ui, s, p);
-            }
-        });
     }
-    fn primary(&mut self, ui: &mut Ui, s: &Shared, p: Palette) {
+    fn primary(&mut self, ui: &mut Ui, s: &Shared, h: &Hero, p: Palette) {
         let a = s.controls().availability();
         let resume = s.pending || s.manual_pause;
         let enabled = if resume {
@@ -812,45 +864,35 @@ impl Dashboard {
         } else {
             a.pause
         };
-        ui.add_enabled_ui(enabled, |ui| {
-            let label = if resume {
+        // Work in progress keeps the state color and takes no input.
+        let busy = h.look == Look::Loading && !enabled;
+        let (label, glyph) = if busy {
+            ("Loading...", Icon::Dots)
+        } else if resume {
+            (
                 crate::restore_dialog::resume_label(
                     !s.active_games.is_empty(),
                     s.coexistence,
                     s.pending,
-                )
-            } else {
-                "Pause AI"
-            };
-            let response = ui.add(
-                Button::new(
-                    RichText::new(format!("     {label}"))
-                        .color(if crate::theme::high_contrast() {
-                            p.selected_text
-                        } else {
-                            p.text
-                        })
-                        .size(20.0)
-                        .family(FontFamily::Name("heading".into())),
-                )
-                .min_size(design::HERO_ACTION)
-                .fill(if ui.visuals().dark_mode {
-                    design::PRIMARY_FILL
-                } else {
-                    p.selected
-                })
-                .stroke(Stroke::new(1.0_f32, p.accent)),
-            );
-            design::icon(
-                ui.painter(),
-                Rect::from_center_size(
-                    pos2(response.rect.left() + 24.0, response.rect.center().y),
-                    vec2(23.0, 23.0),
                 ),
-                if resume { Icon::Play } else { Icon::Pause },
-                p.text,
-            );
-            if response.on_hover_text(a.reason).clicked() {
+                Icon::Play,
+            )
+        } else {
+            ("Pause AI", Icon::Pause)
+        };
+        ui.add_enabled_ui(enabled || busy, |ui| {
+            let response = Push::new(label)
+                .icon(glyph)
+                .emphasis(if busy {
+                    Emphasis::Busy
+                } else {
+                    Emphasis::Solid
+                })
+                .min(design::HERO_ACTION)
+                .size(21.0)
+                .show(ui, p)
+                .on_hover_text(a.reason);
+            if !busy && response.clicked() {
                 if resume {
                     self.resume(s);
                 } else {
@@ -860,200 +902,501 @@ impl Dashboard {
         });
     }
     fn settings_strip(&mut self, ui: &mut Ui, s: &Shared, p: Palette) {
-        p.card().inner_margin(12).show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            ui.horizontal_wrapped(|ui| {
-                let (rect, _) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
-                design::icon(ui.painter(), rect, Icon::Settings, p.muted);
-                ui.strong("Settings");
-                ui.separator();
-                let mut auto = s.config.automation_enabled;
-                if ui
-                    .add_enabled(
-                        !s.commands.settings_pending,
-                        Checkbox::new(&mut auto, "Automatically pause AI while gaming"),
-                    )
-                    .changed()
-                {
-                    let mut c = s.config.clone();
-                    c.automation_enabled = auto;
-                    self.save(c, false);
-                }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        p.card()
+            .inner_margin(Margin::symmetric(22, 8))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new("Settings")
+                            .size(18.0)
+                            .family(design::heading()),
+                    );
+                    ui.separator();
+                    let mut auto = s.config.automation_enabled;
+                    let label = if ui.ctx().content_rect().width() < 700.0 {
+                        "Pause AI while gaming"
+                    } else {
+                        "Automatically pause AI while gaming"
+                    };
                     if ui
                         .add_enabled(
                             !s.commands.settings_pending,
-                            Button::new(if s.config.advanced_settings_visible {
-                                "Back to games"
-                            } else {
-                                "Advanced  >"
-                            }),
+                            Checkbox::new(&mut auto, label),
                         )
-                        .clicked()
+                        .changed()
                     {
-                        self.action(
-                            Action::AdvancedVisibility(!s.config.advanced_settings_visible),
-                            "Advanced visibility",
-                        );
+                        let mut c = s.config.clone();
+                        c.automation_enabled = auto;
+                        self.save(c, false);
                     }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let visible = s.config.advanced_settings_visible;
+                        let push = if visible {
+                            Push::new("Back to games")
+                        } else {
+                            Push::new("Advanced").trailing(Icon::Caret)
+                        };
+                        let clicked = ui
+                            .add_enabled_ui(!s.commands.settings_pending, |ui| {
+                                push.min(vec2(118.0, 38.0)).show(ui, p).clicked()
+                            })
+                            .inner;
+                        if clicked {
+                            self.action(
+                                Action::AdvancedVisibility(!visible),
+                                "Advanced visibility",
+                            );
+                        }
+                    });
                 });
             });
-        });
     }
     fn navigation(&mut self, ui: &mut Ui, p: Palette) {
         ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
             for (page, label, icon) in [
                 (Page::Games, "Games", Icon::Game),
                 (Page::Running, "Running apps", Icon::Apps),
                 (Page::Ignored, "Ignored", Icon::Ignore),
             ] {
-                if design::button(ui, label, icon, self.page == page, p).clicked() {
+                if design::tab(ui, label, icon, self.page == page, p).clicked() {
                     self.set_page(page);
                 }
             }
         });
     }
     fn games(&mut self, ui: &mut Ui, s: &Shared, p: Palette) {
+        const HEADER: f32 = 36.0;
+        let spacing = ui.spacing().item_spacing.y;
+        // Tabs sit directly on the panel they switch.
+        ui.spacing_mut().item_spacing.y = 0.0;
         self.navigation(ui, p);
-        ui.add_space(6.0);
-        p.card().inner_margin(12).show(ui,|ui| {
+        let panel = p.card().inner_margin(12).corner_radius(CornerRadius {
+            nw: 0,
+            ne: design::RADIUS,
+            sw: design::RADIUS,
+            se: design::RADIUS,
+        });
+        panel.show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = spacing;
             ui.set_min_width(ui.available_width());
+            let page = self.page;
             ui.horizontal(|ui| {
-                let (rect,_)=ui.allocate_exact_size(vec2(20.0,20.0),Sense::hover());design::icon(ui.painter(),rect,Icon::Search,p.muted);
-                let width=(ui.available_width()-260.0).max(130.0);
-                ui.add_sized([width,design::CONTROL],TextEdit::singleline(&mut self.query).hint_text(match self.page {Page::Games=>"Search games...",Page::Running=>"Search applications...",_=>"Search ignored..."}));
-                if design::button(ui,"Refresh",Icon::Apps,false,p).clicked(){self.action(Action::Refresh,"Discovery refresh");}
-                if design::button(ui,"Add game...",Icon::Add,true,p).clicked(){self.modal=Some(Modal::Add{name:String::new(),path:String::new(),auto:true});}
+                let width = (ui.available_width() - 162.0 - design::GAP).max(130.0);
+                Frame::new()
+                    .fill(p.background)
+                    .stroke(Stroke::new(1.0_f32, p.border))
+                    .corner_radius(design::RADIUS)
+                    .inner_margin(Margin::symmetric(12, 0))
+                    .show(ui, |ui| {
+                        ui.set_width(width - 24.0);
+                        ui.set_min_height(design::CONTROL);
+                        let (rect, _) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
+                        design::icon(ui.painter(), rect, Icon::Search, p.muted);
+                        ui.add(
+                            TextEdit::singleline(&mut self.query)
+                                .frame(false)
+                                .desired_width(ui.available_width())
+                                .hint_text(match page {
+                                    Page::Games => "Search games...",
+                                    Page::Running => "Search applications...",
+                                    _ => "Search ignored...",
+                                }),
+                        );
+                    });
+                if Push::new("Add game...")
+                    .icon(Icon::Add)
+                    .emphasis(Emphasis::Accent)
+                    .min(vec2(150.0, design::CONTROL + 2.0))
+                    .show(ui, p)
+                    .clicked()
+                {
+                    self.modal = Some(Modal::Add {
+                        name: String::new(),
+                        path: String::new(),
+                        auto: true,
+                    });
+                }
             });
-            ui.add_space(8.0);
-            let entries=rows(s,self.page,&self.query);
-            let height=(ui.available_height()-162.0).clamp(140.0,470.0);
-            let table_top=ui.cursor().top();
-            let table_right=ui.max_rect().right();
-            let row_painter=ui.painter().with_clip_rect(Rect::from_min_max(pos2(ui.max_rect().left(),table_top+34.0),pos2(table_right,table_top+34.0+height)));
-            let original_spacing=ui.spacing().item_spacing.y;
-            ui.spacing_mut().item_spacing.y=0.0;
-            let wide=ui.available_width()>740.0;
-            let page=self.page;
-            let mut selected=self.selected.clone();
-            let mut toggled=None;
-            let mut table=TableBuilder::new(ui).id_salt(("game-table",format!("{page:?}"))).striped(true).resizable(true).sense(Sense::click()).cell_layout(Layout::left_to_right(Align::Center)).min_scrolled_height(height.min(entries.len() as f32*design::ROW).max(96.0)).max_scroll_height(height)
-                .column(Column::remainder().at_least(180.0).resizable(false).clip(true));
-            if wide {table=table.column(Column::initial(145.0).at_least(100.0));}
-            table=table.column(Column::initial(if page==Page::Running {90.0}else{110.0}).at_least(80.0)).column(Column::initial(160.0).at_least(110.0));
-            table.header(34.0,|mut header| {
-                header.col(|ui| {ui.strong(if page==Page::Running {"Application"}else{"Game"});});
-                if wide {header.col(|ui|{ui.strong(if page==Page::Running {"Recognition"}else{"Platform"});});}
-                header.col(|ui|{ui.strong(if page==Page::Running {"PID"}else{"Auto pause"});});
-                header.col(|ui|{ui.strong(if page==Page::Ignored {"Source"}else{"Status"});});
-            }).body(|body| {
-                body.rows(design::ROW,entries.len(),|mut row| {
-                    let index=row.index();
-                    let entry=&entries[index];
-                    row.set_selected(selected.as_ref().is_some_and(|path|canonical(path)==canonical(&entry.path)));
-                    row.col(|ui| {
-                        let (rect,_)=ui.allocate_exact_size(vec2(30.0,30.0),Sense::hover());
-                        ui.painter().rect_filled(rect,5,p.elevated);design::icon(ui.painter(),rect.shrink(4.0),if page==Page::Running {Icon::Apps}else{Icon::Game},p.accent);
-                        ui.add(Label::new(&entry.name).truncate()).on_hover_text(format!("{}\n{}",entry.name,entry.path));
-                    });
-                    if wide {row.col(|ui| {ui.add(Label::new(RichText::new(&entry.platform).color(p.muted)).truncate());});}
-                    row.col(|ui| {
-                        if page==Page::Running {ui.label(entry.pid.map_or_else(||"—".into(),|pid|pid.to_string())).on_hover_text("PID is available for recognized games. Other process IDs are not collected by this inventory.");}
-                        else {let mut on=!entry.ignored;if ui.add_enabled(!s.commands.settings_pending,Checkbox::new(&mut on,if entry.ignored {"Off"}else{"On"})).changed(){toggled=Some((entry.path.clone(),on));}}
-                    });
-                    row.col(|ui| {
-                        if page==Page::Ignored {ui.add(Label::new("Saved exclusion").truncate());}
-                        else {let reliable=s.discovery_ready&&s.detection_ok&&s.discovery_errors.is_empty();let (label,color)=if !reliable {("Unknown",p.muted)} else if entry.running {("Running",p.success)}else{("Not running",p.muted)};
-                            let (dot,_)=ui.allocate_exact_size(vec2(10.0,16.0),Sense::hover());ui.painter().circle_filled(dot.center(),4.0,color);ui.colored_label(color,label);}
-                    });
-                    if row.response().clicked() {selected=Some(entry.path.clone());}
-                    let response=row.response();
-                    let selected_row=selected.as_ref().is_some_and(|path|canonical(path)==canonical(&entry.path));
-                    if selected_row {let mut rect=response.rect.shrink(1.0);rect.max.x=rect.max.x.min(table_right-1.0);row_painter.rect_stroke(rect,4,Stroke::new(1.0_f32,p.accent),StrokeKind::Inside);}
-                    if response.has_focus() {
-                        let step=response.ctx.input(|i|if i.key_pressed(Key::ArrowDown){1}else if i.key_pressed(Key::ArrowUp){-1}else{0});
-                        if step!=0 {let current=selected.as_ref().and_then(|path|entries.iter().position(|r|canonical(&r.path)==canonical(path))).unwrap_or(index);let next=(current as isize+step).clamp(0,entries.len().saturating_sub(1) as isize) as usize;selected=Some(entries[next].path.clone());}
-                        if ui_input_arrow(&response) {selected=Some(entry.path.clone());}
+            ui.add_space(2.0);
+            let mut entries = rows(s, page, &self.query);
+            sort_rows(&mut entries, self.sort, page == Page::Running);
+            let height = (ui.available_height() - 178.0).clamp(140.0, 520.0);
+            let wide = ui.available_width() > 740.0;
+            let mut selected = self.selected.clone();
+            let mut sort = self.sort;
+            let mut toggled = None;
+            // The row closures borrow the cache; details reuse it afterwards.
+            let mut icons = std::mem::take(&mut self.icons);
+            Frame::new()
+                .stroke(Stroke::new(1.0_f32, p.border))
+                .corner_radius(design::RADIUS)
+                .inner_margin(1)
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    // Row selection fills must stay inside the rounded table border.
+                    let mut clip = ui.clip_rect();
+                    clip.min.x = clip.min.x.max(ui.max_rect().left());
+                    clip.max.x = clip.max.x.min(ui.max_rect().right());
+                    ui.set_clip_rect(clip);
+                    let top = ui.cursor().top();
+                    let right = ui.max_rect().right();
+                    let rows_clip = Rect::from_min_max(
+                        pos2(ui.max_rect().left(), top + HEADER),
+                        pos2(right, top + HEADER + height),
+                    );
+                    let row_painter = ui.painter().with_clip_rect(rows_clip);
+                    ui.painter().hline(
+                        ui.max_rect().x_range(),
+                        top + HEADER,
+                        Stroke::new(1.0_f32, p.border),
+                    );
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    let lines = ui.painter().clone();
+                    let mut table = TableBuilder::new(ui)
+                        .id_salt(("game-table", format!("{page:?}")))
+                        .sense(Sense::click())
+                        .cell_layout(Layout::left_to_right(Align::Center))
+                        .min_scrolled_height(
+                            height.min(entries.len() as f32 * design::ROW).max(96.0),
+                        )
+                        .max_scroll_height(height)
+                        .column(Column::remainder().at_least(180.0).clip(true));
+                    if wide {
+                        table = table.column(Column::exact(210.0));
+                    }
+                    table = table.column(Column::exact(if page == Page::Running {
+                        130.0
+                    } else {
+                        190.0
+                    }));
+                    let mut edges = Vec::new();
+                    let mut heading = |ui: &mut Ui, column: usize, label: &str| {
+                        if column > 0 {
+                            edges.push(ui.max_rect().left() - ui.spacing().item_spacing.x / 2.0);
+                        }
+                        ui.add_space(10.0);
+                        let response = ui
+                            .add(
+                                Label::new(
+                                    RichText::new(label).size(16.0).family(design::heading()),
+                                )
+                                .selectable(false)
+                                .sense(Sense::click()),
+                            )
+                            .on_hover_cursor(CursorIcon::PointingHand)
+                            .on_hover_text("Sort by this column");
+                        if sort.0 == column {
+                            let (rect, _) =
+                                ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
+                            design::icon(
+                                ui.painter(),
+                                rect,
+                                if sort.1 { Icon::Up } else { Icon::Down },
+                                p.muted,
+                            );
+                        }
+                        if response.clicked() {
+                            sort = (column, sort.0 != column || !sort.1);
+                        }
+                    };
+                    table
+                        .header(HEADER, |mut header| {
+                            header.col(|ui| {
+                                heading(
+                                    ui,
+                                    0,
+                                    if page == Page::Running {
+                                        "Application"
+                                    } else {
+                                        "Game"
+                                    },
+                                )
+                            });
+                            if wide {
+                                header.col(|ui| {
+                                    heading(
+                                        ui,
+                                        1,
+                                        if page == Page::Running {
+                                            "Recognition"
+                                        } else {
+                                            "Platform"
+                                        },
+                                    )
+                                });
+                            }
+                            header.col(|ui| {
+                                heading(
+                                    ui,
+                                    2,
+                                    if page == Page::Running {
+                                        "PID"
+                                    } else {
+                                        "Auto pause"
+                                    },
+                                )
+                            });
+                        })
+                        .body(|body| {
+                            body.rows(design::ROW, entries.len(), |mut row| {
+                                let index = row.index();
+                                let entry = &entries[index];
+                                let chosen = selected
+                                    .as_ref()
+                                    .is_some_and(|path| canonical(path) == canonical(&entry.path));
+                                row.set_selected(chosen);
+                                row.col(|ui| {
+                                    ui.add_space(8.0);
+                                    let (rect, _) =
+                                        ui.allocate_exact_size(vec2(34.0, 34.0), Sense::hover());
+                                    let texture = icons.get(
+                                        ui.ctx(),
+                                        &entry.path,
+                                        running_executable(s, &entry.path),
+                                        64,
+                                    );
+                                    game_tile(
+                                        ui,
+                                        rect,
+                                        texture,
+                                        if page == Page::Running {
+                                            Icon::Apps
+                                        } else {
+                                            Icon::Game
+                                        },
+                                        p,
+                                    );
+                                    ui.add(Label::new(&entry.name).truncate())
+                                        .on_hover_text(format!("{}\n{}", entry.name, entry.path));
+                                });
+                                if wide {
+                                    row.col(|ui| {
+                                        ui.add_space(10.0);
+                                        let (rect, _) = ui
+                                            .allocate_exact_size(vec2(26.0, 26.0), Sense::hover());
+                                        design::platform(ui.painter(), rect, &entry.platform, p);
+                                        ui.add(
+                                            Label::new(
+                                                RichText::new(&entry.platform).color(p.muted),
+                                            )
+                                            .truncate(),
+                                        );
+                                    });
+                                }
+                                row.col(|ui| {
+                                    ui.add_space(10.0);
+                                    if page == Page::Running {
+                                        ui.label(
+                                            entry
+                                                .pid
+                                                .map_or_else(|| "—".into(), |pid| pid.to_string()),
+                                        )
+                                        .on_hover_text(
+                                            "The process ID is shown for recognized games only.",
+                                        );
+                                    } else {
+                                        let mut on = !entry.ignored;
+                                        if ui
+                                            .add_enabled(
+                                                !s.commands.settings_pending,
+                                                Checkbox::new(
+                                                    &mut on,
+                                                    if entry.ignored { "Off" } else { "On" },
+                                                ),
+                                            )
+                                            .changed()
+                                        {
+                                            toggled = Some((entry.path.clone(), on));
+                                        }
+                                    }
+                                });
+                                if row.response().clicked() {
+                                    selected = Some(entry.path.clone());
+                                }
+                                let response = row.response();
+                                let mut rect = response.rect;
+                                rect.max.x = rect.max.x.min(right - 1.0);
+                                if selected
+                                    .as_ref()
+                                    .is_some_and(|path| canonical(path) == canonical(&entry.path))
+                                {
+                                    row_painter.rect_stroke(
+                                        rect.shrink(1.0),
+                                        4,
+                                        Stroke::new(1.5_f32, p.accent),
+                                        StrokeKind::Inside,
+                                    );
+                                } else if index + 1 < entries.len() {
+                                    row_painter.hline(
+                                        rect.x_range(),
+                                        rect.bottom(),
+                                        Stroke::new(1.0_f32, p.border.gamma_multiply(0.55)),
+                                    );
+                                }
+                                if response.has_focus() {
+                                    let step = response.ctx.input(|i| {
+                                        if i.key_pressed(Key::ArrowDown) {
+                                            1
+                                        } else if i.key_pressed(Key::ArrowUp) {
+                                            -1
+                                        } else {
+                                            0
+                                        }
+                                    });
+                                    if step != 0 {
+                                        let current = selected
+                                            .as_ref()
+                                            .and_then(|path| {
+                                                entries.iter().position(|r| {
+                                                    canonical(&r.path) == canonical(path)
+                                                })
+                                            })
+                                            .unwrap_or(index);
+                                        let next = (current as isize + step)
+                                            .clamp(0, entries.len().saturating_sub(1) as isize)
+                                            as usize;
+                                        selected = Some(entries[next].path.clone());
+                                    }
+                                    if ui_input_arrow(&response) {
+                                        selected = Some(entry.path.clone());
+                                    }
+                                }
+                            });
+                        });
+                    for x in edges {
+                        lines.vline(
+                            x,
+                            top..=ui.min_rect().bottom(),
+                            Stroke::new(1.0_f32, p.border),
+                        );
                     }
                 });
-            });
-            ui.spacing_mut().item_spacing.y=original_spacing;
-            self.selected=selected;
-            if let Some((path,on))=toggled {let mut c=s.config.clone();set_ignored(&mut c,&path,!on);self.save(c,false);}
-            if entries.is_empty() {
-                ui.colored_label(p.muted,if !self.query.is_empty(){"No matching entries. Try a different search."}else{match page {Page::Games=>"No games found. Refresh discovery or add a game executable.",Page::Running=>"No relevant applications are running. This inventory refreshes while the tab is open.",_=>"No ignored applications. Games you ignore will appear here."}});
+            self.icons = icons;
+            self.selected = selected;
+            self.sort = sort;
+            if let Some((path, on)) = toggled {
+                let mut c = s.config.clone();
+                set_ignored(&mut c, &path, !on);
+                self.save(c, false);
             }
-            ui.add_space(10.0);
-            let entry=self.selected.as_ref().and_then(|path|entries.iter().find(|r|canonical(&r.path)==canonical(path)));
-            self.details(ui,s,entry,p);
+            if entries.is_empty() {
+                ui.colored_label(
+                    p.muted,
+                    if !self.query.is_empty() {
+                        "No matching entries. Try a different search."
+                    } else {
+                        match page {
+                            Page::Games => {
+                                "No games found yet. Add a game, or refresh the list in Advanced."
+                            }
+                            Page::Running => "No relevant applications are running right now.",
+                            _ => "Nothing is ignored. Games you ignore appear here.",
+                        }
+                    },
+                );
+            }
+            ui.add_space(4.0);
+            let entry = self.selected.as_ref().and_then(|path| {
+                entries
+                    .iter()
+                    .find(|r| canonical(&r.path) == canonical(path))
+            });
+            self.details(ui, s, entry, p);
         });
     }
     fn details(&mut self, ui: &mut Ui, s: &Shared, row: Option<&Row>, p: Palette) {
-        p.card().show(ui, |ui| {
+        p.card().inner_margin(14).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            if let Some(row) = row {
-                let wide = ui.available_width() > 740.0;
-                ui.horizontal(|ui| {
-                    let (rect, _) = ui.allocate_exact_size(vec2(64.0, 64.0), Sense::hover());
-                    ui.painter().rect_filled(rect, 7, p.elevated);
-                    design::icon(ui.painter(), rect.shrink(14.0), Icon::Game, p.accent);
-                    let text_width =
-                        (ui.available_width() - if wide { 220.0 } else { 0.0 }).max(180.0);
-                    ui.allocate_ui_with_layout(
-                        vec2(text_width, 80.0),
-                        Layout::top_down(Align::Min),
-                        |ui| {
-                            ui.set_min_width(text_width);
-                            ui.add(
-                                Label::new(
-                                    RichText::new(&row.name)
-                                        .size(21.0)
-                                        .family(FontFamily::Name("heading".into())),
-                                )
-                                .truncate(),
+            let Some(row) = row else {
+                ui.colored_label(p.muted, "Select an entry to see its location and actions.");
+                return;
+            };
+            let wide = ui.available_width() > 740.0;
+            ui.horizontal(|ui| {
+                let (rect, _) = ui.allocate_exact_size(vec2(92.0, 92.0), Sense::hover());
+                let texture =
+                    self.icons
+                        .get(ui.ctx(), &row.path, running_executable(s, &row.path), 128);
+                game_tile(
+                    ui,
+                    rect,
+                    texture,
+                    if self.page == Page::Running {
+                        Icon::Apps
+                    } else {
+                        Icon::Game
+                    },
+                    p,
+                );
+                ui.add_space(6.0);
+                let text_width = (ui.available_width() - if wide { 290.0 } else { 0.0 }).max(180.0);
+                ui.allocate_ui_with_layout(
+                    vec2(text_width, 92.0),
+                    Layout::top_down(Align::Min),
+                    |ui| {
+                        ui.set_min_width(text_width);
+                        ui.spacing_mut().interact_size.y = 0.0;
+                        ui.add(
+                            Label::new(
+                                RichText::new(&row.name)
+                                    .size(23.0)
+                                    .family(design::heading()),
                             )
-                            .on_hover_text(&row.name);
+                            .truncate(),
+                        )
+                        .on_hover_text(&row.name);
+                        ui.horizontal(|ui| {
+                            let (rect, _) =
+                                ui.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
+                            design::icon(ui.painter(), rect, Icon::Folder, p.muted);
                             ui.add(Label::new(RichText::new(&row.path).color(p.muted)).truncate())
                                 .on_hover_text(&row.path);
-                            ui.colored_label(p.muted, format!("Recognized from {}", row.platform));
-                        },
-                    );
-                    if wide {
-                        self.row_actions(ui, s, row, p);
-                    }
-                });
-                if !wide {
-                    self.row_actions(ui, s, row, p);
-                }
-            } else {
-                ui.colored_label(
-                    p.muted,
-                    "Select an entry to see its path, source and available actions.",
+                        });
+                        ui.horizontal(|ui| {
+                            let (rect, _) =
+                                ui.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
+                            design::platform(ui.painter(), rect, &row.platform, p);
+                            ui.colored_label(
+                                p.muted,
+                                match row.platform.as_str() {
+                                    "Custom" => "Added by you".into(),
+                                    "Custom exclusion" => "Ignored by you".into(),
+                                    "Unrecognized" => "Not a recognized game".into(),
+                                    platform => format!("Recognized from {platform}"),
+                                },
+                            );
+                        });
+                    },
                 );
+                if wide {
+                    ui.vertical(|ui| {
+                        ui.add_space(4.0);
+                        self.row_actions(ui, s, row, p);
+                    });
+                }
+            });
+            if !wide {
+                self.row_actions(ui, s, row, p);
             }
         });
     }
     fn row_actions(&mut self, ui: &mut Ui, s: &Shared, row: &Row, p: Palette) {
         ui.horizontal_wrapped(|ui| {
             ui.add_enabled_ui(!s.commands.settings_pending, |ui| {
-                if design::button(
-                    ui,
-                    if self.page == Page::Running {
-                        "Add as game"
-                    } else if row.ignored {
-                        "Unignore"
-                    } else {
-                        "Ignore"
-                    },
-                    if self.page == Page::Running {
-                        Icon::Add
-                    } else {
-                        Icon::Ignore
-                    },
-                    false,
-                    p,
-                )
-                .clicked()
+                let (label, icon) = if self.page == Page::Running {
+                    ("Add as game", Icon::Add)
+                } else if row.ignored {
+                    ("Unignore", Icon::Ignore)
+                } else {
+                    ("Ignore", Icon::Ignore)
+                };
+                if Push::new(label)
+                    .icon(icon)
+                    .min(vec2(150.0, 44.0))
+                    .show(ui, p)
+                    .clicked()
                 {
                     if self.page == Page::Running {
                         self.modal = Some(Modal::Add {
@@ -1067,6 +1410,8 @@ impl Dashboard {
                         self.save(c, false);
                     }
                 }
+                ui.spacing_mut().interact_size.y = 44.0;
+                ui.spacing_mut().button_padding.x = 18.0;
                 ui.menu_button("More...", |ui| {
                     if self.page == Page::Running && ui.button("Ignore executable").clicked() {
                         let mut c = s.config.clone();
@@ -1201,6 +1546,7 @@ impl Dashboard {
                         string_list(ui,"Steam roots",&mut self.edit_config.steam_roots,&mut self.dirty);
                         string_list(ui,"Epic manifest folders",&mut self.edit_config.epic_manifest_dirs,&mut self.dirty);
                         string_list(ui,"Excluded executable names",&mut self.edit_config.excluded_executables,&mut self.dirty);
+                        if ui.button("Refresh game list").on_hover_text("Look for newly installed games now.").clicked(){self.action(Action::Refresh,"Discovery refresh");}
                         self.save_bar(ui,s,p);
                     },
                     SettingsPage::LMStudio=> {
@@ -1532,11 +1878,23 @@ impl Dashboard {
     fn draw(&mut self, ctx: &Context, s: &Shared) {
         let contrast = crate::theme::high_contrast();
         let dark = crate::theme::effective_dark(s.config.appearance);
-        let palette = Palette::for_mode(dark, contrast);
-        if self.theme != Some((dark, contrast)) {
+        let hero = hero(s);
+        let palette = Palette::for_mode(dark, contrast, hero.look);
+        if self.theme != Some((dark, contrast, hero.look)) {
             palette.install(ctx, dark);
-            self.theme = Some((dark, contrast));
+            self.theme = Some((dark, contrast, hero.look));
         }
+        if !self.owner.is_null() && self.chrome != Some((dark, contrast)) {
+            caption(self.owner, palette, dark);
+            self.chrome = Some((dark, contrast));
+        }
+        if self.window_icon != Some(palette.accent) {
+            ctx.send_viewport_cmd(ViewportCommand::Icon(Some(Arc::new(app_icon(
+                palette.accent,
+            )))));
+            self.window_icon = Some(palette.accent);
+        }
+        self.icons.poll(ctx);
         if !self.dirty && s.revision != self.edit_revision {
             self.edit_config = s.config.clone();
             self.edit_revision = s.revision;
@@ -1579,7 +1937,7 @@ impl Dashboard {
             .frame(
                 Frame::new()
                     .fill(palette.background)
-                    .inner_margin(Margin::symmetric(22, 12)),
+                    .inner_margin(Margin::symmetric(22, 6)),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -1588,17 +1946,25 @@ impl Dashboard {
                         format!("GamePause {}", env!("CARGO_PKG_VERSION")),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if design::button(ui, "Quit", Icon::Power, false, palette).clicked() {
+                        let size = vec2(126.0, 42.0);
+                        if Push::new("Quit")
+                            .icon(Icon::Power)
+                            .min(size)
+                            .show(ui, palette)
+                            .clicked()
+                        {
                             crate::app::request_quit(&self.shared, &self.tx);
                         }
-                        if design::button(
-                            ui,
-                            "Activity",
-                            Icon::Activity,
-                            self.page == Page::Activity,
-                            palette,
-                        )
-                        .clicked()
+                        if Push::new("Activity")
+                            .icon(Icon::Activity)
+                            .emphasis(if self.page == Page::Activity {
+                                Emphasis::Accent
+                            } else {
+                                Emphasis::Plain
+                            })
+                            .min(size)
+                            .show(ui, palette)
+                            .clicked()
                         {
                             self.set_page(Page::Activity);
                         }
@@ -1611,10 +1977,10 @@ impl Dashboard {
                 ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        self.hero(ui, s, palette);
-                        ui.add_space(design::GAP);
+                        self.hero(ui, s, &hero, palette);
+                        ui.add_space(4.0);
                         self.settings_strip(ui, s, palette);
-                        ui.add_space(design::GAP);
+                        ui.add_space(4.0);
                         if self.page == Page::Activity {
                             self.activity(ui, s, palette);
                         } else if s.config.advanced_settings_visible {
@@ -1655,13 +2021,17 @@ impl Dashboard {
         self.modal(ctx, s, palette);
     }
 }
+fn native_window(frame: &eframe::Frame) -> Option<HWND> {
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    match frame.window_handle().ok()?.as_raw() {
+        RawWindowHandle::Win32(handle) => Some(handle.hwnd.get() as HWND),
+        _ => None,
+    }
+}
 impl eframe::App for Dashboard {
     fn update(&mut self, ctx: &Context, frame: &mut eframe::Frame) {
-        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-        if let Ok(handle) = frame.window_handle()
-            && let RawWindowHandle::Win32(handle) = handle.as_raw()
-        {
-            self.owner = handle.hwnd.get() as HWND;
+        if let Some(owner) = native_window(frame) {
+            self.owner = owner;
         }
         let Ok(s) = self.shared.lock().map(|s| s.clone()) else {
             return;
@@ -1691,7 +2061,10 @@ impl eframe::App for Dashboard {
                         self.modal = Some(Modal::Verify);
                     }
                 }
-                UiRequest::Theme => self.theme = None,
+                UiRequest::Theme => {
+                    self.theme = None;
+                    self.chrome = None;
+                }
             }
         }
         if ctx.input(|i| i.viewport().close_requested()) && !self.stopping {
@@ -1839,25 +2212,79 @@ mod tests {
     fn pending_recovery_and_idle_do_not_claim_verified_pause_or_current_residency() {
         let mut s = fixture();
         s.activity = Activity::Recovery;
-        assert!(!hero(&s).paused);
-        assert_eq!(hero(&s).tone, Tone::Error);
+        assert_eq!(hero(&s).look, Look::Attention);
+        assert_ne!(hero(&s).title, "AI PAUSED");
         s.activity = Activity::Watching;
         s.pending = false;
         s.provider_statuses.clear();
-        assert!(hero(&s).hint.contains("not polled"));
-        assert!(!hero(&s).paused);
-        assert!(provider_status(&s)[0].0.contains("unpolled"));
+        assert_eq!(hero(&s).look, Look::Running);
+        // Idle text never states which models are loaded.
+        assert_eq!(provider_status(&s)[0].1, "Ready");
         s.provider_statuses = fixture().provider_statuses;
         s.provider_statuses[0].state = State::Restored;
-        assert!(
-            provider_status(&s)[0]
-                .0
-                .contains("current residency unpolled")
-        );
+        assert_eq!(provider_status(&s)[0].1, "Models restored");
         s.config.automation_enabled = false;
-        assert_eq!(hero(&s).title, "AUTO PAUSE OFF");
+        assert!(hero(&s).hint.contains("off"));
+        assert!(hero(&s).game.is_some());
         s.detection_ok = false;
-        assert!(hero(&s).reason.contains("not yet confirmed"));
+        assert!(hero(&s).game.is_none());
+    }
+    #[test]
+    fn every_activity_folds_into_one_of_four_looks() {
+        use Activity::*;
+        let mut s = fixture();
+        for (activity, look, title) in [
+            (Unknown, Look::Loading, "LOADING"),
+            (Watching, Look::Running, "AI RUNNING"),
+            (Observation, Look::Running, "AI RUNNING"),
+            (Coexistence, Look::Running, "AI RUNNING"),
+            (Paused, Look::Paused, "AI PAUSED"),
+            (ManualHold, Look::Paused, "AI PAUSED"),
+            (Countdown, Look::Paused, "AI PAUSED"),
+            (Capturing, Look::Loading, "LOADING"),
+            (WaitingForInference, Look::Loading, "LOADING"),
+            (Unloading, Look::Loading, "LOADING"),
+            (Restoring, Look::Loading, "LOADING"),
+            (Verifying, Look::Loading, "LOADING"),
+            (Unavailable, Look::Attention, "AI NEEDS ATTENTION"),
+            (DetectionUnavailable, Look::Attention, "AI NEEDS ATTENTION"),
+            (Recovery, Look::Attention, "AI NEEDS ATTENTION"),
+            (PartialFailure, Look::Attention, "AI NEEDS ATTENTION"),
+        ] {
+            s.activity = activity;
+            let hero = hero(&s);
+            assert_eq!((hero.look, hero.title), (look, title), "{activity:?}");
+        }
+        s.activity = Capturing;
+        s.provider_statuses[0].state = State::Restored;
+        assert_eq!(provider_status(&s)[0].1, "Pausing AI");
+        s.activity = Restoring;
+        s.provider_statuses[0].state = State::Paused;
+        assert_eq!(provider_status(&s)[0].1, "Resuming AI");
+        s.provider_statuses[0].state = State::Failed;
+        assert_eq!(provider_status(&s)[0].2, Tone::Error);
+    }
+    #[test]
+    fn columns_sort_both_ways_and_keep_name_order_within_ties() {
+        let mut s = fixture();
+        let path = s.games[3].path.clone();
+        set_ignored(&mut s.config, &path, true);
+        let names = |sort| {
+            let mut entries = rows(&s, Page::Games, "");
+            sort_rows(&mut entries, sort, false);
+            entries
+                .into_iter()
+                .map(|r| r.name.chars().take(7).collect::<String>())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names((0, true))[0], "Stardew");
+        assert_eq!(names((0, false))[0], "Trine 4");
+        assert_eq!(
+            names((1, true)),
+            ["The Las", "Stardew", "The Wit", "Trine 4"]
+        );
+        assert_eq!(names((2, true))[3], "Trine 4");
+        assert_eq!(names((2, false))[0], "Trine 4");
     }
     #[test]
     fn game_tables_filter_dedupe_and_preserve_exclusions() {
@@ -2012,7 +2439,7 @@ mod tests {
     #[test]
     fn all_pages_and_states_render_at_supported_sizes_and_dpi() {
         for dpi in [1.0, 1.25, 1.5, 1.75, 2.0] {
-            for size in [vec2(620.0, 580.0), vec2(1120.0, 920.0), vec2(1500.0, 960.0)] {
+            for size in [vec2(620.0, 580.0), vec2(1114.0, 848.0), vec2(1500.0, 960.0)] {
                 let mut d = dashboard(fixture());
                 let ctx = Context::default();
                 design::fonts(&ctx);
@@ -2083,6 +2510,7 @@ mod tests {
     #[test]
     #[ignore = "opens an isolated renderer window for visual review"]
     fn ui_design_review_snapshots() {
+        const STAGES: usize = 18;
         struct Review {
             d: Dashboard,
             stage: usize,
@@ -2090,7 +2518,11 @@ mod tests {
             start: Instant,
         }
         impl eframe::App for Review {
-            fn update(&mut self, ctx: &Context, _: &mut eframe::Frame) {
+            fn update(&mut self, ctx: &Context, frame: &mut eframe::Frame) {
+                // Exercise caption tinting on the isolated review window too.
+                if let Some(owner) = native_window(frame) {
+                    self.d.owner = owner;
+                }
                 assert!(
                     self.start.elapsed() < Duration::from_secs(60),
                     "Screenshot renderer timed out"
@@ -2120,12 +2552,12 @@ mod tests {
                     .unwrap();
                     self.stage += 1;
                     self.frames = 0;
-                    if self.stage == 15 {
+                    if self.stage == STAGES {
                         ctx.send_viewport_cmd(ViewportCommand::Close);
                         return;
                     }
                 }
-                if self.stage >= 15 {
+                if self.stage >= STAGES {
                     return;
                 }
                 let mut s = fixture();
@@ -2134,7 +2566,7 @@ mod tests {
                 let size = match self.stage {
                     1 => vec2(620.0, 580.0),
                     2 => vec2(1500.0, 960.0),
-                    _ => vec2(1120.0, 920.0),
+                    _ => vec2(1114.0, 848.0),
                 };
                 ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
                 match self.stage {
@@ -2171,6 +2603,22 @@ mod tests {
                         s.activity = Activity::PartialFailure;
                         s.config.appearance = crate::config::Appearance::Light;
                     }
+                    15 | 17 => {
+                        s.activity = Activity::Watching;
+                        s.pending = false;
+                        s.active_games.clear();
+                        s.restore_offer = None;
+                        s.provider_statuses[0].state = State::Restored;
+                        s.provider_statuses[0].pending = false;
+                        if self.stage == 17 {
+                            s.config.appearance = crate::config::Appearance::Light;
+                        }
+                    }
+                    16 => {
+                        s.activity = Activity::Capturing;
+                        s.pending = false;
+                        s.provider_statuses[0].state = State::Pausing;
+                    }
                     _ => (),
                 }
                 self.d.draw(ctx, &s);
@@ -2181,6 +2629,23 @@ mod tests {
                 ctx.request_repaint_after(Duration::from_millis(40));
             }
         }
+        /// Stand-in artwork, so the review shows icon tiles without reading any game.
+        fn tile(size: usize, seed: usize) -> ColorImage {
+            let tint = [[96, 168, 92], [70, 96, 150], [150, 132, 96], [60, 104, 190]][seed % 4];
+            let mut image = ColorImage::filled([size, size], Color32::BLACK);
+            for (index, pixel) in image.pixels.iter_mut().enumerate() {
+                let (x, y) = (index % size, index / size);
+                let shade = 0.55 + 0.45 * (x + y) as f32 / (2 * size) as f32;
+                let band = if (y * 5 / size + seed).is_multiple_of(2) {
+                    1.0
+                } else {
+                    0.82
+                };
+                let channel = |value: u8| (value as f32 * shade * band) as u8;
+                *pixel = Color32::from_rgb(channel(tint[0]), channel(tint[1]), channel(tint[2]));
+            }
+            image
+        }
         std::fs::create_dir_all("scratch/ui-review").unwrap();
         eframe::run_native(
             "GamePause isolated UI review",
@@ -2189,6 +2654,12 @@ mod tests {
                 design::fonts(&cc.egui_ctx);
                 let mut d = dashboard(fixture());
                 d.selected = Some(fixture().games[3].path.clone());
+                for (seed, game) in fixture().games.iter().enumerate() {
+                    for size in [64, 128] {
+                        d.icons
+                            .preload(&cc.egui_ctx, &game.path, size, tile(size as usize, seed));
+                    }
+                }
                 Ok(Box::new(Review {
                     d,
                     stage: 0,
@@ -2198,7 +2669,7 @@ mod tests {
             }),
         )
         .unwrap();
-        assert!(std::path::Path::new("scratch/ui-review/14.png").exists());
+        assert!(std::path::Path::new("scratch/ui-review/17.png").exists());
     }
 }
 

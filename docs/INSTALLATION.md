@@ -16,9 +16,11 @@ Download the setup EXE and `SHA256SUMS.txt` from [the same release](https://gith
 Get-FileHash .\GamePause-1.0.0-Setup.exe -Algorithm SHA256
 ```
 
-The default installation path is `%LOCALAPPDATA%\Programs\GamePause`. Setup creates Start menu shortcuts and a Windows Installed apps entry. **Start GamePause automatically when I sign in to Windows** is checked by default. The desktop shortcut is optional.
+The default installation path is `%LOCALAPPDATA%\Programs\GamePause`. Setup creates Start menu shortcuts and a Windows Installed apps entry. **Start GamePause in the system tray when I sign in to Windows** is checked by default. The desktop shortcut is optional.
 
-Automatic pausing is enabled on first run. Launch games normally; use the native dashboard to see discovery and session status. No mode switch or configuration edit is required. Configuration and recovery live separately in `%LOCALAPPDATA%\GamePause`.
+The last setup page offers **Start GamePause in the system tray**. It starts monitoring without opening a window: look for the GamePause icon in the notification area, which may be under the **^** overflow arrow. Left-click that icon, or use the Start menu or desktop shortcut, to open the dashboard.
+
+Automatic pausing is enabled on first run. Launch games normally; open the dashboard to see discovery and session status. No mode switch or configuration edit is required. Configuration and recovery live separately in `%LOCALAPPDATA%\GamePause`.
 
 ## Automatic startup
 

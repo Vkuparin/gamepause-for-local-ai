@@ -8,9 +8,9 @@
 
 GamePause is a small native Rust app for Windows. It notices when a game starts, saves the models currently loaded in LM Studio, unloads them, and restores them afterward. Experimental Ollama control is available by explicit opt-in and is off by default. The model name can change: there is no fixed model list to maintain.
 
-GamePause **1.5.0** was approved for publication on 2026-10-05 after the owner confirmed the app works. Download the installer or portable ZIP from [Releases](https://github.com/Vkuparin/gamepause-lmstudio/releases/tag/v1.5.0). See [Acceptance](docs/ACCEPTANCE.md) for the approval and evidence limits.
+GamePause **1.6.0** was published on 2026-10-06 at the owner's request. Download the installer or portable ZIP from [Releases](https://github.com/Vkuparin/gamepause-lmstudio/releases/tag/v1.6.0). See [Acceptance](docs/ACCEPTANCE.md) for the approval and evidence limits.
 
-The **v1.5.0 UI redesign** uses a Rust-native eframe dashboard and keeps the Win32 tray and existing control/recovery engine. See the [implementation journal](docs/UI_V1.5.0_JOURNAL.md) for validation and remaining acceptance limits.
+**v1.6.0** restyles the Rust-native eframe dashboard around four color-coded states, shows each game's executable icon, and makes the installer start GamePause in the tray. The Win32 tray and the control/recovery engine are unchanged. See the [changelog](CHANGELOG.md); the [v1.5.0 implementation journal](docs/UI_V1.5.0_JOURNAL.md) records the original dashboard redesign.
 
 ## Features
 
@@ -20,18 +20,18 @@ The **v1.5.0 UI redesign** uses a Rust-native eframe dashboard and keeps the Win
 - Stops LM Studio's HTTP server during gaming by default to prevent HTTP clients from immediately loading models again.
 - Waits 30 seconds after the last game exits. Starting another game cancels the delay; alt-tabbing keeps AI paused.
 - Keeps a durable recovery journal through partial failures and restarts.
-- Shows detected games, separate enabled-provider outcomes and command results. Confirmed gameplay Restore applies only to the approved live game instances.
+- Shows one of four color-coded states (AI running, AI paused, loading, needs attention), detected games with their executable icons, separate enabled-provider outcomes and command results. Confirmed gameplay Restore applies only to the approved live game instances.
 - Offers saved Advanced visibility, read-only provider diagnostics, separate sound/notification preferences, and native dark/light/high-contrast behavior.
 - Coordinates independent provider recovery while periodic game detection continues during blocked model operations.
 - Tests the full pause/restore round-trip on demand, with durable recovery on failure: capture, unload, confirm the server emptied, restore, and field-compare the read-back settings — from the dashboard, tray, or `GamePauseCLI.exe --verify`.
 - Escaped one-line-per-item CLI output for scripting: `--status` (key=value state), `--games` (name/launcher/path), plus read-only `--doctor` and disruptive `--verify`. Status, cached games, and doctor work alongside the GUI; verify requires it to be closed.
 - Includes a native dashboard, searchable games, live settings, tray controls, automatic startup at Windows sign-in, a per-user installer, and a portable ZIP.
 
-No Python runtime, administrator service, telemetry, recursive game scans, or permanent model-name configuration. Model control uses localhost.
+No Python runtime, administrator service, telemetry, artwork downloads, or permanent model-name configuration. Game detection never scans installation folders recursively; the open dashboard reads executable icons from a bounded two-level lookup. Model control uses localhost.
 
 ## Get started
 
-1. Download the **Setup.exe** from [Releases](https://github.com/Vkuparin/gamepause-lmstudio/releases) and install it. Startup at sign-in is checked by default.
+1. Download the **Setup.exe** from [Releases](https://github.com/Vkuparin/gamepause-lmstudio/releases) and install it. Startup at sign-in is checked by default. Setup starts GamePause in the system tray, without opening a window.
 2. Keep LM Studio open with the models you want available. Its `lms` CLI must be installed; GamePause finds it automatically. See [Installation](docs/INSTALLATION.md).
 3. Launch games normally. **Automatic pausing is on by default.** GamePause discovers supported launcher installations, saves and unloads your currently loaded models, and restores them after gaming.
 
@@ -62,7 +62,7 @@ GamePause keeps a durable recovery journal for every model it unloads, and that 
 
 On one Windows 11 / RTX 5090 PC with 16 logical CPUs, the installed v0.2.0 watcher used **14.1 MiB RAM** and **0.055% of total CPU capacity** during a 46-second Witcher 3 menu sample, including an inventory refresh. The dashboard was closed. This measures the watcher, not FPS or all machines. See [Validation](docs/VALIDATION.md).
 
-GamePause **1.0.0** is the stable release. Discovery is best effort. Protected processes and unconventional installations can require registering a game through the dashboard. Earlier Steam / Witcher 3 measurements remain historical; the owner reported human tests passed for the final 1.0.0 build. Other launcher adapters have metadata/fixture evidence, not complete gameplay sessions.
+Discovery is best effort. Protected processes and unconventional installations can require registering a game through the dashboard. Earlier Steam / Witcher 3 measurements remain historical; the owner reported human tests passed for the final 1.0.0 build. Other launcher adapters have metadata/fixture evidence, not complete gameplay sessions.
 
 Ollama has source and private protocol-fixture evidence, with no live-tested version range. Its supported subset is local GGUF completion models with verified identity/digest/context and finite observed expiry. It does not preserve all load options, parallelism, conversations or KV cache, start the service, download models or prevent later client reloads. [Limits and opt-in](docs/USAGE.md#background-ai-applications) and sanitized contributor live evidence remain explicit.
 

@@ -9,6 +9,7 @@ mod detection_worker;
 pub mod diagnostics;
 pub mod discovery;
 pub mod engine;
+mod game_icons;
 pub mod gameplay;
 pub mod lm_session;
 pub mod lmstudio;

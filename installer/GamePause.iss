@@ -1,5 +1,5 @@
 #ifndef AppVersion
-  #define AppVersion "1.5.0"
+  #define AppVersion "1.6.0"
 #endif
 
 [Setup]
@@ -29,20 +29,20 @@ RestartApplications=no
 SetupLogging=yes
 
 [Tasks]
-Name: "startup"; Description: "Start GamePause automatically when I sign in to Windows"; GroupDescription: "Startup:"
-Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"; Flags: unchecked
+Name: "startup"; Description: "Start GamePause in the system tray when I sign in to Windows"; GroupDescription: "Startup:"
+Name: "desktopicon"; Description: "Create a desktop shortcut that opens the dashboard"; GroupDescription: "Shortcuts:"; Flags: unchecked
 
 [Files]
 Source: "..\dist\GamePause\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{group}\GamePause"; Filename: "{app}\GamePause.exe"
+Name: "{group}\GamePause"; Filename: "{app}\GamePause.exe"; Comment: "Open the GamePause dashboard"
 Name: "{group}\Usage guide"; Filename: "{app}\docs\USAGE.md"
 Name: "{group}\Uninstall GamePause"; Filename: "{uninstallexe}"
-Name: "{userdesktop}\GamePause"; Filename: "{app}\GamePause.exe"; Tasks: desktopicon
+Name: "{userdesktop}\GamePause"; Filename: "{app}\GamePause.exe"; Comment: "Open the GamePause dashboard"; Tasks: desktopicon
 
 [Registry]
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "GamePause"; ValueData: """{app}\GamePause.exe"" --background"; Tasks: startup; Flags: uninsdeletevalue
 
 [Run]
-Filename: "{app}\GamePause.exe"; Description: "Launch GamePause (automatic pausing is enabled)"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\GamePause.exe"; Parameters: "--background"; Description: "Start GamePause in the system tray (automatic pausing is enabled)"; Flags: nowait postinstall skipifsilent
