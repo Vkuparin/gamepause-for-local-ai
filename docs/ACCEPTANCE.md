@@ -4,7 +4,7 @@
 
 The owner instructed "commit and publish v1.7.0" after receiving the slimmed tray menu, its check results and the list of unexercised behavior. This authorizes committing and publishing v1.7.0. The owner did not supply a test report for this build, so this record is a publication request, not a statement that the owner ran it.
 
-Automated checks passed: 262 library tests and 10 CLI integration tests, formatting, Clippy, the release resilience probe and the release build. The package verifier passed. One unrelated mock-HTTP engine test failed once during development and passed on every later run.
+Automated checks passed: 262 library tests and 10 CLI integration tests, formatting, Clippy, the release resilience probe and the release build. The package verifier passed. One Ollama mock-HTTP engine test failed once during development and once in the release workflow's first attempt because of a timing race in the test fixture; the workflow rerun of the same commit passed, and the fixture was corrected after the tag.
 
 Not exercised for v1.7.0: the new tray menu on a real desktop (appearance, width, keyboard and screen-reader traversal, high contrast), the ignored interactive popup test, the real application against LM Studio or Ollama, real games, Windows 10, install/upgrade/uninstall, startup, sleep/wake and multi-monitor behavior. Ollama remains experimental and off by default. Published SHA256SUMS.txt and BUILD-INFO.json identify the packaged artifacts; the release acceptance asset records this request separately from build-time review status. Earlier records below are historical.
 
