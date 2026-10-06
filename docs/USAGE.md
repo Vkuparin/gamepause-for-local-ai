@@ -4,7 +4,7 @@
 
 Keep LM Studio open and load whichever models you want available after gaming. Install GamePause and launch your games normally. Automatic pausing is enabled by default; there is no observation-mode setup or model-name list.
 
-GamePause discovers Steam, Epic, EA, Ubisoft Connect, Battle.net, and Xbox installations automatically. Small launcher inventories refresh every 30 seconds. A new unfamiliar process in a known Steam library requests an early metadata refresh. It does not classify arbitrary executables as games just because they are in that library. Xbox game folders and packages are looked for every five minutes while idle, on fixed local disks only; expensive refreshes defer during gaming.
+GamePause discovers Steam, Epic, GOG, EA, Ubisoft Connect, Battle.net, and Xbox installations automatically. Small launcher inventories refresh every 30 seconds. A new unfamiliar process in a known Steam library requests an early metadata refresh. It does not classify arbitrary executables as games just because they are in that library. Xbox game folders and packages are looked for every five minutes while idle, on fixed local disks only; expensive refreshes defer during gaming.
 
 When a recognized game starts, GamePause captures all loaded models and their settings before unloading. It uses the existing local server's port, or temporarily starts the server to capture settings and closes it again. The original server state is remembered. Known launchers, background utilities, installers, crash reporters, and anti-cheat helpers do not start gaming sessions.
 

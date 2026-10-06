@@ -198,6 +198,31 @@ fn reg_children(hive: usize, path: &str) -> Vec<(String, BTreeMap<String, String
         })
         .collect()
 }
+/// GOG registers each installed product under its product ID, written by
+/// Galaxy and by the offline installers alike. DLC has its own key naming the
+/// base game in `dependsOn`, and is not a game of its own.
+fn gog_games(rows: Vec<(String, BTreeMap<String, String>)>) -> Vec<Game> {
+    let filled = |v: &BTreeMap<String, String>, key: &str| {
+        v.get(key).filter(|value| !value.trim().is_empty()).cloned()
+    };
+    rows.into_iter()
+        .filter_map(|(id, v)| {
+            if filled(&v, "dependsOn").is_some() {
+                return None;
+            }
+            let folder = filled(&v, "path").map(PathBuf::from).or_else(|| {
+                Path::new(&filled(&v, "exe")?)
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .map(Path::to_path_buf)
+            })?;
+            let name = filled(&v, "gameName")
+                .or_else(|| Some(folder.file_name()?.to_str()?.to_owned()))
+                .unwrap_or_else(|| id.clone());
+            Some(Game::new("GOG", &id, &name, folder))
+        })
+        .collect()
+}
 #[derive(Default)]
 pub struct Discovery {
     pub steam_libraries: Vec<String>,
@@ -239,6 +264,7 @@ impl Discovery {
             ("Epic", self.epic(c)),
             ("EA", self.ea()),
             ("Ubisoft", self.ubisoft()),
+            ("GOG", self.gog()),
             ("Battle.net", self.battlenet()),
             ("Xbox", self.xbox(now, force, defer_packages)),
             ("Custom", Ok(self.custom(c))),
@@ -487,6 +513,12 @@ impl Discovery {
             })
         })
         .collect())
+    }
+    fn gog(&self) -> Result<Vec<Game>> {
+        Ok(gog_games(reg_children(
+            HKEY_LOCAL_MACHINE as usize,
+            r"SOFTWARE\GOG.com\Games",
+        )))
     }
     fn battlenet(&self) -> Result<Vec<Game>> {
         let mut games = vec![];
@@ -752,6 +784,46 @@ mod tests {
             "The Witcher 3",
             r"D:\Steam\Witcher"
         )));
+    }
+    #[test]
+    fn gog_registry_rows_become_games_and_dlc_is_skipped() {
+        let row = |id: &str, values: &[(&str, &str)]| {
+            (
+                id.to_owned(),
+                values
+                    .iter()
+                    .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                    .collect::<BTreeMap<_, _>>(),
+            )
+        };
+        let games = gog_games(vec![
+            row(
+                "1001",
+                &[
+                    ("gameName", "Fixture Quest"),
+                    ("path", r"D:\GOG\Fixture Quest"),
+                    ("exe", r"D:\GOG\Fixture Quest\bin\quest.exe"),
+                    ("dependsOn", ""),
+                ],
+            ),
+            row(
+                "1002",
+                &[
+                    ("gameName", "Fixture Quest: Expansion"),
+                    ("path", r"D:\GOG\Fixture Quest"),
+                    ("dependsOn", "1001"),
+                ],
+            ),
+            row("1003", &[("exe", r"D:\GOG\Second Game\second.exe")]),
+            row("1004", &[("gameName", "No location")]),
+        ]);
+        assert_eq!(
+            games,
+            vec![
+                Game::new("GOG", "1001", "Fixture Quest", r"D:\GOG\Fixture Quest"),
+                Game::new("GOG", "1003", "Second Game", r"D:\GOG\Second Game"),
+            ]
+        );
     }
     #[test]
     fn path_boundaries() {

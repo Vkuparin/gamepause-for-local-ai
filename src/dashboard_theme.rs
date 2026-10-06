@@ -448,6 +448,11 @@ pub fn platform(painter: &Painter, rect: Rect, launcher: &str, palette: Palette)
                 painter.circle_stroke(p(x, 0.5), rect.width() * 0.3, stroke);
             }
         }
+        // A ringed planet.
+        "GOG" => {
+            painter.circle_stroke(p(0.5, 0.5), rect.width() * 0.3, stroke);
+            line(vec![p(0.0, 0.78), p(1.0, 0.22)]);
+        }
         // Crossed blades.
         "Battle.net" => {
             line(vec![p(0.05, 0.95), p(0.95, 0.05)]);

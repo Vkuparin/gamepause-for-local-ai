@@ -14,7 +14,7 @@ GamePause is a small native Windows tray app. When a game starts, it saves what 
 
 ## What it does
 
-- **Pauses AI when a game starts.** Games from Steam, Epic, Xbox, EA, Ubisoft Connect and Battle.net are found automatically. Add anything else from **Running apps** or with **Add game...**.
+- **Pauses AI when a game starts.** Games from Steam, Epic, GOG, Xbox, EA, Ubisoft Connect and Battle.net are found automatically. Add anything else from **Running apps** or with **Add game...**.
 - **Restores it when you are done.** 30 seconds after the last game exits, your models come back. Starting another game cancels the countdown; alt-tabbing does not end the pause.
 - **LM Studio, restored exactly.** Every loaded LLM and embedding model returns with the same identifier, variant, TTL and load configuration, and the result is verified. The local server is stopped while you play, so clients cannot load models back in, and returned to its original state afterward.
 - **Ollama, when it is running.** Local models are unloaded. GGUF completion models are reloaded with their context and the keep-alive time they had left. If Ollama is not running, nothing happens and nothing is reported as an error.

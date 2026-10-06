@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.3.0 — 2026-10-07
+
+- GOG games are found automatically, whether they were installed through GOG Galaxy or with a GOG offline installer. DLC is not listed as a game of its own.
+
+Checked on one Windows 11 PC with two games installed through GOG Galaxy, one of them with DLC. Not yet tested: a game installed with a GOG offline installer.
+
 ## 2.2.1 — 2026-10-07
 
 - Task Manager and the program file's properties now show **GamePause for Local AI**. They still showed the old name, GamePause for LM Studio.
