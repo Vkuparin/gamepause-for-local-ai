@@ -41,6 +41,10 @@ Source: "..\dist\GamePause\*"; DestDir: "{app}"; Flags: ignoreversion recursesub
 ; Shortcuts created under the pre-2.1.0 name.
 Type: filesandordirs; Name: "{userprograms}\GamePause for LM Studio"
 Type: files; Name: "{userdesktop}\GamePause.lnk"
+; Files earlier versions installed that are no longer shipped.
+Type: files; Name: "{app}\GamePauseCLI.exe"
+Type: files; Name: "{app}\docs\ACCEPTANCE.md"
+Type: files; Name: "{app}\docs\UI_V1.5.0_JOURNAL.md"
 
 [Icons]
 Name: "{group}\GamePause for Local AI"; Filename: "{app}\GamePause.exe"; Comment: "Open the GamePause dashboard"
