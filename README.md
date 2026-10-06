@@ -4,85 +4,93 @@
 [![MIT](https://img.shields.io/badge/license-MIT-155e75.svg)](LICENSE)
 [![Windows x64](https://img.shields.io/badge/platform-Windows_x64-155e75.svg)](docs/INSTALLATION.md)
 
-**Give your games room. Bring your local AI back afterward.**
+**Give your games the VRAM. Get your local AI back afterward.**
 
-GamePause is a small native Rust app for Windows. It notices when a game starts, saves the models currently loaded in LM Studio, unloads them, and restores them afterward. It does the same for Ollama when Ollama is running. The model name can change: there is no fixed model list to maintain.
+GamePause is a small native Windows tray app. When a game starts, it saves what LM Studio and Ollama have loaded, unloads it, and puts everything back after you stop playing. There is no model list to maintain and nothing to configure first.
 
-GamePause **2.0.0** was published on 2026-10-06 at the owner's request. Download the installer or portable ZIP from [Releases](https://github.com/Vkuparin/gamepause-lmstudio/releases/tag/v2.0.0). See [Acceptance](docs/ACCEPTANCE.md) for the approval and evidence limits.
+![GamePause dashboard, dark theme: AI paused while a game runs](docs/images/dashboard-dark.png)
 
-**v2.0.0** makes Ollama a regular provider that works whenever it is running, and treats a missing AI app as nothing to pause instead of an error. It adds other AI apps that can be stopped and restarted by program file, per-game **Ask** rules, a system-wide Pause/Resume shortcut, suggestions for games GamePause does not know, and a rough figure for the memory a pause freed. Settings move to version 4 with an automatic, backed-up migration. See the [changelog](CHANGELOG.md); the [v1.5.0 implementation journal](docs/UI_V1.5.0_JOURNAL.md) records the original dashboard redesign and [Roadmap](docs/ROADMAP.md) lists ideas kept for later.
+**[Download the latest release](https://github.com/Vkuparin/gamepause-lmstudio/releases/latest)** (installer or portable ZIP) · [Changelog](CHANGELOG.md) · [Installation guide](docs/INSTALLATION.md)
 
-## Features
+## What it does
 
-- Discovers Steam, Epic, Xbox, EA, Ubisoft Connect, and Battle.net installations. Local inventories refresh every 30 seconds. Xbox package discovery refreshes every five minutes and defers during gaming.
-- Checks running processes every two seconds using Windows APIs and cached executable paths. Desktop shortcuts work too.
-- Captures loaded LLM and embedding instances, exact model selections, identifiers, TTL policies, and complete load configuration. Restoration verifies the settings.
-- Pauses Ollama too when it is running: unloads its local models and reloads completion models with the keep-alive time they had left.
-- Stops and restarts other local AI servers you choose by program file, such as llama.cpp or KoboldCpp (not yet tested with those tools).
-- Per-game rules (pause, ignore or ask), an optional system-wide Pause/Resume shortcut, and suggestions for fullscreen programs that look like unregistered games.
-- Stops LM Studio's HTTP server during gaming by default to prevent HTTP clients from immediately loading models again.
-- Waits 30 seconds after the last game exits. Starting another game cancels the delay; alt-tabbing keeps AI paused.
-- Keeps a durable recovery journal through partial failures and restarts.
-- Shows one of four color-coded states (AI running, AI paused, loading, needs attention), detected games with their executable icons, separate enabled-provider outcomes and command results. Confirmed gameplay Restore applies only to the approved live game instances.
-- Offers saved Advanced visibility, read-only provider diagnostics, separate sound/notification preferences, and native dark/light/high-contrast behavior.
-- Coordinates independent provider recovery while periodic game detection continues during blocked model operations.
-- Tests the full pause/restore round-trip on demand, with durable recovery on failure: capture, unload, confirm the server emptied, restore, and field-compare the read-back settings — from the dashboard or `GamePauseCLI.exe --verify`.
-- Escaped one-line-per-item CLI output for scripting: `--status` (key=value state), `--games` (name/launcher/path), plus read-only `--doctor` and disruptive `--verify`. Status, cached games, and doctor work alongside the GUI; verify requires it to be closed.
-- Includes a native dashboard, searchable games, live settings, tray controls, automatic startup at Windows sign-in, a per-user installer, and a portable ZIP.
+- **Pauses AI when a game starts.** Games from Steam, Epic, Xbox, EA, Ubisoft Connect and Battle.net are found automatically. Add anything else from **Running apps** or with **Add game...**.
+- **Restores it when you are done.** 30 seconds after the last game exits, your models come back. Starting another game cancels the countdown; alt-tabbing does not end the pause.
+- **LM Studio, restored exactly.** Every loaded LLM and embedding model returns with the same identifier, variant, TTL and load configuration, and the result is verified. The local server is stopped while you play, so clients cannot load models back in, and returned to its original state afterward.
+- **Ollama, when it is running.** Local models are unloaded. GGUF completion models are reloaded with their context and the keep-alive time they had left. If Ollama is not running, nothing happens and nothing is reported as an error.
+- **Other AI servers.** Pick a program file, such as `llama-server.exe` or `koboldcpp.exe`, and GamePause stops it for gaming and starts it again with the same command line. Not yet tested with those tools themselves.
+- **A rule per game.** **On** pauses automatically, **Off** ignores the game, **Ask** leaves AI running and offers a one-click pause.
+- **Manual control.** **Pause AI** and **Resume AI** in the dashboard and tray, plus an optional system-wide shortcut that works inside games.
+- **Recovery that survives crashes.** What was unloaded is written to disk before anything changes. If GamePause or the PC goes down mid-pause, start GamePause again and it finishes the job.
 
-No Python runtime, administrator service, telemetry, artwork downloads, or permanent model-name configuration. Game detection never scans installation folders recursively; the open dashboard reads executable icons from a bounded two-level lookup. Model control uses localhost.
+It is local only: no telemetry, no downloads, no administrator service, and model control stays on localhost.
+
+## One window, four states
+
+The status card always shows one of four color-coded states: **AI running** (blue), **AI paused** (orange), **Loading** (yellow) and **AI needs attention** (red). Below it are one line per AI app, the game that triggered the pause, and roughly how much memory was freed.
+
+![GamePause dashboard, light theme: AI running and watching for games](docs/images/dashboard-light.png)
+
+Light, dark and Windows high-contrast themes are supported, and the dashboard follows your Windows setting by default. **Advanced** holds the connection settings, detection options, the shortcut, read-only diagnostics and a round-trip test that pauses and restores your live models on request.
+
+## Quick controls in the tray
+
+Closing the window leaves GamePause watching from the tray. Left-click the icon to open the dashboard, or right-click for the current state and the quick controls.
+
+![GamePause tray menu](docs/images/tray-menu.png)
 
 ## Get started
 
-1. Download the **Setup.exe** from [Releases](https://github.com/Vkuparin/gamepause-lmstudio/releases) and install it. Startup at sign-in is checked by default. Setup starts GamePause in the system tray, without opening a window.
-2. Keep LM Studio open with the models you want available. Its `lms` CLI must be installed; GamePause finds it automatically. See [Installation](docs/INSTALLATION.md).
-3. Launch games normally. **Automatic pausing is on by default.** GamePause discovers supported launcher installations, saves and unloads your currently loaded models, and restores them after gaming.
+1. Download **Setup.exe** from [Releases](https://github.com/Vkuparin/gamepause-lmstudio/releases) and install it. GamePause starts in the tray and, by default, at Windows sign-in.
+2. Use LM Studio or Ollama as usual. For LM Studio, its `lms` command-line tool must be installed; GamePause finds it on its own.
+3. Play. Automatic pausing is on from the first launch.
 
-Left-click the tray icon or open GamePause from Start to see its dashboard. The **Games** list shows what was discovered and what is running. Newly installed games become available automatically; no observation-mode trial, tooltip inspection, JSON edit, restart, or fixed model list is needed. If a game is missed, use **Running apps → Add as game**, or **Add game…** to select its executable.
+If a game is not recognized, open **Running apps** while it runs and choose **Add as game**. GamePause also points out fullscreen programs that look like games it does not know.
 
-You do not need to start LM Studio's HTTP server manually. GamePause uses an already-running server's port, or temporarily opens the local server to capture loaded model settings, then returns it to its original state. Automatic-pausing, startup, exclusions, and optional connection/delay settings are controlled in the app.
+The installer and executables are unsigned, so Windows may show a publisher warning. Download from this repository and compare the SHA-256 checksums published with each release.
 
-Round-trip testing unloads/reloads your current models. Close games and finish inference first. It refuses observation mode or existing recovery, and retains unfinished restoration for retry.
+## Good to know
 
-Quit retains pending recovery for the next active run. Finish restoration before uninstalling. The installer and executables are currently unsigned; Windows may show a publisher warning. Download from this repository and compare the supplied SHA-256 checksums.
+- **Busy models wait.** If a model is generating when a game starts, unloading waits until it finishes. Stop long-running agents before playing if you need the memory right away.
+- **Ollama restores a subset.** Embedding models and models with unknown format are unloaded but not reloaded; load options, parallelism and conversations are not preserved. Tested with Ollama 0.35.1 only. [Details](docs/USAGE.md#background-ai-applications).
+- **LM Studio updates can need a GamePause update.** Full settings restoration uses LM Studio's internal protocol. Run `GamePauseCLI.exe --doctor` after upgrading LM Studio. If a complete snapshot cannot be captured, GamePause refuses to unload.
+- **Quitting keeps a pending restore.** Models paused when you quit come back the next time GamePause runs. Restore before uninstalling.
+- **Detection is best effort.** Protected processes and unusual installations may need to be added by hand.
 
-## Recovery
+## For scripts
 
-GamePause keeps a durable recovery journal for every model it unloads, and that journal survives a crash, a failed restore, and a restart. **If GamePause disappears while a pause is still pending — a crash, a power cut, or you closing the app mid-pause — just start it again.** On startup it reloads the journal, and as soon as the game is no longer running it resumes the restore: your models come back the same way they did before you played. You do not need to do anything else. If a restore does fail, GamePause never deletes the journal — it shows "Restore failed — AI not restored, click Restore" and lets you retry. See [Usage and recovery](docs/USAGE.md) for the full crash-recovery walkthrough.
+`GamePauseCLI.exe` prints stable, one-line-per-item output:
+
+| Command | Output |
+|---|---|
+| `--status` | Current state as `key=value` lines, safe to run beside the app |
+| `--games` | Known games as `name<TAB>launcher<TAB>path` |
+| `--doctor` | Read-only report on LM Studio, Ollama and the data folder |
+| `--verify` | Round-trip test: unload, confirm, restore, compare settings. Close the app first |
+| `--restore` | Retry a pending restore with the app closed |
 
 ## Documentation
 
 | Guide | Covers |
 |---|---|
 | [Installation](docs/INSTALLATION.md) | Installer, portable use, prerequisites, startup, upgrades, uninstall |
-| [Usage and recovery](docs/USAGE.md) | Session behavior, manual controls, crash recovery |
+| [Usage and recovery](docs/USAGE.md) | Session behavior, manual controls, crash recovery, CLI |
 | [Configuration](docs/CONFIGURATION.md) | Every setting, custom games, exclusions |
 | [Troubleshooting](docs/TROUBLESHOOTING.md) | Diagnostics and common failures |
-| [Validation](docs/VALIDATION.md) | Live Witcher 3 test, overhead, coverage limits |
-| [Development](docs/DEVELOPMENT.md) | Build, architecture, safety, packaging |
-
-## Performance and compatibility
-
-On one Windows 11 / RTX 5090 PC with 16 logical CPUs, the installed v0.2.0 watcher used **14.1 MiB RAM** and **0.055% of total CPU capacity** during a 46-second Witcher 3 menu sample, including an inventory refresh. The dashboard was closed. This measures the watcher, not FPS or all machines. See [Validation](docs/VALIDATION.md).
-
-Discovery is best effort. Protected processes and unconventional installations can require registering a game through the dashboard. Earlier Steam / Witcher 3 measurements remain historical; the owner reported human tests passed for the final 1.0.0 build. Other launcher adapters have metadata/fixture evidence, not complete gameplay sessions.
-
-Ollama needs no setup: it is used when it is running and ignored when it is not. It was tested with Ollama 0.35.1. GamePause unloads all local Ollama models for gaming and reloads local GGUF completion models with their identity/digest, context and the keep-alive time left when the pause began; other local models are unloaded without reload. It does not preserve all load options, parallelism, conversations or KV cache, start the service, download models or prevent later client reloads. [Limits](docs/USAGE.md#background-ai-applications).
-
-Complete settings preservation currently requires LM Studio's internal WebSocket protocol alongside its CLI and native REST API. Protocol changes can require a GamePause update. Run `GamePauseCLI.exe --doctor` after upgrading LM Studio. If a recoverable snapshot cannot be captured, GamePause refuses to unload. It does not launch LM Studio or supervise clients that independently restart its server.
-
-Active inference defers unloading until idle. Pause continuously running AI agents before gaming if you need VRAM released promptly.
+| [Validation](docs/VALIDATION.md) | What was tested live, measured overhead, coverage limits |
+| [Development](docs/DEVELOPMENT.md) | Build, architecture, safety rules, packaging |
 
 ## Build and contribute
 
-Windows x64, the pinned Rust toolchain, and Visual Studio C++ Build Tools are required:
+Windows x64, the pinned Rust toolchain and Visual Studio C++ Build Tools are required:
 
 ```powershell
 cargo test --locked
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo build --locked --release
-.\target\release\GamePauseCLI.exe --doctor
 ```
 
-See [Contributing](CONTRIBUTING.md) and [Security](SECURITY.md). Free under the [MIT license](LICENSE); binary distributions include dependency licenses. Independent community project, unaffiliated with LM Studio or launcher vendors.
+See [Contributing](CONTRIBUTING.md), [Security](SECURITY.md) and the [roadmap](docs/ROADMAP.md). Free under the [MIT license](LICENSE); binary distributions include dependency licenses. GamePause is an independent community project, not affiliated with LM Studio, Ollama or any launcher vendor.
+
+Screenshots show fictional sample data.
