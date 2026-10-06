@@ -47,6 +47,13 @@ Closing the window leaves GamePause watching from the tray. Left-click the icon 
 
 If a game is not recognized, open **Running apps** while it runs and choose **Add as game**. GamePause also points out fullscreen programs that look like games it does not know.
 
+Prefer a package manager? With [Scoop](https://scoop.sh):
+
+```powershell
+scoop bucket add gamepause https://github.com/Vkuparin/gamepause-for-local-ai
+scoop install gamepause
+```
+
 The installer and executables are unsigned, so Windows may show a publisher warning. Download from this repository and compare the SHA-256 checksums published with each release.
 
 ## Good to know

@@ -178,6 +178,7 @@ CI runs formatting, tests, Clippy and the release resilience probe on every bran
 2. Add a `## <version> — <date>` section to `CHANGELOG.md`. It becomes the release notes verbatim, so write it for users and include anything known to be untested that they should hear about.
 3. Run the quality gates, commit and push to `main`, and wait for CI.
 4. Tag the commit `v<version>` and push the tag.
+5. After the release is published, set `version` and the ZIP `hash` (from the release's `SHA256SUMS.txt`) in `bucket/gamepause.json`, the Scoop manifest, and push.
 
 The release workflow then runs the tests, builds the installer and portable ZIP, runs `scripts/verify_release.ps1` (checksums, version metadata, default preferences, dependency license texts, no internal or runtime files in the archive) and publishes the GitHub release with the installer, ZIP, `SHA256SUMS.txt` and `BUILD-INFO.json`. It refuses a tag that does not match the package version or a version with no changelog section. Nothing is uploaded by hand. A manual run of the workflow builds the same packages as a workflow artifact without publishing. Binaries are unsigned. Release only when asked to.
 
