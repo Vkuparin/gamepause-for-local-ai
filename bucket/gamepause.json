@@ -1,5 +1,5 @@
 {
-    "version": "2.2.0",
+    "version": "2.2.1",
     "description": "Pauses LM Studio, Ollama and other local AI servers while you game, and restores them afterward.",
     "homepage": "https://github.com/Vkuparin/gamepause-for-local-ai",
     "license": "MIT",
@@ -9,8 +9,8 @@
     ],
     "architecture": {
         "64bit": {
-            "url": "https://github.com/Vkuparin/gamepause-for-local-ai/releases/download/v2.2.0/GamePause-2.2.0-windows-x64.zip",
-            "hash": "b676db1ab6192d8d7799b0df7937916cd4356539b3d7efde2a1e47c1fb51557e"
+            "url": "https://github.com/Vkuparin/gamepause-for-local-ai/releases/download/v2.2.1/GamePause-2.2.1-windows-x64.zip",
+            "hash": "4827cf2eb2f6b8f1b2520fe84f0b293d2a74a3e0404609ab5f7e9b79aa2ffabe"
         }
     },
     "extract_dir": "GamePause",
