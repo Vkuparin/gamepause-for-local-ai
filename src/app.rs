@@ -11,12 +11,14 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
+#[cfg(test)]
+use std::time::SystemTime;
 use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc},
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 
 #[derive(Clone, Debug)]
@@ -56,6 +58,13 @@ pub enum Action {
     Appearance(crate::config::Appearance),
 }
 impl Action {
+    /// The user chose to pause for the running "ask" games.
+    fn answers_ask(&self) -> bool {
+        match self {
+            Action::Tracked { action, .. } => action.answers_ask(),
+            action => matches!(action, Action::PauseForGame),
+        }
+    }
     fn changes_settings(&self) -> bool {
         matches!(
             self,
@@ -341,7 +350,7 @@ fn format_status(status: &Value) -> String {
         output.push_str("\nprovider_evidence=cached_status");
         for provider in providers {
             // Keys come from known provider kinds, never from arbitrary IDs.
-            let Some(kind @ ("lmstudio" | "ollama")) = provider["kind"].as_str() else {
+            let Some(kind @ ("lmstudio" | "ollama" | "process")) = provider["kind"].as_str() else {
                 continue;
             };
             for key in [
@@ -434,7 +443,7 @@ pub fn main(console: bool) -> Result<()> {
     }
     if args.help {
         println!(
-            "GamePause for LM Studio and Ollama\n--headless --active --observe --duration SECONDS\n--doctor --discover --restore --verify --status --games --data-dir PATH\nDefault: automatic pausing with a native dashboard. --background starts in the tray. --observe is a diagnostic override. --verify unloads/reloads LM Studio models using durable recovery; close games and the GUI first. --doctor never starts/stops the server or unloads models. --status/--games print stable, parseable one-line-per-item output for scripting. Ollama is used when it is running and ignored when it is not; turn it off in Advanced settings or its enabled config field. Tested with Ollama 0.35.1. Local GGUF completion models are restored with their identity, context and the keep-alive time left at pause; other local models are unloaded without reload; full load options and conversations are not preserved."
+            "GamePause: pauses local AI for games\n--headless --active --observe --duration SECONDS\n--doctor --discover --restore --verify --status --games --data-dir PATH\nDefault: automatic pausing with a native dashboard. --background starts in the tray. --observe is a diagnostic override. --verify unloads/reloads the models LM Studio and Ollama have loaded, using durable recovery; close games and the GUI first. --doctor never starts/stops the server or unloads models. --status/--games print stable, parseable one-line-per-item output for scripting. Ollama is used when it is running and ignored when it is not; turn it off in Advanced settings or its enabled config field. Tested with Ollama 0.35.1. Local GGUF completion models are restored with their identity, context and the keep-alive time left at pause; other local models are unloaded without reload; full load options and conversations are not preserved."
         );
         return Ok(());
     }
@@ -497,7 +506,6 @@ pub fn main(console: bool) -> Result<()> {
         Ok(lock) => lock,
         Err(e) => {
             if !args.headless
-                && !args.doctor
                 && !args.discover
                 && !args.restore
                 && !args.verify
@@ -523,13 +531,7 @@ pub fn main(console: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
-    let backend = LMStudio::new(config.clone());
-    let backend = OptionalBackend {
-        claims: Default::default(),
-        backend: backend.ok(),
-        config: config.clone(),
-        folder: Some(folder.clone()),
-    };
+    let backend = OptionalBackend::new(config.clone(), Some(folder.clone()));
     let mut engine = Engine::new(config.clone(), backend, folder.join("state.json"))?;
     if args.restore || args.verify {
         if config.mode != "active" {
@@ -655,11 +657,45 @@ struct OptionalBackend {
     claims: crate::ownership::SharedClaims,
     config: Config,
     folder: Option<PathBuf>,
+    /// When the CLI was last looked for and not found, and why.
+    missing: Option<(Instant, String)>,
 }
+/// How long a failed search for the LM Studio CLI stands before the disks are
+/// asked again. The watcher asks whether it is installed on every tick.
+const LMS_SEARCH_INTERVAL: Duration = Duration::from_secs(30);
 impl OptionalBackend {
+    fn new(config: Config, folder: Option<PathBuf>) -> Self {
+        Self {
+            backend: None,
+            claims: Default::default(),
+            config,
+            folder,
+            missing: None,
+        }
+    }
+    /// Forget the transport and any failed search, after a settings change.
+    fn reset(&mut self, config: Config) {
+        self.config = config;
+        self.backend = None;
+        self.missing = None;
+    }
     fn get(&mut self) -> Result<&mut LMStudio> {
         if self.backend.is_none() {
-            self.backend = Some(LMStudio::new(self.config.clone())?);
+            if let Some((at, error)) = &self.missing
+                && at.elapsed() < LMS_SEARCH_INTERVAL
+            {
+                bail!("{error}");
+            }
+            match LMStudio::new(self.config.clone()) {
+                Ok(backend) => {
+                    self.missing = None;
+                    self.backend = Some(backend);
+                }
+                Err(error) => {
+                    self.missing = Some((Instant::now(), format!("{error:#}")));
+                    return Err(error);
+                }
+            }
         }
         let backend = self.backend.as_mut().unwrap();
         backend.use_claims(self.claims.clone());
@@ -739,7 +775,7 @@ fn apply_action_detected(
         let action = *action;
         let settings = action.changes_settings();
         let refresh = matches!(action, Action::Refresh);
-        let before = serde_json::to_value(&engine.config)?;
+        let before = engine.config.clone();
         let waiting = match action {
             Action::Pause => Some(Waiting::Pause),
             Action::Restore | Action::ConfirmedRestore { .. } | Action::RetryGameplayRestore => {
@@ -761,6 +797,7 @@ fn apply_action_detected(
             Action::Doctor => {
                 "Read-only diagnostics finished; see Advanced provider details.".into()
             }
+            Action::PauseForGame => "Pausing AI for this game.".into(),
             _ => "Command completed.".into(),
         };
         let gameplay = matches!(
@@ -847,7 +884,7 @@ fn apply_action_detected(
             } else if let Some(waiting) = waiting {
                 shared.commands.waiting = Some((id, waiting));
             } else {
-                let unchanged = settings && before == serde_json::to_value(&engine.config)?;
+                let unchanged = settings && before == engine.config;
                 shared.commands.update(
                     id,
                     if unchanged {
@@ -998,8 +1035,7 @@ fn apply_action_detected(
                 {
                     engine.backend.claims = Default::default();
                 }
-                engine.backend.config = (*updated).clone();
-                engine.backend.backend = None;
+                engine.backend.reset((*updated).clone());
                 engine.config = *updated;
                 engine.settings_changed();
                 *scanner = replacement;
@@ -1201,10 +1237,7 @@ pub fn remove_custom(config: &Config, path: &str, name: &str) -> Result<Config> 
     let index = config
         .extra_games
         .iter()
-        .position(|game| {
-            crate::discovery::canonical(&game.path) == crate::discovery::canonical(path)
-                && game.name == name
-        })
+        .position(|game| crate::discovery::same_path(&game.path, path) && game.name == name)
         .context("Selected custom game changed or was removed; select it again")?;
     let mut updated = config.clone();
     updated.extra_games.remove(index);
@@ -1222,9 +1255,10 @@ fn evidence_from(
         .filter(|game| {
             let name = game.executable.rsplit(['\\', '/']).next().unwrap_or("");
             !trigger_scanner.excluded(name, &game.executable)
-                && !config.ignored_games.iter().any(|path| {
-                    crate::discovery::canonical(path) == crate::discovery::canonical(&game.path)
-                })
+                && !config
+                    .ignored_games
+                    .iter()
+                    .any(|path| crate::discovery::same_path(path, &game.path))
                 && (ask_approved || !config.asks(&game.path))
         })
         .cloned()
@@ -1330,9 +1364,10 @@ fn recovery_games(engine: &Engine<OptionalBackend>, games: &[Game]) -> Vec<Game>
     let mut known = games.to_vec();
     let approved = engine.gameplay.remembered_games();
     for game in engine.remembered_games.iter().chain(approved.iter()) {
-        if !known.iter().any(|g| {
-            crate::discovery::canonical(&g.path) == crate::discovery::canonical(&game.path)
-        }) {
+        if !known
+            .iter()
+            .any(|g| crate::discovery::same_path(&g.path, &game.path))
+        {
             known.push(game.clone());
         }
     }
@@ -1382,7 +1417,7 @@ struct DetectionInput {
 #[derive(Clone)]
 struct DetectionFrame {
     power_generation: u64,
-    config: Value,
+    config: Config,
     /// Running "ask" games, answered or not.
     asking: Vec<String>,
     /// A fullscreen program nothing recognises, once it has stayed in front.
@@ -1399,7 +1434,7 @@ struct DetectionFrame {
 const SUGGEST_AFTER_SCANS: u32 = 5;
 struct NativeDetection {
     power_generation: u64,
-    config: Value,
+    config: Config,
     scanner: Scanner,
     guard: Scanner,
     candidate: u64,
@@ -1410,7 +1445,7 @@ impl NativeDetection {
     fn new(config: &Config) -> Result<Self> {
         Ok(Self {
             power_generation: 0,
-            config: serde_json::to_value(config)?,
+            config: config.clone(),
             scanner: Scanner::new(config.clone())?,
             guard: recovery_scanner(config)?,
             candidate: 0,
@@ -1421,13 +1456,12 @@ impl NativeDetection {
         if !input.power.permits(input.power_generation) {
             bail!("Power state changed; fresh post-resume detection required");
         }
-        let config = serde_json::to_value(&input.config)?;
-        if config != self.config || self.power_generation != input.power_generation {
+        if input.config != self.config || self.power_generation != input.power_generation {
             let scanner = Scanner::new(input.config.clone())?;
             let guard = recovery_scanner(&input.config)?;
             self.scanner = scanner;
             self.guard = guard;
-            self.config = config.clone();
+            self.config = input.config.clone();
             self.power_generation = input.power_generation;
         }
         let scanned = self.scanner.scan(&input.games)?;
@@ -1458,9 +1492,7 @@ impl NativeDetection {
                     .dismissed_suggestions
                     .iter()
                     .chain(&input.config.ignored_games)
-                    .any(|known| {
-                        crate::discovery::canonical(known) == crate::discovery::canonical(path)
-                    })
+                    .any(|known| crate::discovery::same_path(known, path))
             });
         let all = if input.guarded {
             self.guard.scan(&input.guard_games)?
@@ -1476,9 +1508,12 @@ impl NativeDetection {
         let active = scanned
             .into_iter()
             .filter(|game| {
-                !input.config.ignored_games.iter().any(|path| {
-                    crate::discovery::canonical(path) == crate::discovery::canonical(&game.path)
-                }) && (input.ask_approved || !input.config.asks(&game.path))
+                !input
+                    .config
+                    .ignored_games
+                    .iter()
+                    .any(|path| crate::discovery::same_path(path, &game.path))
+                    && (input.ask_approved || !input.config.asks(&game.path))
             })
             .collect();
         let evidence = (input.ready
@@ -1498,7 +1533,7 @@ impl NativeDetection {
         }
         Ok(DetectionFrame {
             power_generation: input.power_generation,
-            config,
+            config: input.config.clone(),
             asking,
             suggestion,
             active,
@@ -1525,8 +1560,7 @@ fn publish_detection(state: &SharedState, result: &std::result::Result<Detection
         match result {
             Ok(frame)
                 if shared.power.permits(frame.power_generation)
-                    && serde_json::to_value(&shared.config).ok().as_ref()
-                        == Some(&frame.config) =>
+                    && shared.config == frame.config =>
             {
                 shared.detection_ok = frame.evidence.is_some();
                 shared.active_games = frame.all.clone();
@@ -1540,8 +1574,10 @@ fn publish_detection(state: &SharedState, result: &std::result::Result<Detection
                             !frame.all.iter().any(|current| {
                                 current.pid == game.pid
                                     && current.created_at == game.created_at
-                                    && crate::discovery::canonical(&current.executable)
-                                        == crate::discovery::canonical(&game.executable)
+                                    && crate::discovery::same_path(
+                                        &current.executable,
+                                        &game.executable,
+                                    )
                             })
                         })
                 }) {
@@ -1780,6 +1816,8 @@ fn run(
                 quit = true;
                 break;
             }
+            // Honoured wherever it sits in the queue, tracked or not.
+            ask_approved |= action.answers_ask();
             if let Action::Tracked { id, action } = &action
                 && matches!(action.as_ref(), Action::Refresh)
                 && let Ok(mut shared) = state.lock()
@@ -1815,7 +1853,6 @@ fn run(
         if power.snapshot().suspended {
             match commands.recv_timeout(Duration::from_secs_f64(engine.config.poll_seconds)) {
                 Ok(Action::Quit) => break,
-                Ok(Action::PauseForGame) => ask_approved = true,
                 Ok(action) => queued = Some(action),
                 Err(mpsc::RecvTimeoutError::Timeout) => (),
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -1838,7 +1875,7 @@ fn run(
                 if accepted_generation < minimum_inventory_generation {
                     force_requested = true;
                 } else {
-                    let changed = serde_json::to_value(&games)? != serde_json::to_value(&updated)?;
+                    let changed = games != updated;
                     inventory_ready = true;
                     steam_roots = roots;
                     games = updated;
@@ -1922,9 +1959,9 @@ fn run(
             let records = guard_games
                 .iter()
                 .filter(|g| {
-                    all_active.iter().any(|a| {
-                        crate::discovery::canonical(&a.path) == crate::discovery::canonical(&g.path)
-                    })
+                    all_active
+                        .iter()
+                        .any(|a| crate::discovery::same_path(&a.path, &g.path))
                 })
                 .cloned()
                 .collect();
@@ -2085,7 +2122,6 @@ fn run(
         }
         match commands.recv_timeout(Duration::from_secs_f64(engine.config.poll_seconds)) {
             Ok(Action::Quit) => break,
-            Ok(Action::PauseForGame) => ask_approved = true,
             Ok(action) => queued = Some(action),
             Err(mpsc::RecvTimeoutError::Timeout) => (),
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -2135,12 +2171,19 @@ pub fn log(folder: &std::path::Path, message: &str) {
         let _ = fs::rename(&file, folder.join("gamepause.log.1"));
     }
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(file) {
-        let timestamp = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let _ = writeln!(file, "{timestamp} {message}");
+        let _ = writeln!(file, "{} {message}", local_timestamp());
     }
+}
+/// Local wall-clock time for log lines, as `2026-10-06 21:44:07`.
+fn local_timestamp() -> String {
+    let mut now = windows_sys::Win32::Foundation::SYSTEMTIME::default();
+    unsafe {
+        windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut now);
+    }
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond
+    )
 }
 #[cfg(test)]
 mod tests {
@@ -2152,6 +2195,7 @@ mod tests {
         status["provider_outcomes"] = json!([
             {"kind":"lmstudio","id":"lmstudio-main","state":"restored","guarantee":"captured_configuration","pending":false,"error":"","retry_seconds":null},
             {"kind":"ollama","id":"ollama-main","state":"failed","guarantee":"supported_fields","pending":true,"error":"failure\nwith\tfields\\path","retry_seconds":10},
+            {"kind":"process","id":"apps-main","state":"paused","guarantee":"process_relaunch","pending":true,"error":"","retry_seconds":null},
             {"kind":"unexpected\nkey","id":"unsupported"}]);
         let output = format_status(&status);
         assert!(output.starts_with(&format!(
@@ -2161,8 +2205,45 @@ mod tests {
         assert!(output.contains("provider.lmstudio.pending=no"));
         assert!(output.contains("provider.ollama.pending=yes"));
         assert!(output.contains("provider.ollama.error=failure\\nwith\\tfields\\\\path"));
+        assert!(output.contains("provider.process.state=paused"));
+        assert!(
+            output.find("provider.ollama.").unwrap() < output.find("provider.process.").unwrap(),
+            "process lines follow the earlier providers"
+        );
         assert!(!output.contains("unsupported"));
-        assert_eq!(output.lines().count(), 23);
+        assert_eq!(output.lines().count(), 29);
+    }
+    #[test]
+    fn log_lines_start_with_a_readable_local_time() {
+        let stamp = local_timestamp();
+        let bytes = stamp.as_bytes();
+        assert_eq!(stamp.len(), 19);
+        assert!(bytes[4] == b'-' && bytes[7] == b'-' && bytes[10] == b' ');
+        assert!(bytes[13] == b':' && bytes[16] == b':');
+        assert!(
+            stamp
+                .chars()
+                .all(|c| c.is_ascii_digit() || "-: ".contains(c))
+        );
+    }
+    #[test]
+    fn ask_answer_counts_whether_or_not_it_is_tracked() {
+        assert!(Action::PauseForGame.answers_ask());
+        assert!(
+            Action::Tracked {
+                id: 7,
+                action: Box::new(Action::PauseForGame)
+            }
+            .answers_ask()
+        );
+        assert!(!Action::Pause.answers_ask());
+        assert!(
+            !Action::Tracked {
+                id: 8,
+                action: Box::new(Action::Refresh)
+            }
+            .answers_ask()
+        );
     }
     #[test]
     fn diagnostics_requests_coalesce_and_failed_dispatch_releases_pending() {
@@ -2207,12 +2288,7 @@ mod tests {
         ));
         let mut engine = Engine::new(
             config.clone(),
-            OptionalBackend {
-                claims: Default::default(),
-                backend: None,
-                folder: None,
-                config: config.clone(),
-            },
+            OptionalBackend::new(config.clone(), None),
             path,
         )
         .unwrap();
@@ -2267,7 +2343,7 @@ mod tests {
         let game = crate::gameplay::fixtures::game(42, 10);
         let mut frame = DetectionFrame {
             power_generation: 0,
-            config: serde_json::to_value(Config::default()).unwrap(),
+            config: Config::default(),
             asking: vec![],
             suggestion: None,
             active: vec![game.clone()],
@@ -2330,7 +2406,7 @@ mod tests {
                 input.power.notify(18);
                 Ok(DetectionFrame {
                     power_generation: input.power_generation,
-                    config: serde_json::to_value(&input.config).unwrap(),
+                    config: input.config.clone(),
                     asking: vec![],
                     suggestion: None,
                     active: vec![],
@@ -2361,12 +2437,7 @@ mod tests {
         ));
         let mut engine = Engine::new(
             config.clone(),
-            OptionalBackend {
-                claims: Default::default(),
-                backend: None,
-                config: config.clone(),
-                folder: None,
-            },
+            OptionalBackend::new(config.clone(), None),
             path,
         )
         .unwrap();
@@ -2511,12 +2582,7 @@ mod tests {
         let remembered = Game::new("Custom", "a", "Fixture A", &config.extra_games[0].path);
         write_json(&folder.join("state.json"), &json!({"schema":2,"server":{"running":false,"port":1234},"server_stopped":false,"models":[],"pause_complete":true,"games":[remembered]})).unwrap();
         write_json(&folder.join("config.json"), &config).unwrap();
-        let backend = OptionalBackend {
-            claims: Default::default(),
-            backend: None,
-            folder: None,
-            config: config.clone(),
-        };
+        let backend = OptionalBackend::new(config.clone(), None);
         let mut engine = Engine::new(config.clone(), backend, folder.join("state.json")).unwrap();
         let journal = fs::read(folder.join("state.json")).unwrap();
         let mut scanner = Scanner::new(config.clone()).unwrap();
@@ -2643,12 +2709,7 @@ mod tests {
         let config = Config::default();
         let mut engine = Engine::new(
             config.clone(),
-            OptionalBackend {
-                claims: Default::default(),
-                backend: None,
-                folder: None,
-                config: config.clone(),
-            },
+            OptionalBackend::new(config.clone(), None),
             path.clone(),
         )
         .unwrap();
@@ -2682,12 +2743,7 @@ mod tests {
         let config = Config::default();
         let mut engine = Engine::new(
             config.clone(),
-            OptionalBackend {
-                claims: Default::default(),
-                backend: None,
-                folder: None,
-                config: config.clone(),
-            },
+            OptionalBackend::new(config.clone(), None),
             folder.join("state.json"),
         )
         .unwrap();
@@ -2765,12 +2821,7 @@ mod tests {
             std::env::temp_dir().join(format!("gamepause-pause-revocation-{}", std::process::id()));
         let mut engine = Engine::new(
             config.clone(),
-            OptionalBackend {
-                claims: Default::default(),
-                backend: None,
-                folder: None,
-                config: config.clone(),
-            },
+            OptionalBackend::new(config.clone(), None),
             folder.join("state.json"),
         )
         .unwrap();
@@ -2919,12 +2970,7 @@ mod tests {
         };
         let engine = Engine::new(
             config.clone(),
-            OptionalBackend {
-                claims: Default::default(),
-                backend: None,
-                folder: None,
-                config: config.clone(),
-            },
+            OptionalBackend::new(config.clone(), None),
             folder.join("state.json"),
         )
         .unwrap();
@@ -2989,12 +3035,7 @@ mod tests {
         write_json(&folder.join("config.json"), &config).unwrap();
         write_json(&folder.join("state.json"), &json!({"schema":2,"server":{"running":false,"port":1234},"server_stopped":false,"models":[],"pause_complete":true})).unwrap();
         let original = fs::read(folder.join("config.json")).unwrap();
-        let backend = OptionalBackend {
-            claims: Default::default(),
-            backend: None,
-            config: config.clone(),
-            folder: None,
-        };
+        let backend = OptionalBackend::new(config.clone(), None);
         let mut engine = Engine::new(config.clone(), backend, folder.join("state.json")).unwrap();
         let ownership = engine.backend.claims.clone();
         let journal = fs::read(folder.join("state.json")).unwrap();
@@ -3073,12 +3114,7 @@ mod tests {
             *enabled = false;
         }
         write_json(&folder.join("config.json"), &engine.config).unwrap();
-        let backend = OptionalBackend {
-            claims: Default::default(),
-            backend: None,
-            config: engine.config.clone(),
-            folder: None,
-        };
+        let backend = OptionalBackend::new(engine.config.clone(), None);
         assert!(Engine::new(engine.config.clone(), backend, folder.join("state.json")).is_err());
         assert_eq!(fs::read(folder.join("state.json")).unwrap(), journal);
         fs::remove_dir_all(folder).unwrap();
@@ -3088,12 +3124,7 @@ mod tests {
         let folder =
             std::env::temp_dir().join(format!("gamepause-live-settings-{}", std::process::id()));
         let config = Config::default();
-        let backend = OptionalBackend {
-            claims: Default::default(),
-            backend: None,
-            folder: None,
-            config: config.clone(),
-        };
+        let backend = OptionalBackend::new(config.clone(), None);
         let mut engine = Engine::new(config.clone(), backend, folder.join("state.json")).unwrap();
         let mut scanner = Scanner::new(config.clone()).unwrap();
         let shared = Arc::new(Mutex::new(Shared::default()));
@@ -3282,12 +3313,7 @@ mod tests {
         config.excluded_executables.push("game.exe".into());
         let mut engine = Engine::new(
             config.clone(),
-            OptionalBackend {
-                claims: Default::default(),
-                backend: None,
-                config: config.clone(),
-                folder: None,
-            },
+            OptionalBackend::new(config.clone(), None),
             std::env::temp_dir().join("nonexistent-guard-state.json"),
         )
         .unwrap();
@@ -3322,12 +3348,7 @@ mod tests {
             ..Default::default()
         };
         write_json(&folder.join("config.json"), &config).unwrap();
-        let backend = OptionalBackend {
-            claims: Default::default(),
-            backend: None,
-            config: config.clone(),
-            folder: None,
-        };
+        let backend = OptionalBackend::new(config.clone(), None);
         let mut engine = Engine::new(config.clone(), backend, folder.join("state.json")).unwrap();
         let mut scanner = Scanner::new(config.clone()).unwrap();
         let shared = Arc::new(Mutex::new(Shared {
@@ -3402,12 +3423,7 @@ mod tests {
             ..Default::default()
         };
         write_json(&folder.join("config.json"), &config).unwrap();
-        let backend = OptionalBackend {
-            claims: Default::default(),
-            backend: None,
-            config: config.clone(),
-            folder: None,
-        };
+        let backend = OptionalBackend::new(config.clone(), None);
         let mut engine = Engine::new(config.clone(), backend, folder.join("state.json")).unwrap();
         let mut scanner = Scanner::new(config.clone()).unwrap();
         let shared = Arc::new(Mutex::new(Shared {
@@ -3483,12 +3499,7 @@ mod tests {
             std::env::temp_dir().join(format!("gamepause-advanced-{}", std::process::id()));
         let config = Config::default();
         write_json(&folder.join("config.json"), &config).unwrap();
-        let backend = OptionalBackend {
-            claims: Default::default(),
-            backend: None,
-            config: config.clone(),
-            folder: None,
-        };
+        let backend = OptionalBackend::new(config.clone(), None);
         let mut engine = Engine::new(config.clone(), backend, folder.join("state.json")).unwrap();
         let mut scanner = Scanner::new(config.clone()).unwrap();
         let shared = Arc::new(Mutex::new(Shared {

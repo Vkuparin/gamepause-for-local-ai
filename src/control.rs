@@ -8,7 +8,6 @@ pub enum Activity {
     Unknown,
     Watching,
     Observation,
-    Unavailable,
     DetectionUnavailable,
     Capturing,
     WaitingForInference,

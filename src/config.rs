@@ -33,7 +33,7 @@ impl Appearance {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub poll_seconds: f64,
@@ -73,7 +73,7 @@ enum Source {
     VersionThree,
     Legacy,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExtraGame {
     pub name: String,
@@ -256,7 +256,7 @@ impl Config {
     pub fn asks(&self, path: &str) -> bool {
         self.ask_games
             .iter()
-            .any(|ask| crate::discovery::canonical(ask) == crate::discovery::canonical(path))
+            .any(|ask| crate::discovery::same_path(ask, path))
     }
     pub fn any_provider_enabled(&self) -> bool {
         self.providers.iter().any(Provider::enabled)

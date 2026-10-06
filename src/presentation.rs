@@ -90,11 +90,6 @@ pub fn status(s: &Shared) -> Status {
             Look::Loading,
         ),
         Verifying => ("LOADING", "Testing pause and resume...", Look::Loading),
-        Unavailable => (
-            "AI NEEDS ATTENTION",
-            "AI is not reachable. Open your AI app or check Advanced.",
-            Look::Attention,
-        ),
         DetectionUnavailable => (
             "AI NEEDS ATTENTION",
             "Game detection is not working. AI is left alone until it recovers.",
@@ -180,7 +175,6 @@ pub fn summarize(shared: &Shared) -> Summary {
         Activity::Unknown => "waiting for game detection; AI state unknown.",
         Activity::Watching => "watching games; idle loaded-model state is not probed.",
         Activity::Observation => "observation only; AI is unchanged.",
-        Activity::Unavailable => "unavailable; AI control cannot proceed.",
         Activity::DetectionUnavailable => "game detection unavailable; AI control is held.",
         Activity::Capturing => "capturing settings before unloading; pause is not complete.",
         Activity::WaitingForInference => "waiting for inference to finish; pause is not complete.",
@@ -225,8 +219,6 @@ pub fn summarize(shared: &Shared) -> Summary {
         }
     } else if activity == Activity::WaitingForInference {
         "Wait for current inference to finish; GamePause retries automatically."
-    } else if activity == Activity::Unavailable {
-        "Open the enabled provider or check its connection. GamePause retries automatically."
     } else if !shared.config.automation_enabled {
         "Automatic pausing is off. Enable it to pause AI when recognized games start."
     } else {
@@ -464,7 +456,6 @@ mod tests {
             Activity::Unknown,
             Activity::Watching,
             Activity::Observation,
-            Activity::Unavailable,
             Activity::DetectionUnavailable,
             Activity::Capturing,
             Activity::WaitingForInference,
@@ -498,7 +489,6 @@ mod tests {
             Activity::Unknown,
             Activity::Watching,
             Activity::Observation,
-            Activity::Unavailable,
             Activity::DetectionUnavailable,
             Activity::Capturing,
             Activity::WaitingForInference,

@@ -33,10 +33,29 @@ pub fn canonical(path: &str) -> String {
         .trim_end_matches('\\')
         .to_lowercase()
 }
+/// `canonical` one character at a time, for comparisons on the scan path
+/// that must not allocate.
+fn canonical_chars(path: &str) -> impl Iterator<Item = char> + '_ {
+    path.trim_end_matches(['\\', '/'])
+        .chars()
+        .map(|c| if c == '/' { '\\' } else { c })
+        .flat_map(char::to_lowercase)
+}
+/// Whether two paths are the same location under `canonical`.
+pub fn same_path(a: &str, b: &str) -> bool {
+    canonical_chars(a).eq(canonical_chars(b))
+}
 pub fn inside(path: &str, root: &str) -> bool {
-    let p = canonical(path);
-    let r = canonical(root);
-    !r.is_empty() && (p == r || p.starts_with(&(r + "\\")))
+    let mut path = canonical_chars(path);
+    let mut any = false;
+    for expected in canonical_chars(root) {
+        any = true;
+        if path.next() != Some(expected) {
+            return false;
+        }
+    }
+    // The root itself, or something below it; never a longer sibling name.
+    any && matches!(path.next(), None | Some('\\'))
 }
 fn background_utility(game: &Game) -> bool {
     [
@@ -52,8 +71,11 @@ pub fn parse_vdf(text: &str) -> Result<Value> {
     if text.len() > 16 * 1024 * 1024 {
         bail!("Launcher metadata exceeds 16 MiB");
     }
-    let token = regex::Regex::new(r#"//[^\n]*|"((?:\\.|[^"\\])*)"|([{}])"#)?;
-    let tokens: Vec<String> = token
+    // One manifest per installed Steam game is parsed on every refresh.
+    static TOKEN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"//[^\n]*|"((?:\\.|[^"\\])*)"|([{}])"#).expect("constant token pattern")
+    });
+    let tokens: Vec<String> = TOKEN
         .captures_iter(text)
         .filter_map(|c| {
             c.get(1)
@@ -706,6 +728,31 @@ mod tests {
             r"d:/games/witcher"
         ));
         assert!(!inside(r"D:\Games\Witcher2\game.exe", r"D:\Games\Witcher"));
+    }
+    #[test]
+    fn in_place_path_checks_agree_with_canonical() {
+        let paths = [
+            "",
+            r"\",
+            r"D:\Games\Witcher",
+            r"d:/games/witcher/",
+            r"D:\Games\Witcher\",
+            r"D:\Games\Witcher\bin\game.exe",
+            r"D:\Games\Witcher2",
+            r"D:\Games\WITCHER\Ünïcode\Spiel.EXE",
+            r"D:\Games",
+        ];
+        for path in paths {
+            for root in paths {
+                let (p, r) = (canonical(path), canonical(root));
+                assert_eq!(same_path(path, root), p == r, "{path:?} == {root:?}");
+                assert_eq!(
+                    inside(path, root),
+                    !r.is_empty() && (p == r || p.starts_with(&format!("{r}\\"))),
+                    "{path:?} inside {root:?}"
+                );
+            }
+        }
     }
     #[test]
     fn worker_survives_a_panicking_adapter_and_keeps_last_good_inventory() {

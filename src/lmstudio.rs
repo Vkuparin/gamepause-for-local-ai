@@ -346,7 +346,7 @@ impl LMStudio {
         let lms = candidates
             .into_iter()
             .find(|p| p.is_file())
-            .context("Waiting for LM Studio: its CLI could not be found. Open LM Studio and install its CLI, or use Locate lms in GamePause")?;
+            .context("Waiting for LM Studio: its CLI could not be found. Open LM Studio and install its CLI, or choose the lms executable under Advanced > LM Studio")?;
         Ok(Self {
             configured_endpoint: config.lm_endpoint().into(),
             claims: Default::default(),
@@ -995,6 +995,7 @@ pub fn run_command(program: &str, args: &[&str], timeout: Duration) -> Result<Ve
         pipe: &mut (impl Read + AsRawHandle),
         bytes: &mut Vec<u8>,
         truncated: &mut bool,
+        progress: &mut bool,
     ) -> Result<bool> {
         let mut available = 0;
         if unsafe {
@@ -1020,6 +1021,7 @@ pub fn run_command(program: &str, args: &[&str], timeout: Duration) -> Result<Ve
             let retained = count.min(CAP.saturating_sub(bytes.len()));
             bytes.extend_from_slice(&buffer[..retained]);
             *truncated |= retained < count;
+            *progress |= count != 0;
         }
         Ok(false)
     }
@@ -1040,11 +1042,12 @@ pub fn run_command(program: &str, args: &[&str], timeout: Duration) -> Result<Ve
             if Instant::now() >= deadline {
                 bail!("Local command timed out (including pipe completion)");
             }
+            let mut progress = false;
             if !out_done {
-                out_done = drain(&mut stdout, &mut output, &mut truncated)?;
+                out_done = drain(&mut stdout, &mut output, &mut truncated, &mut progress)?;
             }
             if !err_done {
-                err_done = drain(&mut stderr, &mut errors, &mut truncated)?;
+                err_done = drain(&mut stderr, &mut errors, &mut truncated, &mut progress)?;
             }
             if let Some(status) = child.try_wait()?
                 && out_done
@@ -1058,7 +1061,11 @@ pub fn run_command(program: &str, args: &[&str], timeout: Duration) -> Result<Ve
                 }
                 return Ok(output);
             }
-            std::thread::sleep(Duration::from_millis(2));
+            // Keep draining while output flows; idle waits are coarse so a
+            // slow command is not polled hundreds of times a second.
+            if !progress {
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
     })();
     if result.is_err() {

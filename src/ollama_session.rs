@@ -31,6 +31,19 @@ impl std::fmt::Display for Unreachable {
 }
 impl std::error::Error for Unreachable {}
 pub const NOT_RUNNING: &str = "Not running; nothing to pause.";
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// A preload answers only once the model is resident, and Ollama abandons a
+/// load whose client disconnects, so it gets the same allowance as an LM
+/// Studio load.
+const LOAD_TIMEOUT: Duration = Duration::from_secs(300);
+/// Only a generate request that keeps the model resident is a load; reads and
+/// unloads (`keep_alive: 0`) are acknowledged at once.
+fn request_timeout(path: &str, body: Option<&serde_json::Value>) -> Duration {
+    match body {
+        Some(body) if path == "/api/generate" && body["keep_alive"] != 0 => LOAD_TIMEOUT,
+        _ => REQUEST_TIMEOUT,
+    }
+}
 pub struct Http {
     endpoint: String,
     agent: ureq::Agent,
@@ -42,7 +55,7 @@ impl Http {
             agent: ureq::AgentBuilder::new()
                 .try_proxy_from_env(false)
                 .redirects(0)
-                .timeout(Duration::from_secs(10))
+                .timeout(REQUEST_TIMEOUT)
                 .build(),
         })
     }
@@ -57,9 +70,10 @@ impl Transport for Http {
             bail!("Unsupported Ollama request route");
         }
         let url = format!("http://{}{path}", self.endpoint);
+        let timeout = request_timeout(path, body.as_ref());
         let response = match body {
-            Some(body) => self.agent.post(&url).send_json(body),
-            None => self.agent.get(&url).call(),
+            Some(body) => self.agent.post(&url).timeout(timeout).send_json(body),
+            None => self.agent.get(&url).timeout(timeout).call(),
         }
         .map_err(|error| match error {
             ureq::Error::Transport(transport)
@@ -1374,6 +1388,27 @@ pub(crate) mod tests {
             }
         });
         (endpoint, thread)
+    }
+    #[test]
+    fn only_a_model_load_gets_the_long_request_timeout() {
+        let unload = json!({"model":"m:latest", "prompt":"", "stream":false, "keep_alive":0});
+        let finite =
+            json!({"model":"m:latest", "prompt":"", "stream":false, "keep_alive":"240000000000ns"});
+        let indefinite = json!({"model":"m:latest", "prompt":"", "stream":false, "keep_alive":-1});
+        assert_eq!(
+            request_timeout("/api/generate", Some(&finite)),
+            LOAD_TIMEOUT
+        );
+        assert_eq!(
+            request_timeout("/api/generate", Some(&indefinite)),
+            LOAD_TIMEOUT
+        );
+        assert_eq!(
+            request_timeout("/api/generate", Some(&unload)),
+            REQUEST_TIMEOUT
+        );
+        assert_eq!(request_timeout("/api/show", Some(&finite)), REQUEST_TIMEOUT);
+        assert_eq!(request_timeout("/api/ps", None), REQUEST_TIMEOUT);
     }
     #[test]
     fn bounded_http_refuses_redirects_oversize_remote_routes_and_unknown_operations() {

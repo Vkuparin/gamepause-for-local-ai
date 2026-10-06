@@ -176,7 +176,7 @@ pub fn show(shared: SharedState, tx: Sender<Action>, folder: PathBuf) {
                 let app_folder = folder.clone();
                 let app_rx = rx.clone();
                 let result = eframe::run_native(
-                    "GamePause for LM Studio",
+                    "GamePause",
                     native_options(),
                     Box::new(move |cc| {
                         design::fonts(&cc.egui_ctx);
@@ -280,8 +280,7 @@ fn caption(hwnd: HWND, palette: Palette, dark: bool) {
     set(DWMWA_TEXT_COLOR, text);
 }
 /// The native tray routes gameplay confirmation into the same themed modal.
-pub fn request_resume(shared: SharedState, tx: Sender<Action>) {
-    let folder = crate::config::data_directory();
+pub fn request_resume(shared: SharedState, tx: Sender<Action>, folder: PathBuf) {
     show(shared, tx, folder);
     dispatch(UiRequest::Resume);
 }
@@ -499,7 +498,6 @@ fn provider_status(s: &Shared) -> Vec<(String, &'static str, Tone)> {
                 (_, Activity::Verifying) => ("Testing", Tone::Busy),
                 (Some(State::Paused), _) => ("Models unloaded successfully", Tone::Success),
                 (Some(State::Restored), _) => ("Models restored", Tone::Success),
-                (_, Activity::Unavailable) => ("Not reachable", Tone::Error),
                 (_, Activity::Unknown | Activity::DetectionUnavailable) => {
                     ("Waiting for game detection", Tone::Neutral)
                 }
@@ -595,6 +593,8 @@ enum Modal {
     Resume(crate::gameplay::RestoreOffer, Vec<bool>),
     Verify,
     Help,
+    /// Escape was pressed in Advanced with unsaved edits.
+    Discard,
 }
 struct Dashboard {
     shared: SharedState,
@@ -610,6 +610,8 @@ struct Dashboard {
     modal_active: bool,
     owner: HWND,
     edit_config: Config,
+    /// Saved settings the draft was last based on.
+    edit_base: Config,
     edit_revision: u64,
     dirty: bool,
     validation: String,
@@ -644,6 +646,7 @@ impl Dashboard {
             modal: None,
             modal_active: false,
             owner: null_mut(),
+            edit_base: s.config.clone(),
             edit_config: s.config,
             edit_revision: s.revision,
             dirty: false,
@@ -1374,7 +1377,7 @@ impl Dashboard {
                     }
                     if self.page == Page::Running && ui.button("Ignore executable").clicked() {
                         let mut c = s.config.clone();
-                        set_ignored(&mut c, &row.path, true);
+                        exclude_executable(&mut c, &row.path);
                         self.save(c, false);
                         ui.close();
                     }
@@ -1398,6 +1401,51 @@ impl Dashboard {
     }
 }
 
+/// Carries unsaved Advanced edits over a change to the saved settings: a value
+/// the draft did not touch follows the saved settings, and one it did touch
+/// stays as typed. `None` when the result is not a valid configuration.
+fn rebase_draft(base: &Config, draft: &Config, saved: &Config) -> Option<Config> {
+    use serde_json::Value;
+    fn merge(base: &Value, draft: &Value, saved: &Value) -> Value {
+        if draft == base {
+            return saved.clone();
+        }
+        if saved == base {
+            return draft.clone();
+        }
+        match (base, draft, saved) {
+            (Value::Object(base), Value::Object(draft), Value::Object(saved)) => Value::Object(
+                draft
+                    .iter()
+                    .map(|(key, value)| {
+                        let other = |map: &serde_json::Map<String, Value>| {
+                            map.get(key).cloned().unwrap_or(Value::Null)
+                        };
+                        (key.clone(), merge(&other(base), value, &other(saved)))
+                    })
+                    .collect(),
+            ),
+            (Value::Array(base), Value::Array(draft), Value::Array(saved))
+                if base.len() == draft.len() && draft.len() == saved.len() =>
+            {
+                Value::Array(
+                    base.iter()
+                        .zip(draft)
+                        .zip(saved)
+                        .map(|((base, draft), saved)| merge(base, draft, saved))
+                        .collect(),
+                )
+            }
+            // Both changed the same value: the edit on screen wins.
+            _ => draft.clone(),
+        }
+    }
+    let value = |config: &Config| serde_json::to_value(config).ok();
+    let merged: Config =
+        serde_json::from_value(merge(&value(base)?, &value(draft)?, &value(saved)?)).ok()?;
+    merged.validate().ok()?;
+    Some(merged)
+}
 fn ui_input_arrow(response: &Response) -> bool {
     response
         .ctx
@@ -1410,6 +1458,13 @@ fn set_ask(config: &mut Config, path: &str, ask: bool) {
         set_ignored(config, path, false);
         config.ask_games.push(path.into());
     }
+}
+/// A running executable is ignored through `excluded_paths`, which detection
+/// matches against process paths. `ignored_games` names game locations and
+/// never matches an executable inside a launcher's game folder.
+fn exclude_executable(config: &mut Config, path: &str) {
+    set_ignored(config, path, false);
+    config.excluded_paths.push(path.into());
 }
 fn set_ignored(config: &mut Config, path: &str, off: bool) {
     if off {
@@ -1546,25 +1601,15 @@ impl Dashboard {
                         ui.heading("Ollama");
                         ui.label("Works when Ollama is running; nothing happens when it is not. Local models are unloaded for gaming. GGUF completion models come back with their context and the keep-alive time they had left; other local models, such as embedding models, stay unloaded. Full load options, parallelism, conversations and KV cache are not preserved.");
                         ui.label("Ollama itself keeps running. GamePause does not download models or fight later client reloads. Tested with Ollama 0.35.1.");
-                        let saved=s.config.providers.iter().find(|p|p.kind()==crate::provider::Kind::Ollama);
                         let editable=!s.provider_pending(crate::provider::Kind::Ollama);
                         ui.add_enabled_ui(editable,|ui| {
-                            if let Some(saved)=saved {
-                                let mut enabled=saved.enabled();
-                                if ui.styled_checkbox(&mut enabled,"Pause Ollama models while gaming").changed(){
-                                    let mut c=s.config.clone();if let Some(crate::config::Provider::Ollama{enabled:saved,..})=c.providers.iter_mut().find(|p|p.kind()==crate::provider::Kind::Ollama){*saved=enabled;}self.save(c,true);
-                                }
-                                if let Some(crate::config::Provider::Ollama{endpoint,..})=self.edit_config.providers.iter_mut().find(|p|p.kind()==crate::provider::Kind::Ollama) {
-                                    ui.label("Loopback endpoint");self.dirty |= ui.text_edit_singleline(endpoint).changed();
-                                }
-                                if ui.button("Save Ollama endpoint").clicked(){
-                                    let mut c=s.config.clone();
-                                    let value=self.edit_config.providers.iter().find(|p|p.kind()==crate::provider::Kind::Ollama).map(|p|p.endpoint().to_owned());
-                                    if let (Some(value),Some(crate::config::Provider::Ollama{endpoint,..}))=(value,c.providers.iter_mut().find(|p|p.kind()==crate::provider::Kind::Ollama)){*endpoint=value;self.save(c,true);self.dirty=false;}
-                                }
+                            if let Some(crate::config::Provider::Ollama{enabled,endpoint,..})=self.edit_config.providers.iter_mut().find(|p|p.kind()==crate::provider::Kind::Ollama) {
+                                self.dirty |= ui.styled_checkbox(enabled,"Pause Ollama models while gaming").changed();
+                                ui.label("Loopback endpoint");self.dirty |= ui.text_edit_singleline(endpoint).changed();
                             } else {ui.label("No Ollama entry is configured.");}
                         });
                         if !editable {ui.colored_label(p.accent,"Finish pending Ollama recovery before turning it off or changing its endpoint.");}
+                        self.save_bar(ui,s,p);
                         ui.hyperlink_to("Report Ollama problems or contribute fixes",concat!(env!("CARGO_PKG_REPOSITORY"),"/blob/main/CONTRIBUTING.md"));
                     },
                     SettingsPage::Apps=> {
@@ -1612,7 +1657,7 @@ impl Dashboard {
                         self.save_bar(ui,s,p);
                         ui.add_space(design::GAP);
                         if ui.add_enabled(crate::ui_commands::verify_available(s),Button::new("Test round-trip...")).clicked(){self.modal=Some(Modal::Verify);}
-                        ui.colored_label(p.muted,"The test captures, unloads and reloads your live LM Studio models. It requires no running games or pending recovery.");
+                        ui.colored_label(p.muted,"The test captures, unloads and reloads the models LM Studio and Ollama have loaded. It requires no running games or pending recovery.");
                     },
                     SettingsPage::Diagnostics=> {
                         ui.heading("Read-only diagnostics");
@@ -1627,6 +1672,13 @@ impl Dashboard {
             if !self.validation.is_empty(){ui.colored_label(p.error,&self.validation);}
             if !s.settings_error.is_empty(){ui.colored_label(p.error,&s.settings_error);}
         });
+    }
+    fn discard_draft(&mut self, s: &Shared) {
+        self.edit_config = s.config.clone();
+        self.edit_base = s.config.clone();
+        self.edit_revision = s.revision;
+        self.dirty = false;
+        self.validation.clear();
     }
     fn save_bar(&mut self, ui: &mut Ui, s: &Shared, p: Palette) {
         ui.add_space(design::GAP);
@@ -1647,9 +1699,7 @@ impl Dashboard {
                 .add_enabled(self.dirty, Button::new("Discard edits"))
                 .clicked()
             {
-                self.edit_config = s.config.clone();
-                self.dirty = false;
-                self.validation.clear();
+                self.discard_draft(s);
             }
             if self.dirty {
                 ui.colored_label(p.muted, "Unsaved changes");
@@ -1707,7 +1757,7 @@ impl Dashboard {
         if let Some(text) = self.worker_log.as_mut() {
             ui.add_space(design::GAP);
             p.card().show(ui, |ui| {
-                ui.strong("Recent worker log (timestamps are Unix seconds)");
+                ui.strong("Recent worker log");
                 ui.colored_label(
                     p.muted,
                     "Loaded on request. Up to 64 KiB from the current local log.",
@@ -1737,6 +1787,7 @@ impl Dashboard {
             Modal::Resume(..) => "Resume AI while a game is running?",
             Modal::Verify => "Test live pause and restore?",
             Modal::Help => "Keyboard and controls",
+            Modal::Discard => "Discard unsaved settings?",
         };
         let response=egui::Modal::new(Id::new("gamepause-modal")).frame(p.card().inner_margin(20)).show(ctx,|ui| {
             ui.set_width(510.0_f32.min(ctx.content_rect().width()-64.0));
@@ -1767,28 +1818,32 @@ impl Dashboard {
                     ui.colored_label(p.muted,"Ignore selections are optional. Resume works without selecting any games.");
                 },
                 Modal::Verify=> {ui.label("This live test captures settings, unloads models and restores them. It can interrupt current inference. Recovery safeguards and fresh game checks remain in force.");},
+                Modal::Discard=> {ui.label("Advanced has edits that were not saved. Discard them and go back to games, or keep editing.");},
                 Modal::Help=> {ui.label("Tab / Shift+Tab moves focus. Enter / Space activates controls. Arrow keys select table rows. Escape closes this dialog or returns to Games. F1 opens this help. Closing the dashboard keeps the tray watcher running. Quit uses the existing safe shutdown path.");},
             }
             if !self.validation.is_empty(){ui.colored_label(p.error,&self.validation);}
             ui.add_space(design::GAP);
             ui.horizontal(|ui| {
-                let cancel_button=ui.button(if matches!(modal,Modal::Help){"Close"}else{"Cancel"});
+                let cancel_button=ui.button(match modal {Modal::Help=>"Close",Modal::Discard=>"Keep editing",_=>"Cancel"});
                 // Cancel is first in keyboard order. Dangerous actions require explicit activation.
                 if first {cancel_button.request_focus();}
                 cancel=cancel_button.clicked();
-                let label=match modal {Modal::Add{..}=>"Add game",Modal::Rename(..)=>"Rename",Modal::Remove(..)=>"Remove",Modal::Resume(..)=>"Resume AI",Modal::Verify=>"Test round-trip",Modal::Help=>""};
+                let label=match modal {Modal::Add{..}=>"Add game",Modal::Rename(..)=>"Rename",Modal::Remove(..)=>"Remove",Modal::Resume(..)=>"Resume AI",Modal::Verify=>"Test round-trip",Modal::Discard=>"Discard",Modal::Help=>""};
                 if !label.is_empty(){accepted=ui.add_enabled(!s.commands.settings_pending,Button::new(label).fill(p.selected).stroke(Stroke::new(1.0_f32,p.accent))).clicked();}
             });
         });
         cancel |= response.should_close();
         if cancel {
             self.modal_active = false;
-            self.validation.clear();
-            crate::app::local_result(
-                &self.shared,
-                Outcome::Cancelled,
-                "Dialog cancelled; AI and preferences unchanged.",
-            );
+            // Closing help or returning to the edits cancels nothing.
+            if !matches!(modal, Modal::Help | Modal::Discard) {
+                self.validation.clear();
+                crate::app::local_result(
+                    &self.shared,
+                    Outcome::Cancelled,
+                    "Dialog cancelled; AI and preferences unchanged.",
+                );
+            }
             return;
         }
         if accepted {
@@ -1847,6 +1902,11 @@ impl Dashboard {
                     }
                     self.validation="The test is no longer available. Wait for games, recovery or current work to finish.".into();
                 }
+                Modal::Discard => {
+                    self.discard_draft(s);
+                    self.action(Action::AdvancedVisibility(false), "Close Advanced");
+                    return;
+                }
                 Modal::Help => return,
             }
         }
@@ -1872,16 +1932,27 @@ impl Dashboard {
             self.window_icon = Some(palette.accent);
         }
         self.icons.poll(ctx);
-        if !self.dirty && s.revision != self.edit_revision {
-            self.edit_config = s.config.clone();
+        if s.revision != self.edit_revision && !(self.dirty && s.commands.settings_pending) {
+            if self.dirty {
+                // Another save or a refresh happened: keep what was typed and
+                // take everything else from the saved settings.
+                match rebase_draft(&self.edit_base, &self.edit_config, &s.config) {
+                    Some(merged) => {
+                        self.dirty = merged != s.config;
+                        self.edit_config = merged;
+                    }
+                    None => {
+                        self.edit_config = s.config.clone();
+                        self.dirty = false;
+                        self.validation =
+                            "Saved settings changed. Review them before editing again.".into();
+                    }
+                }
+            } else {
+                self.edit_config = s.config.clone();
+            }
+            self.edit_base = s.config.clone();
             self.edit_revision = s.revision;
-        }
-        if self.dirty && s.revision != self.edit_revision && !s.commands.settings_pending {
-            // Preserve edits only while their base settings have not changed.
-            self.edit_config = s.config.clone();
-            self.edit_revision = s.revision;
-            self.dirty = false;
-            self.validation = "Saved settings changed. Review them before editing again.".into();
         }
         let summary = crate::presentation::summarize(s);
         let command = s
@@ -1904,10 +1975,12 @@ impl Dashboard {
             self.modal = Some(Modal::Help);
         }
         if self.modal.is_none() && ctx.input(|i| i.key_pressed(Key::Escape)) {
-            if s.config.advanced_settings_visible {
-                self.action(Action::AdvancedVisibility(false), "Close Advanced");
-            } else {
+            if self.page == Page::Activity || !s.config.advanced_settings_visible {
                 self.set_page(Page::Games);
+            } else if self.dirty {
+                self.modal = Some(Modal::Discard);
+            } else {
+                self.action(Action::AdvancedVisibility(false), "Close Advanced");
             }
         }
         TopBottomPanel::bottom("footer")
@@ -1974,7 +2047,7 @@ impl Dashboard {
                                         .show(ui, palette)
                                         .clicked()
                                     {
-                                        let _ = self.tx.send(Action::PauseForGame);
+                                        self.action(Action::PauseForGame, "Pause AI for this game");
                                     }
                                 });
                             });
@@ -2276,7 +2349,6 @@ mod tests {
             (Unloading, Look::Loading, "LOADING"),
             (Restoring, Look::Loading, "LOADING"),
             (Verifying, Look::Loading, "LOADING"),
-            (Unavailable, Look::Attention, "AI NEEDS ATTENTION"),
             (DetectionUnavailable, Look::Attention, "AI NEEDS ATTENTION"),
             (Recovery, Look::Attention, "AI NEEDS ATTENTION"),
             (PartialFailure, Look::Attention, "AI NEEDS ATTENTION"),
@@ -2477,7 +2549,6 @@ mod tests {
                     Activity::Unknown,
                     Activity::Watching,
                     Activity::Observation,
-                    Activity::Unavailable,
                     Activity::DetectionUnavailable,
                     Activity::Capturing,
                     Activity::WaitingForInference,
@@ -2541,7 +2612,7 @@ mod tests {
     #[test]
     #[ignore = "opens an isolated renderer window for visual review"]
     fn ui_design_review_snapshots() {
-        const STAGES: usize = 18;
+        const STAGES: usize = 19;
         struct Review {
             d: Dashboard,
             stage: usize,
@@ -2607,7 +2678,7 @@ mod tests {
                         let path = s.games[0].path.clone();
                         set_ignored(&mut s.config, &path, true);
                     }
-                    5..=10 => {
+                    5..=11 => {
                         s.config.advanced_settings_visible = true;
                         self.d.settings_page = [
                             SettingsPage::General,
@@ -2619,34 +2690,34 @@ mod tests {
                             SettingsPage::Diagnostics,
                         ][self.stage - 5];
                     }
-                    11 => {
+                    12 => {
                         self.d.modal =
                             Some(Modal::Resume(s.restore_offer.clone().unwrap(), vec![false]))
                     }
-                    12 => {
+                    13 => {
                         self.d.modal = Some(Modal::Add {
                             name: "Fixture game".into(),
                             path: r"D:\Fixture Games\play.exe".into(),
                             auto: true,
                         })
                     }
-                    13 => self.d.page = Page::Activity,
-                    14 => {
+                    14 => self.d.page = Page::Activity,
+                    15 => {
                         s.activity = Activity::PartialFailure;
                         s.config.appearance = crate::config::Appearance::Light;
                     }
-                    15 | 17 => {
+                    16 | 18 => {
                         s.activity = Activity::Watching;
                         s.pending = false;
                         s.active_games.clear();
                         s.restore_offer = None;
                         s.provider_statuses[0].state = State::Restored;
                         s.provider_statuses[0].pending = false;
-                        if self.stage == 17 {
+                        if self.stage == 18 {
                             s.config.appearance = crate::config::Appearance::Light;
                         }
                     }
-                    16 => {
+                    17 => {
                         s.activity = Activity::Capturing;
                         s.pending = false;
                         s.provider_statuses[0].state = State::Pausing;
@@ -2701,7 +2772,7 @@ mod tests {
             }),
         )
         .unwrap();
-        assert!(std::path::Path::new("scratch/ui-review/17.png").exists());
+        assert!(std::path::Path::new("scratch/ui-review/18.png").exists());
     }
 }
 
@@ -2926,6 +2997,72 @@ mod preserved_behavior_tests {
         assert!(err.contains("empty"), "got: {err}");
     }
 
+    #[test]
+    fn ignoring_a_running_executable_uses_the_list_detection_reads() {
+        let exe = r"D:\Fixture Games\Trine 4\bin\trine4.exe";
+        let mut config = Config::default();
+        config.ignored_games.push(exe.to_uppercase());
+        exclude_executable(&mut config, exe);
+        assert_eq!(config.excluded_paths, vec![exe.to_string()]);
+        assert!(
+            config.ignored_games.is_empty(),
+            "an earlier entry in the wrong list is replaced"
+        );
+        // The scanner that decides triggers honours it for a launcher game.
+        let scanner = crate::processes::Scanner::new(config.clone()).unwrap();
+        let game =
+            crate::discovery::Game::new("Steam", "1", "Trine 4", r"D:\Fixture Games\Trine 4");
+        assert!(scanner.match_path(exe, &[game]).is_none());
+        assert!(ignored(&config, exe), "and the Ignored page lists it");
+        exclude_executable(&mut config, exe);
+        assert_eq!(config.excluded_paths.len(), 1);
+        set_ignored(&mut config, exe, false);
+        assert!(config.excluded_paths.is_empty());
+    }
+    #[test]
+    fn unsaved_advanced_edits_survive_other_saves() {
+        let base = Config::default();
+        let mut draft = base.clone();
+        draft.pause_hotkey = "Ctrl+Alt+P".into();
+        draft.restore_delay_seconds = 45.;
+        if let Some(crate::config::Provider::LMStudio { connection, .. }) =
+            draft.providers.first_mut()
+        {
+            connection.endpoint = "127.0.0.1:4321".into();
+        }
+        // Meanwhile: an instant preference, a game rule and the Ollama entry.
+        let mut saved = base.clone();
+        saved.notifications_enabled = false;
+        saved
+            .ignored_games
+            .push(r"D:\Fixture Games\Stardew Valley".into());
+        if let Some(crate::config::Provider::Ollama { endpoint, .. }) = saved.providers.get_mut(1) {
+            *endpoint = "127.0.0.1:11500".into();
+        }
+        let merged = rebase_draft(&base, &draft, &saved).unwrap();
+        assert_eq!(merged.pause_hotkey, "Ctrl+Alt+P");
+        assert_eq!(merged.restore_delay_seconds, 45.);
+        assert_eq!(merged.lm_endpoint(), "127.0.0.1:4321");
+        assert!(!merged.notifications_enabled);
+        assert_eq!(merged.ignored_games, saved.ignored_games);
+        assert_eq!(merged.providers[1].endpoint(), "127.0.0.1:11500");
+        assert_ne!(merged, saved, "the draft is still unsaved");
+        // A refresh that changes no setting leaves the draft exactly as typed.
+        assert_eq!(rebase_draft(&base, &draft, &base).unwrap(), draft);
+        // The same value changed on both sides: the edit on screen wins.
+        let mut both = base.clone();
+        both.pause_hotkey = "Ctrl+Alt+R".into();
+        assert_eq!(
+            rebase_draft(&base, &draft, &both).unwrap().pause_hotkey,
+            "Ctrl+Alt+P"
+        );
+        // A merge that is not valid settings is refused rather than applied.
+        let mut clash = base.clone();
+        if let Some(crate::config::Provider::Ollama { endpoint, .. }) = clash.providers.get_mut(1) {
+            *endpoint = "127.0.0.1:4321".into();
+        }
+        assert!(rebase_draft(&base, &draft, &clash).is_none());
+    }
     #[test]
     fn ask_and_ignore_are_exclusive_rules_for_one_game() {
         let mut config = Config::default();

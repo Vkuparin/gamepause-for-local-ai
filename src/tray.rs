@@ -107,10 +107,30 @@ struct UI {
     folder: PathBuf,
     icons: Icons,
     taskbar_message: u32,
-    last_error: String,
+    /// Icon state and tooltip last sent to the shell; unchanged ticks send nothing.
+    shown: Option<(StateKind, String)>,
+    /// Consecutive timer ticks that found game detection unavailable.
+    detection_down: u32,
     notifications: crate::notifications::Queue,
     clock: std::time::Instant,
     menu_open: bool,
+}
+/// Detection must stay down this many two-second ticks before it is announced.
+/// A wake from sleep or a start-up scan recovers well inside it.
+const DETECTION_DOWN_TICKS: u32 = 10;
+/// Whether the current state is a failure worth a notification: an operation
+/// that did not finish, saved AI still waiting after a restart, or detection
+/// that stays broken. The brief hold after Windows resumes is not.
+pub(crate) fn failure_due(activity: Activity, message: &str, detection_down: u32) -> bool {
+    if message.starts_with("Needs attention") {
+        return true;
+    }
+    match activity {
+        Activity::PartialFailure => true,
+        Activity::Recovery => !message.starts_with("Windows resumed"),
+        Activity::DetectionUnavailable => detection_down >= DETECTION_DOWN_TICKS,
+        _ => false,
+    }
 }
 thread_local! {static UI_STATE:RefCell<Option<UI>>=const{RefCell::new(None)};}
 
@@ -330,13 +350,13 @@ fn command_items(state: &crate::app::Shared) -> Vec<(usize, String, u32)> {
 }
 /// The tray glyph's solid fill color per state. Pure + unit-testable: this is
 /// the "state -> icon variant" mapping P1-6 wants asserted without Win32.
-/// `Idle` is the app's brand color; `Paused` reads "standby"; `Attention` is
-/// a warning red that pops against the dark tray.
+/// Bytes are in bitmap order, blue-green-red: `Idle` is blue, `Paused` is
+/// orange and `Attention` is a warning red that pops against the dark tray.
 pub fn icon_tint(kind: StateKind) -> [u8; 3] {
     match kind {
         StateKind::Idle => [220, 168, 72],
         StateKind::Paused => [56, 132, 255],
-        StateKind::Attention => [230, 62, 62],
+        StateKind::Attention => [62, 62, 230],
     }
 }
 /// Read the OS app-color preference. `true` = dark mode. The key/value is the
@@ -410,13 +430,15 @@ unsafe fn icon(color: [u8; 3]) -> HICON {
     }
 }
 unsafe fn notification(hwnd: HWND, operation: u32, ui: &UI) {
+    let (message, activity) = ui
+        .shared
+        .lock()
+        .map(|s| (s.message.clone(), s.activity))
+        .unwrap_or_else(|_| ("GamePause".into(), Activity::Unknown));
+    unsafe { notify_icon(hwnd, operation, ui, activity_kind(activity), &message) }
+}
+unsafe fn notify_icon(hwnd: HWND, operation: u32, ui: &UI, kind: StateKind, message: &str) {
     unsafe {
-        let (message, activity) = ui
-            .shared
-            .lock()
-            .map(|s| (s.message.clone(), s.activity))
-            .unwrap_or_else(|_| ("GamePause".into(), Activity::Unknown));
-        let kind = activity_kind(activity);
         let mut data: NOTIFYICONDATAW = std::mem::zeroed();
         data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
         data.hWnd = hwnd;
@@ -431,6 +453,24 @@ unsafe fn notification(hwnd: HWND, operation: u32, ui: &UI) {
         data.szTip[..text.len()].copy_from_slice(&text);
         Shell_NotifyIconW(operation, &data);
     }
+    UI_STATE.with(|state| {
+        if let Some(current) = state.borrow_mut().as_mut() {
+            current.shown = (operation != NIM_DELETE).then(|| (kind, message.to_owned()));
+        }
+    });
+}
+/// What one timer tick reads from shared state.
+struct Seen {
+    message: String,
+    activity: Activity,
+    pending: bool,
+    pause: u64,
+    restore: u64,
+    freed: u64,
+    ask_prompt: Vec<String>,
+    suggestion: Option<String>,
+    visual: bool,
+    sound: bool,
 }
 /// Tray appearance follows typed worker evidence. Recovery alone is not a pause.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -446,10 +486,9 @@ pub enum StateKind {
 fn activity_kind(activity: Activity) -> StateKind {
     match activity {
         Activity::Paused | Activity::ManualHold | Activity::Countdown => StateKind::Paused,
-        Activity::PartialFailure
-        | Activity::DetectionUnavailable
-        | Activity::Recovery
-        | Activity::Unavailable => StateKind::Attention,
+        Activity::PartialFailure | Activity::DetectionUnavailable | Activity::Recovery => {
+            StateKind::Attention
+        }
         _ => StateKind::Idle,
     }
 }
@@ -577,7 +616,7 @@ unsafe fn menu(hwnd: HWND, ui: &UI) {
                 None
             }
             Command::Resume => {
-                crate::restore_dialog::request(hwnd, &ui.shared, &ui.tx);
+                crate::restore_dialog::request(hwnd, &ui.shared, &ui.tx, &ui.folder);
                 None
             }
             Command::Automation => {
@@ -664,36 +703,45 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> L
                 if ui.menu_open {
                     MENU_TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
                 }
-                unsafe {
-                    notification(hwnd, NIM_MODIFY, &ui);
-                }
-                let text = ui
-                    .shared
-                    .lock()
-                    .map(|s| s.message.clone())
-                    .unwrap_or_default();
-                let pending = ui.shared.lock().map(|s| s.pending).unwrap_or(true);
-                // Keep the tray tooltip's "current attention" line in sync with
-                // the state. This display bookkeeping is asserted by
-                // `timer_can_reenter_while_menu_context_is_alive`: set the line
-                // when a "Needs attention" message changes, clear it once a
-                // healthy message arrives with no pending work, otherwise leave
-                // it untouched.
-                UI_STATE.with(|state| {
-                    let mut state = state.borrow_mut();
-                    let Some(current) = state.as_mut() else {
-                        return;
-                    };
-                    if text.starts_with("Needs attention:") && text != current.last_error {
-                        current.last_error = text.clone();
-                    } else if !text.starts_with("Needs attention:") && !pending {
-                        current.last_error.clear();
-                    }
+                // One short lock copies only what this tick needs.
+                let seen = ui.shared.lock().ok().map(|s| Seen {
+                    message: s.message.clone(),
+                    activity: s.activity,
+                    pending: s.pending,
+                    pause: s.pause_completions,
+                    restore: s.restore_completions,
+                    freed: s.freed_bytes,
+                    ask_prompt: s.ask_prompt.clone(),
+                    suggestion: s.suggestion.clone(),
+                    visual: s.config.notifications_enabled,
+                    sound: s.config.sound_enabled,
                 });
-                let snapshot = ui.shared.lock().map(|s| s.clone()).ok();
-                if let Some(snapshot) = snapshot {
-                    let failure = activity_kind(snapshot.activity) == StateKind::Attention
-                        || snapshot.message.starts_with("Needs attention:");
+                if let Some(snapshot) = seen {
+                    let kind = activity_kind(snapshot.activity);
+                    // The shell is told only when the icon or tooltip changes.
+                    if ui
+                        .shown
+                        .as_ref()
+                        .is_none_or(|(shown, text)| *shown != kind || *text != snapshot.message)
+                    {
+                        unsafe {
+                            notify_icon(hwnd, NIM_MODIFY, &ui, kind, &snapshot.message);
+                        }
+                    }
+                    let detection_down = UI_STATE.with(|state| {
+                        let mut state = state.borrow_mut();
+                        let Some(current) = state.as_mut() else {
+                            return 0;
+                        };
+                        current.detection_down =
+                            if snapshot.activity == Activity::DetectionUnavailable {
+                                current.detection_down.saturating_add(1)
+                            } else {
+                                0
+                            };
+                        current.detection_down
+                    });
+                    let failure = failure_due(snapshot.activity, &snapshot.message, detection_down);
                     let ask = if !snapshot.ask_prompt.is_empty() {
                         Some(format!(
                             "{} is running. AI is still running: open GamePause to pause it for this game.",
@@ -713,16 +761,16 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> L
                         current.notifications.poll(
                             current.clock.elapsed(),
                             crate::notifications::Input {
-                                pause: snapshot.pause_completions,
-                                restore: snapshot.restore_completions,
+                                pause: snapshot.pause,
+                                restore: snapshot.restore,
                                 activity: snapshot.activity,
                                 pending: snapshot.pending,
-                                freed: snapshot.freed_bytes,
+                                freed: snapshot.freed,
                                 ask: ask.as_deref(),
                                 failure: failure.then_some(snapshot.message.as_str()),
                             },
-                            snapshot.config.notifications_enabled,
-                            snapshot.config.sound_enabled,
+                            snapshot.visual,
+                            snapshot.sound,
                         )
                     });
                     // Release every state borrow before shell calls that can reenter.
@@ -786,7 +834,7 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> L
                 if pause {
                     crate::app::request_core(&ui.shared, &ui.tx, CoreCommand::Pause);
                 } else if crate::ui_commands::allowed(&ui.shared, Command::Resume) {
-                    crate::restore_dialog::request(hwnd, &ui.shared, &ui.tx);
+                    crate::restore_dialog::request(hwnd, &ui.shared, &ui.tx, &ui.folder);
                 }
             }
             0
@@ -843,7 +891,8 @@ pub fn run(shared: SharedState, tx: Sender<Action>, folder: PathBuf, show: bool)
                 attention: icon(icon_tint(StateKind::Attention)),
             },
             taskbar_message: RegisterWindowMessageW(taskbar.as_ptr()),
-            last_error: String::new(),
+            shown: None,
+            detection_down: 0,
             notifications: crate::notifications::Queue::default(),
             clock: std::time::Instant::now(),
 
@@ -1025,6 +1074,42 @@ mod tests {
         unsafe { super::apply_theme(std::ptr::null_mut()) };
     }
     #[test]
+    fn only_real_or_lasting_problems_are_announced_as_failures() {
+        // A failed operation and saved AI found waiting are announced at once.
+        assert!(failure_due(Activity::PartialFailure, "Restore failed", 0));
+        assert!(failure_due(
+            Activity::Recovery,
+            "Saved AI is waiting to be restored; restoring in 30s",
+            0
+        ));
+        assert!(failure_due(
+            Activity::Watching,
+            "Needs attention — repeated monitoring failures: x",
+            0
+        ));
+        // Waking from sleep is a short hold, with or without saved AI.
+        let wake = "Power state changed; fresh game detection is required before AI control.";
+        assert!(!failure_due(Activity::DetectionUnavailable, wake, 1));
+        assert!(!failure_due(
+            Activity::Recovery,
+            "Windows resumed; saved AI recovery in 30s after fresh game detection.",
+            0
+        ));
+        // Detection that stays down is announced once it has lasted.
+        assert!(!failure_due(
+            Activity::DetectionUnavailable,
+            wake,
+            DETECTION_DOWN_TICKS - 1
+        ));
+        assert!(failure_due(
+            Activity::DetectionUnavailable,
+            wake,
+            DETECTION_DOWN_TICKS
+        ));
+        assert!(!failure_due(Activity::Unknown, "Starting GamePause", 0));
+        assert!(!failure_due(Activity::Paused, "AI paused for gaming", 0));
+    }
+    #[test]
     fn icon_tint_maps_state_to_distinct_colors() {
         // The three states must be visually distinct (P1-6 acceptance: the
         // state→icon mapping is asserted without Win32).
@@ -1034,11 +1119,12 @@ mod tests {
         assert_ne!(idle, paused, "idle and paused icons must differ");
         assert_ne!(idle, attention, "idle and attention icons must differ");
         assert_ne!(paused, attention, "paused and attention icons must differ");
-        // Each tint supplies three DIB color bytes; the attention color is a warning red
-        // (high R, low G/B) so it pops against the dark tray.
-        assert!(attention[0] > 180 && attention[1] < 120 && attention[2] < 120);
-        // DIB pixels are BGR: paused uses orange with a dominant red byte.
+        // DIB pixels are BGR. The attention color is a warning red (low B/G,
+        // high R) so it pops against the dark tray and cannot pass for idle.
+        assert!(attention[2] > 180 && attention[1] < 120 && attention[0] < 120);
+        // Paused uses orange with a dominant red byte; idle is blue.
         assert!(paused[2] > paused[0] && paused[2] > paused[1]);
+        assert!(idle[0] > idle[2]);
     }
     #[test]
     fn timer_can_reenter_while_menu_context_is_alive() {
@@ -1094,7 +1180,8 @@ mod tests {
                     attention: null_mut(),
                 },
                 taskbar_message: WM_APP + 9,
-                last_error: String::new(),
+                shown: None,
+                detection_down: 0,
                 notifications: crate::notifications::Queue::default(),
                 clock: std::time::Instant::now(),
 
@@ -1110,16 +1197,24 @@ mod tests {
         unsafe {
             window_proc(null_mut(), WM_TIMER, 1, 0);
         }
+        // The nested timer could write the state it sent to the shell.
         assert_eq!(
-            ui_snapshot().unwrap().last_error,
-            "Needs attention: simulated failure"
+            ui_snapshot().unwrap().shown,
+            Some((
+                StateKind::Attention,
+                "Needs attention: simulated failure".to_string()
+            ))
         );
         shared.lock().unwrap().message = "AI available".into();
+        shared.lock().unwrap().activity = Activity::Watching;
         shared.lock().unwrap().pending = false;
         unsafe {
             window_proc(null_mut(), WM_TIMER, 1, 0);
         }
-        assert!(ui_snapshot().unwrap().last_error.is_empty());
+        assert_eq!(
+            ui_snapshot().unwrap().shown,
+            Some((StateKind::Idle, "AI available".to_string()))
+        );
         drop(session);
         assert!(begin_menu().is_some(), "menu opens again after dismissal");
         shared.lock().unwrap().detection_ok = true;

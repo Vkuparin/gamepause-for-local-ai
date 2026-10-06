@@ -195,17 +195,22 @@ impl Scanner {
             patterns,
         })
     }
+    /// Runs for every process on every scan, so it compares in place.
     pub fn excluded(&self, name: &str, path: &str) -> bool {
-        HELPERS.contains(&name.to_lowercase().as_str())
+        HELPERS
+            .iter()
+            .any(|helper| helper.eq_ignore_ascii_case(name))
             || self.patterns.iter().any(|r| r.is_match(name))
             || self
                 .config
                 .excluded_paths
                 .iter()
                 .any(|root| inside(path, root))
-            || canonical(path)
-                .split('\\')
-                .any(|p| ["__installer", "_commonredist", "redist"].contains(&p))
+            || path.split(['\\', '/']).any(|part| {
+                ["__installer", "_commonredist", "redist"]
+                    .iter()
+                    .any(|folder| folder.eq_ignore_ascii_case(part))
+            })
     }
     /// The executable of a fullscreen foreground process that nothing
     /// recognises: not a known game, helper, exclusion, Windows component or
@@ -242,11 +247,13 @@ impl Scanner {
         let mut uncertain_pids = HashSet::new();
         self.inaccessible = 0;
         self.uncertain_games = false;
-        let known_pids: HashSet<u32> = self
+        // Match each already-known process once; the enumeration reuses it.
+        let known: HashMap<(u32, u64), &Game> = self
             .cache
             .iter()
-            .filter_map(|((pid, _), path)| self.match_path(path, games).map(|_| *pid))
+            .filter_map(|(key, path)| self.match_path(path, games).map(|game| (*key, game)))
             .collect();
+        let known_pids: HashSet<u32> = known.keys().map(|key| key.0).collect();
         let known_names: HashSet<String> = games
             .iter()
             .filter_map(|game| {
@@ -274,9 +281,10 @@ impl Scanner {
                         .position(|n| *n == 0)
                         .unwrap_or(entry.szExeFile.len())],
                 );
-                if !HELPERS.contains(&name.to_lowercase().as_str()) && entry.th32ProcessID != 0 {
-                    let known_game = known_pids.contains(&entry.th32ProcessID)
-                        || known_names.contains(&name.to_lowercase());
+                let lower = name.to_lowercase();
+                if !HELPERS.contains(&lower.as_str()) && entry.th32ProcessID != 0 {
+                    let known_game =
+                        known_pids.contains(&entry.th32ProcessID) || known_names.contains(&lower);
                     let process =
                         OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, entry.th32ProcessID);
                     if process.is_null() {
@@ -297,6 +305,7 @@ impl Scanner {
                                     | created.dwLowDateTime as u64,
                             );
                             live.insert(key);
+                            let fresh = !self.cache.contains_key(&key);
                             if let std::collections::hash_map::Entry::Vacant(v) =
                                 self.cache.entry(key)
                             {
@@ -316,7 +325,11 @@ impl Scanner {
                                 }
                             }
                             if let Some(path) = self.cache.get(&key)
-                                && let Some(game) = self.match_path(path, games)
+                                && let Some(game) = if fresh {
+                                    self.match_path(path, games)
+                                } else {
+                                    known.get(&key).copied()
+                                }
                             {
                                 active.push(ActiveGame {
                                     pid: key.0,

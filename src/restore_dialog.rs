@@ -18,7 +18,7 @@ pub fn resume_label(gaming: bool, coexisting: bool, pending: bool) -> &'static s
 }
 
 /// Both native surfaces call this flow. The worker alone accepts offer IDs.
-pub fn request(_parent: HWND, state: &SharedState, tx: &Sender<Action>) {
+pub fn request(_parent: HWND, state: &SharedState, tx: &Sender<Action>, folder: &std::path::Path) {
     let Ok(snapshot) = state.lock().map(|shared| shared.clone()) else {
         return;
     };
@@ -39,5 +39,5 @@ pub fn request(_parent: HWND, state: &SharedState, tx: &Sender<Action>) {
         crate::app::request_core(state, tx, CoreCommand::Restore);
         return;
     }
-    crate::dashboard::request_resume(state.clone(), tx.clone());
+    crate::dashboard::request_resume(state.clone(), tx.clone(), folder.to_path_buf());
 }

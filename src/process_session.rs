@@ -623,12 +623,19 @@ mod native {
                 .to_string(),
         })
     }
-    unsafe extern "system" fn close_window(window: HWND, pid: LPARAM) -> i32 {
+    /// The process to close and how many of its windows were asked.
+    struct Closing {
+        pid: u32,
+        asked: u32,
+    }
+    unsafe extern "system" fn close_window(window: HWND, closing: LPARAM) -> i32 {
         let mut owner = 0u32;
         unsafe {
+            // Valid for the synchronous EnumWindows call that passed it.
+            let closing = &mut *(closing as *mut Closing);
             GetWindowThreadProcessId(window, &mut owner);
-            if owner == pid as u32 {
-                PostMessageW(window, WM_CLOSE, 0, 0);
+            if owner == closing.pid && PostMessageW(window, WM_CLOSE, 0, 0) != 0 {
+                closing.asked += 1;
             }
         }
         1
@@ -638,9 +645,12 @@ mod native {
             // Already gone, or not ours to stop; the absence check decides.
             return Ok(());
         };
+        let mut closing = Closing { pid, asked: 0 };
         unsafe {
-            EnumWindows(Some(close_window), pid as LPARAM);
-            if WaitForSingleObject(handle.0, 3_000) == WAIT_OBJECT_0 {
+            EnumWindows(Some(close_window), &raw mut closing as LPARAM);
+            // A console server owns no window (its console belongs to the
+            // host), so no close request can reach it: do not wait for one.
+            if closing.asked != 0 && WaitForSingleObject(handle.0, 3_000) == WAIT_OBJECT_0 {
                 return Ok(());
             }
             TerminateProcess(handle.0, 1);

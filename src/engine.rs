@@ -469,9 +469,11 @@ impl<B: Backend> Engine<B> {
         }
         let mut changed = false;
         for game in games {
-            if !self.remembered_games.iter().any(|g| {
-                crate::discovery::canonical(&g.path) == crate::discovery::canonical(&game.path)
-            }) {
+            if !self
+                .remembered_games
+                .iter()
+                .any(|g| crate::discovery::same_path(&g.path, &game.path))
+            {
                 self.remembered_games.push(game);
                 changed = true;
             }
@@ -553,6 +555,14 @@ impl<B: Backend> Engine<B> {
                 } else if self.pause_verified() {
                     self.set_activity(Activity::Countdown);
                     self.message = format!("Restoring AI in {}s", remaining.ceil() as u64);
+                } else if self.last_error.is_empty() {
+                    // Unverified, not failed: a restart or a fresh journal
+                    // carries no evidence either way.
+                    self.set_activity(Activity::Recovery);
+                    self.message = format!(
+                        "Saved AI is waiting to be restored; restoring in {}s",
+                        remaining.ceil() as u64
+                    );
                 } else {
                     self.set_activity(Activity::Recovery);
                     self.message = format!(
@@ -931,7 +941,7 @@ impl<B: Backend> Engine<B> {
                 .as_ref()
                 .is_some_and(|journal| journal.providers.iter().all(|entry| entry.restore_complete))
         {
-            bail!("LM Studio recovery is pending; re-enable its provider. Recovery retained");
+            bail!("AI recovery is pending; re-enable its provider in Advanced. Recovery retained");
         }
         if cancelled() {
             self.set_activity(Activity::Recovery);
