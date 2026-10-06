@@ -27,7 +27,7 @@ Select its game entry and click **Ignore selected**. Advanced exclusions also su
 
 Verify **Automatically pause AI while gaming** is checked and the game is enabled. Keep LM Studio open; its server is handled automatically. `--doctor` should report `snapshot_ok`. Busy inference/queued requests defer capture; retry occurs after the backoff interval. A capture failure leaves models loaded and reports the error.
 
-If the CLI is missing, install/bootstrap it in LM Studio or use **Locate lms…**. GamePause stays running and retries. Native API or WebSocket failures can indicate a port, token, server, or LM Studio protocol compatibility problem. Upgrading LM Studio may require an updated GamePause version.
+If the CLI is missing, install/bootstrap it in LM Studio or choose the file under **Advanced > LM Studio > lms executable**. GamePause stays running and looks again every 30 seconds. Native API or WebSocket failures can indicate a port, token, server, or LM Studio protocol compatibility problem. Upgrading LM Studio may require an updated GamePause version.
 
 ## AI does not restore
 

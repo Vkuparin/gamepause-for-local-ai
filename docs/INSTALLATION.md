@@ -30,11 +30,11 @@ The tray startup command includes a custom data directory when used. Keep the ex
 
 ## Portable ZIP
 
-Extract the whole ZIP into a permanent directory. Run `GamePause.exe` for the tray or `GamePauseCLI.exe` for diagnostics. Both are standalone native executables. Keep documentation and dependency licenses alongside them. Enable startup through the tray if desired.
+Extract the whole ZIP into a permanent directory. Run `GamePause.exe` for the tray or `GamePauseCLI.exe` for diagnostics. Both are standalone native executables. Keep documentation and dependency licenses alongside them. Enable startup under **Advanced > General** if desired.
 
 ## LM Studio configuration
 
-GamePause searches `PATH` and standard CLI locations. GamePause stays running and retries if the CLI is unavailable. Install/bootstrap it through LM Studio; for an unusual installation, use **Locate lms…** under Advanced settings. In version-3 files, update `connection` inside the existing `lmstudio` provider entry, preserving its ID and enabled choice:
+GamePause searches `PATH` and standard CLI locations. GamePause stays running and retries if the CLI is unavailable. Install/bootstrap it through LM Studio; for an unusual installation, choose the file under **Advanced > LM Studio > lms executable > Browse...**. When editing `config.json` by hand, update `connection` inside the existing `lmstudio` provider entry, preserving its ID and enabled choice:
 
 ```json
 "connection": {
@@ -44,7 +44,7 @@ GamePause searches `PATH` and standard CLI locations. GamePause stays running an
 }
 ```
 
-An already-running server port is detected automatically. The optional **Local API** dashboard field selects the port used when GamePause opens a temporary server. Only `localhost` and `127.0.0.1` are accepted. If REST authentication is enabled, provide `GAMEPAUSE_LM_API_TOKEN` in the app's environment. Never share the token. Internal WebSocket compatibility is checked separately; a REST token does not guarantee internal control access.
+An already-running server port is detected automatically. The **Loopback API address** field under Advanced > LM Studio selects the port used when GamePause opens a temporary server. Only `localhost` and `127.0.0.1` are accepted. If REST authentication is enabled, provide `GAMEPAUSE_LM_API_TOKEN` in the app's environment. Never share the token. Internal WebSocket compatibility is checked separately; a REST token does not guarantee internal control access.
 
 ## Upgrade and uninstall
 

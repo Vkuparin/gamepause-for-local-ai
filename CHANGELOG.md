@@ -1,5 +1,26 @@
 # Changelog
 
+## 2.0.1 — unreleased
+
+Fixes
+
+- Ollama: a model reload is allowed up to five minutes instead of ten seconds. Larger models could fail to come back after gaming, because the load request timed out and Ollama abandons a load whose client disconnects. Covered by fixtures; not yet confirmed against a live Ollama.
+- The tray icon is red when GamePause needs attention. It was blue, almost the same as the idle icon.
+- **Running apps > More... > Ignore executable** now stops that program from triggering a pause for launcher games too. Entries ignored this way with 2.0.0 are not converted: remove them under **Ignored** and ignore the executable again.
+- **Pause AI for this game** can no longer be lost when it is clicked while GamePause is busy, and it reports its result like other commands.
+- Waking the PC from sleep and starting GamePause no longer raise an error notification. A failed pause or restore, saved AI found waiting after a restart, and game detection that stays unavailable for about 20 seconds still do.
+- Unsaved Advanced edits are kept when another setting is saved or the game list refreshes; before, a typed shortcut or endpoint could vanish within 30 seconds. Escape in Advanced asks before discarding unsaved edits. Ollama settings use the same **Save settings** bar as the other pages.
+- Resuming from the tray during a game opens the dashboard with the data folder in use instead of the default one.
+- A restart with saved AI waiting says so, instead of "pause was incomplete".
+
+Changes
+
+- `--status` also reports other AI apps as `provider.process.*` lines, after the existing lines.
+- Worker log lines start with the local date and time instead of Unix seconds.
+- Other AI apps: a console program that has no window to close is ended at once instead of after a three-second wait.
+- The window title and help text say **GamePause**; wording that still described the round-trip test or a pending restore as LM Studio only is corrected, and references to the removed **Locate lms** control now point to **Advanced > LM Studio**.
+- Less background work: process matching no longer allocates for every process and game on each scan, settings are compared without serializing them, the tray icon is updated only when it changes, Steam manifests reuse one compiled parser, and a missing LM Studio CLI is searched for every 30 seconds instead of every two.
+
 ## 2.0.0 — 2026-10-06
 
 - Make Ollama a regular provider, enabled by default and tested against a live Ollama 0.35.1 installation; other versions are unverified. If Ollama is not running, GamePause reports **Not running** and does nothing. The opt-in dialog and experimental labels are gone.
