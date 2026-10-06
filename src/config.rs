@@ -58,6 +58,11 @@ pub struct Config {
     pub extra_games: Vec<ExtraGame>,
     pub excluded_executables: Vec<String>,
     pub excluded_paths: Vec<String>,
+    /// Point out fullscreen programs no launcher knows, so they can be added.
+    /// GamePause never pauses AI for them on its own.
+    pub suggest_unknown_games: bool,
+    /// Executables the user said are not games; never suggested again.
+    pub dismissed_suggestions: Vec<String>,
     /// System-wide Pause AI / Resume AI shortcut such as `Ctrl+Alt+P`.
     /// Empty registers nothing.
     pub pause_hotkey: String,
@@ -186,6 +191,8 @@ impl Default for Config {
             extra_games: vec![],
             excluded_executables: vec![],
             excluded_paths: vec![],
+            suggest_unknown_games: true,
+            dismissed_suggestions: vec![],
             pause_hotkey: String::new(),
         }
     }

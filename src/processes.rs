@@ -19,6 +19,90 @@ use windows_sys::Win32::{
     },
 };
 
+/// Programs that commonly run fullscreen and are not games.
+const NOT_GAMES: &[&str] = &[
+    "explorer.exe",
+    "chrome.exe",
+    "msedge.exe",
+    "firefox.exe",
+    "brave.exe",
+    "opera.exe",
+    "vivaldi.exe",
+    "vlc.exe",
+    "mpv.exe",
+    "mpc-hc64.exe",
+    "mpc-be64.exe",
+    "wmplayer.exe",
+    "potplayermini64.exe",
+    "spotify.exe",
+    "powerpnt.exe",
+    "winword.exe",
+    "excel.exe",
+    "acrobat.exe",
+    "acrord32.exe",
+    "code.exe",
+    "devenv.exe",
+    "windowsterminal.exe",
+    "obs64.exe",
+    "mstsc.exe",
+    "vmware.exe",
+    "virtualboxvm.exe",
+    "zoom.exe",
+    "teams.exe",
+    "ms-teams.exe",
+    "discord.exe",
+    "slack.exe",
+    "applicationframehost.exe",
+    "searchhost.exe",
+    "shellexperiencehost.exe",
+    "lockapp.exe",
+    "textinputhost.exe",
+    "dwm.exe",
+    "lm studio.exe",
+    "ollama app.exe",
+];
+/// Process that owns the foreground window when that window fills its
+/// monitor without a caption, as fullscreen and borderless games do. Reads
+/// window geometry only; no message is sent to the window.
+pub fn fullscreen_foreground() -> Option<u32> {
+    use windows_sys::Win32::{
+        Foundation::RECT,
+        Graphics::Gdi::{
+            GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+        },
+        UI::WindowsAndMessaging::{
+            GWL_STYLE, GetForegroundWindow, GetWindowLongW, GetWindowRect,
+            GetWindowThreadProcessId, WS_CAPTION,
+        },
+    };
+    unsafe {
+        let window = GetForegroundWindow();
+        if window.is_null() {
+            return None;
+        }
+        let mut rect: RECT = std::mem::zeroed();
+        let mut monitor: MONITORINFO = std::mem::zeroed();
+        monitor.cbSize = size_of::<MONITORINFO>() as u32;
+        if GetWindowRect(window, &mut rect) == 0
+            || GetMonitorInfoW(
+                MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST),
+                &mut monitor,
+            ) == 0
+        {
+            return None;
+        }
+        let screen = monitor.rcMonitor;
+        let covers = rect.left <= screen.left
+            && rect.top <= screen.top
+            && rect.right >= screen.right
+            && rect.bottom >= screen.bottom;
+        let captioned = GetWindowLongW(window, GWL_STYLE) as u32 & WS_CAPTION == WS_CAPTION;
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(window, &mut pid);
+        (covers && !captioned && pid != 0).then_some(pid)
+    }
+}
+
 pub const HELPERS: &[&str] = &[
     "galaxyclient.exe",
     "galaxyclientservice.exe",
@@ -122,6 +206,25 @@ impl Scanner {
             || canonical(path)
                 .split('\\')
                 .any(|p| ["__installer", "_commonredist", "redist"].contains(&p))
+    }
+    /// The executable of a fullscreen foreground process that nothing
+    /// recognises: not a known game, helper, exclusion, Windows component or
+    /// common fullscreen program. A hint for the user, never a trigger.
+    pub fn suggestion(&self, games: &[Game], foreground: Option<u32>) -> Option<String> {
+        let pid = foreground?;
+        let path = self
+            .cache
+            .iter()
+            .find(|((candidate, _), _)| *candidate == pid)
+            .map(|(_, path)| path)?;
+        let name = path.rsplit(['\\', '/']).next().unwrap_or("").to_lowercase();
+        let windows = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
+        (name.ends_with(".exe")
+            && !NOT_GAMES.contains(&name.as_str())
+            && !self.excluded(&name, path)
+            && !inside(path, &windows)
+            && self.match_path(path, games).is_none())
+        .then(|| path.clone())
     }
     pub fn match_path<'a>(&self, path: &str, games: &'a [Game]) -> Option<&'a Game> {
         let name = path.rsplit(['\\', '/']).next().unwrap_or("");
@@ -351,5 +454,34 @@ mod tests {
             s.match_path(r"D:\Games\Witcher\redlauncher.exe", &games)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn only_an_unrecognised_fullscreen_program_is_suggested() {
+        let mut config = Config::default();
+        config.excluded_paths.push(r"D:\Tools".into());
+        let mut scanner = Scanner::new(config).unwrap();
+        for (pid, path) in [
+            (1, r"D:\Unknown\Launcher Game\play.exe"),
+            (2, r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+            (3, r"D:\Known\Game\known.exe"),
+            (4, r"D:\Tools\tool.exe"),
+            (5, r"D:\Steam\steam.exe"),
+        ] {
+            scanner.cache.insert((pid, 1), path.into());
+        }
+        let windows = std::env::var("WINDIR").unwrap();
+        scanner
+            .cache
+            .insert((6, 1), format!(r"{windows}\System32\mspaint.exe"));
+        let games = vec![Game::new("Fixture", "known", "Known", r"D:\Known\Game")];
+        assert_eq!(
+            scanner.suggestion(&games, Some(1)).as_deref(),
+            Some(r"D:\Unknown\Launcher Game\play.exe")
+        );
+        for pid in [2, 3, 4, 5, 6, 99] {
+            assert_eq!(scanner.suggestion(&games, Some(pid)), None, "{pid}");
+        }
+        assert_eq!(scanner.suggestion(&games, None), None);
     }
 }

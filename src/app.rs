@@ -105,6 +105,8 @@ pub struct Shared {
     pub freed_bytes: u64,
     /// Running games whose rule is "ask" and that have not been answered.
     pub ask_prompt: Vec<String>,
+    /// Executable path of a program that looks like an unregistered game.
+    pub suggestion: Option<String>,
     pub power: Arc<crate::power::Signal>,
 }
 
@@ -605,6 +607,7 @@ pub fn main(console: bool) -> Result<()> {
         lm_missing: false,
         freed_bytes: 0,
         ask_prompt: vec![],
+        suggestion: None,
         power: Default::default(),
     }));
     let (tx, rx) = mpsc::channel();
@@ -1382,6 +1385,8 @@ struct DetectionFrame {
     config: Value,
     /// Running "ask" games, answered or not.
     asking: Vec<String>,
+    /// A fullscreen program nothing recognises, once it has stayed in front.
+    suggestion: Option<String>,
     active: Vec<ActiveGame>,
     all: Vec<ActiveGame>,
     evidence: Option<GameEvidence>,
@@ -1390,12 +1395,16 @@ struct DetectionFrame {
     lm_running: bool,
     running_apps: Vec<RunningApp>,
 }
+/// Scans a fullscreen program must lead before it is suggested.
+const SUGGEST_AFTER_SCANS: u32 = 5;
 struct NativeDetection {
     power_generation: u64,
     config: Value,
     scanner: Scanner,
     guard: Scanner,
     candidate: u64,
+    /// Unrecognised fullscreen executable and how many scans it has led.
+    fullscreen: (String, u32),
 }
 impl NativeDetection {
     fn new(config: &Config) -> Result<Self> {
@@ -1405,6 +1414,7 @@ impl NativeDetection {
             scanner: Scanner::new(config.clone())?,
             guard: recovery_scanner(config)?,
             candidate: 0,
+            fullscreen: (String::new(), 0),
         })
     }
     fn scan(&mut self, input: &DetectionInput) -> Result<DetectionFrame> {
@@ -1427,6 +1437,31 @@ impl NativeDetection {
         {
             self.candidate = self.candidate.saturating_add(1);
         }
+        // Suggest only what stays fullscreen and in front for several scans.
+        let front = input
+            .config
+            .suggest_unknown_games
+            .then(crate::processes::fullscreen_foreground)
+            .flatten();
+        match self.scanner.suggestion(&input.games, front) {
+            Some(path) if path == self.fullscreen.0 => {
+                self.fullscreen.1 = self.fullscreen.1.saturating_add(1)
+            }
+            Some(path) => self.fullscreen = (path, 1),
+            None => self.fullscreen = (String::new(), 0),
+        }
+        let suggestion = (self.fullscreen.1 >= SUGGEST_AFTER_SCANS)
+            .then(|| self.fullscreen.0.clone())
+            .filter(|path| {
+                !input
+                    .config
+                    .dismissed_suggestions
+                    .iter()
+                    .chain(&input.config.ignored_games)
+                    .any(|known| {
+                        crate::discovery::canonical(known) == crate::discovery::canonical(path)
+                    })
+            });
         let all = if input.guarded {
             self.guard.scan(&input.guard_games)?
         } else {
@@ -1465,6 +1500,7 @@ impl NativeDetection {
             power_generation: input.power_generation,
             config,
             asking,
+            suggestion,
             active,
             all,
             evidence,
@@ -1845,6 +1881,7 @@ fn run(
             if frame.asking.is_empty() {
                 ask_approved = false;
             }
+            let suggestion = frame.suggestion.clone();
             let ask_prompt = if ask_approved {
                 vec![]
             } else {
@@ -1975,6 +2012,7 @@ fn run(
                 shared.lm_missing = engine.lm_missing;
                 shared.freed_bytes = engine.freed_bytes;
                 shared.ask_prompt = ask_prompt.clone();
+                shared.suggestion = suggestion.clone();
                 shared.pending = engine.pending();
                 shared.active_mode = engine.config.mode == "active";
                 shared.config = engine.config.clone();
@@ -2231,6 +2269,7 @@ mod tests {
             power_generation: 0,
             config: serde_json::to_value(Config::default()).unwrap(),
             asking: vec![],
+            suggestion: None,
             active: vec![game.clone()],
             all: vec![game.clone()],
             evidence: Some(crate::gameplay::fixtures::evidence(vec![game.clone()])),
@@ -2293,6 +2332,7 @@ mod tests {
                     power_generation: input.power_generation,
                     config: serde_json::to_value(&input.config).unwrap(),
                     asking: vec![],
+                    suggestion: None,
                     active: vec![],
                     all: vec![],
                     evidence: Some(crate::gameplay::fixtures::evidence(vec![])),

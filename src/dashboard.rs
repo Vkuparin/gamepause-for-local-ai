@@ -1516,6 +1516,8 @@ impl Dashboard {
                         ui.heading("Game detection");
                         ui.colored_label(p.muted,"Launcher metadata and registered paths identify games. Running apps helps you add missed executables.");
                         numeric(ui,"Process poll interval (seconds)",&mut self.edit_config.poll_seconds,&mut self.dirty);
+                        self.dirty |= ui.styled_checkbox(&mut self.edit_config.suggest_unknown_games,"Point out fullscreen programs that look like games").changed();
+                        ui.colored_label(p.muted,"A suggestion only: AI is never paused for a program until you add it.");
                         numeric(ui,"Discovery interval (seconds)",&mut self.edit_config.discovery_seconds,&mut self.dirty);
                         string_list(ui,"Additional game folders",&mut self.edit_config.game_roots,&mut self.dirty);
                         string_list(ui,"Steam roots",&mut self.edit_config.steam_roots,&mut self.dirty);
@@ -1974,6 +1976,34 @@ impl Dashboard {
                                     {
                                         let _ = self.tx.send(Action::PauseForGame);
                                     }
+                                });
+                            });
+                        }
+                        if let Some(path) = &s.suggestion {
+                            let name = crate::process_session::file_name(path);
+                            palette.card().inner_margin(16).show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(format!(
+                                        "{name} looks like a game GamePause does not know. Add it so AI pauses when it runs?"
+                                    ));
+                                    ui.add_enabled_ui(!s.commands.settings_pending, |ui| {
+                                        if ui.button("Add as game").clicked() {
+                                            self.modal = Some(Modal::Add {
+                                                name: name
+                                                    .trim_end_matches(".exe")
+                                                    .trim_end_matches(".EXE")
+                                                    .into(),
+                                                path: path.clone(),
+                                                auto: true,
+                                            });
+                                        }
+                                        if ui.button("Not a game").clicked() {
+                                            let mut c = s.config.clone();
+                                            c.dismissed_suggestions.push(path.clone());
+                                            self.save(c, false);
+                                        }
+                                    });
                                 });
                             });
                         }

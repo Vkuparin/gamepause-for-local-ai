@@ -90,6 +90,10 @@ A previous gameplay coexistence choice is held while discovery refreshes and is 
 
 `--status` checks the instance lock and prints `status=absent` after quit/crash, even if an old status file remains. `--games` reads cached inventory and returns `games=absent` only when that file is missing. Permission/I/O errors and corrupt cached files are errors. Text fields escape backslashes, tabs, carriage returns and newlines as `\\`, `\t`, `\r`, `\n`; paths use the same escaping. `active_games` is a JSON array on one status line.
 
+## Games GamePause does not know
+
+A game from a launcher GamePause cannot read never triggers a pause on its own. To help you catch those, GamePause notices a program that stays fullscreen and in front for about ten seconds and is not a known game, a Windows component or a common fullscreen program such as a browser or video player. It then shows a notification and a prompt in the dashboard: **Add as game** registers it so AI pauses the next time it runs, and **Not a game** stops the suggestion for that program for good. AI is never paused on a suggestion alone. The check reads only the foreground window's size and owner. Turn it off under Advanced > Detection.
+
 ## Other AI apps
 
 For local AI servers without their own integration, such as llama.cpp's `llama-server.exe` or KoboldCpp, GamePause can stop the program for gaming and start it again afterwards. This has not been tested with those tools themselves; the process handling was tested with stand-in programs. Under Advanced > Other apps, choose **Add app...** and pick the program file. Each app has a **Start again after gaming** switch.

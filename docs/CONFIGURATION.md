@@ -15,6 +15,8 @@ The complete starting configuration is [config.example.json](../config.example.j
 | `retry_seconds` | `30` | Independent provider retry backoff, minimum 5 seconds |
 | `ask_games` | `[]` | Game paths that do not pause AI on their own; GamePause asks instead |
 | `pause_hotkey` | `""` | System-wide Pause AI / Resume AI shortcut such as `Ctrl+Alt+P`; needs Ctrl, Alt or Win plus one letter, digit, F1-F24 or a named key (Pause, Space, Home, End, Insert, Delete, PageUp, PageDown). Empty registers nothing |
+| `suggest_unknown_games` | `true` | Point out fullscreen programs that no launcher inventory knows. A suggestion only; AI is never paused for them |
+| `dismissed_suggestions` | `[]` | Executable paths answered with **Not a game**; never suggested again |
 | `providers` | LM Studio and Ollama enabled; no other apps chosen | Typed provider entries; see below |
 | `advanced_settings_visible` | `false` | Show noncore settings/tools in dashboard and tray |
 | `notifications_enabled` | `true` | Windows completion/failure notifications |

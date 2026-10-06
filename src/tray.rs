@@ -694,12 +694,19 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> L
                 if let Some(snapshot) = snapshot {
                     let failure = activity_kind(snapshot.activity) == StateKind::Attention
                         || snapshot.message.starts_with("Needs attention:");
-                    let ask = (!snapshot.ask_prompt.is_empty()).then(|| {
-                        format!(
+                    let ask = if !snapshot.ask_prompt.is_empty() {
+                        Some(format!(
                             "{} is running. AI is still running: open GamePause to pause it for this game.",
                             snapshot.ask_prompt.join(", ")
-                        )
-                    });
+                        ))
+                    } else {
+                        snapshot.suggestion.as_deref().map(|path| {
+                            format!(
+                                "{} looks like a game GamePause does not know. Open GamePause to add it.",
+                                crate::process_session::file_name(path)
+                            )
+                        })
+                    };
                     let delivery = UI_STATE.with(|state| {
                         let mut state = state.borrow_mut();
                         let current = state.as_mut()?;
@@ -1068,6 +1075,7 @@ mod tests {
             lm_missing: false,
             freed_bytes: 0,
             ask_prompt: vec![],
+            suggestion: None,
             power: Default::default(),
         }));
         {
@@ -1181,6 +1189,7 @@ mod tests {
             lm_missing: false,
             freed_bytes: 0,
             ask_prompt: vec![],
+            suggestion: None,
             power: Default::default(),
         }));
         let (tx, _rx) = mpsc::channel();
