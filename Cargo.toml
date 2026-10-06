@@ -1,6 +1,6 @@
 [package]
 name = "gamepause-lmstudio"
-version = "1.7.0"
+version = "2.0.0"
 edition = "2024"
 license = "MIT"
 description = "A native Windows tray app that pauses local AI for games, with LM Studio and experimental Ollama support."

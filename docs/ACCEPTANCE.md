@@ -1,5 +1,20 @@
 # Candidate acceptance
 
+## v2.0.0 owner publication request - 2026-10-06
+
+The owner set the goal "keep on implementing the 2.0.0 features, and after you are done, push to publish and release according to the process." This authorizes committing and publishing v2.0.0. The owner did not supply a test report for this build, so this record is a publication request, not a statement that the owner ran it.
+
+Automated checks passed: 291 library tests and 10 CLI integration tests (6 ignored), formatting, Clippy, the release resilience probe and the release build. The package verifier ran in the release workflow.
+
+Exercised live during development, on one Windows 11 PC with private data directories and a renamed system executable registered as a game:
+
+- Ollama 0.35.1 with one local GGUF model: observation mode, pause and restore with the frozen keep-alive, indefinite keep-alive, a pause requested during a running generation, recovery after the watcher was killed mid-pause, nothing loaded, nothing listening on the port, and migration of earlier settings.
+- LM Studio with one small embedding model loaded: the round-trip test alone and together with Ollama, and a mixed LM Studio plus Ollama session through the watcher. LM Studio reported as not installed (pointed at a missing CLI path) with and without Ollama.
+- The memory-freed figure, the ask rule's no-pause path and message, and the global shortcut end to end through the tray app with a synthetic key press.
+- The process provider's Windows handling with a stand-in executable: stop, sealed journal, relaunch with the same command line, and stop-only mode.
+
+Not exercised: the dashboard on a real desktop beyond rendered fixtures (the new Other apps page, the ask and suggestion prompts, the shortcut field), the ask rule's accept path, game suggestions against any real fullscreen program, real llama.cpp or KoboldCpp, Ollama versions other than 0.35.1, Ollama embedding or vision models and several resident models, real games, Windows 10, install/upgrade/uninstall, startup, sleep/wake, multi-monitor and screen-reader behavior. Published SHA256SUMS.txt and BUILD-INFO.json identify the packaged artifacts; the release acceptance asset records this request separately from build-time review status. Earlier records below are historical.
+
 ## v1.7.0 owner publication request - 2026-10-06
 
 The owner instructed "commit and publish v1.7.0" after receiving the slimmed tray menu, its check results and the list of unexercised behavior. This authorizes committing and publishing v1.7.0. The owner did not supply a test report for this build, so this record is a publication request, not a statement that the owner ran it.

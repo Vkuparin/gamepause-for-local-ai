@@ -8,15 +8,18 @@
 
 GamePause is a small native Rust app for Windows. It notices when a game starts, saves the models currently loaded in LM Studio, unloads them, and restores them afterward. It does the same for Ollama when Ollama is running. The model name can change: there is no fixed model list to maintain.
 
-GamePause **1.7.0** was published on 2026-10-06 at the owner's request. Download the installer or portable ZIP from [Releases](https://github.com/Vkuparin/gamepause-lmstudio/releases/tag/v1.7.0). See [Acceptance](docs/ACCEPTANCE.md) for the approval and evidence limits.
+GamePause **2.0.0** was published on 2026-10-06 at the owner's request. Download the installer or portable ZIP from [Releases](https://github.com/Vkuparin/gamepause-lmstudio/releases/tag/v2.0.0). See [Acceptance](docs/ACCEPTANCE.md) for the approval and evidence limits.
 
-**v1.7.0** slims the tray menu to a short state header and the quick controls: the automatic-pausing toggle, Pause AI, Resume AI, Open GamePause and Quit. Tools and details stay in the dashboard, which v1.6.0 restyled around four color-coded states. The control/recovery engine is unchanged. See the [changelog](CHANGELOG.md); the [v1.5.0 implementation journal](docs/UI_V1.5.0_JOURNAL.md) records the original dashboard redesign.
+**v2.0.0** makes Ollama a regular provider that works whenever it is running, and treats a missing AI app as nothing to pause instead of an error. It adds other AI apps that can be stopped and restarted by program file, per-game **Ask** rules, a system-wide Pause/Resume shortcut, suggestions for games GamePause does not know, and a rough figure for the memory a pause freed. Settings move to version 4 with an automatic, backed-up migration. See the [changelog](CHANGELOG.md); the [v1.5.0 implementation journal](docs/UI_V1.5.0_JOURNAL.md) records the original dashboard redesign and [Roadmap](docs/ROADMAP.md) lists ideas kept for later.
 
 ## Features
 
 - Discovers Steam, Epic, Xbox, EA, Ubisoft Connect, and Battle.net installations. Local inventories refresh every 30 seconds. Xbox package discovery refreshes every five minutes and defers during gaming.
 - Checks running processes every two seconds using Windows APIs and cached executable paths. Desktop shortcuts work too.
 - Captures loaded LLM and embedding instances, exact model selections, identifiers, TTL policies, and complete load configuration. Restoration verifies the settings.
+- Pauses Ollama too when it is running: unloads its local models and reloads completion models with the keep-alive time they had left.
+- Stops and restarts other local AI servers you choose by program file, such as llama.cpp or KoboldCpp (not yet tested with those tools).
+- Per-game rules (pause, ignore or ask), an optional system-wide Pause/Resume shortcut, and suggestions for fullscreen programs that look like unregistered games.
 - Stops LM Studio's HTTP server during gaming by default to prevent HTTP clients from immediately loading models again.
 - Waits 30 seconds after the last game exits. Starting another game cancels the delay; alt-tabbing keeps AI paused.
 - Keeps a durable recovery journal through partial failures and restarts.

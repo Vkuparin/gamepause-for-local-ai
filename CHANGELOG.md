@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 2.0.0 — 2026-10-06
 
 - Make Ollama a regular provider, enabled by default and tested against a live Ollama 0.35.1 installation; other versions are unverified. If Ollama is not running, GamePause reports **Not running** and does nothing. The opt-in dialog and experimental labels are gone.
 - Settings move to version 4. Version-3 files migrate on startup with a `config.v3.backup.json` copy; their Ollama entry is switched on once, and turning it off afterwards is kept. Older builds cannot read version-4 settings.
@@ -17,6 +17,7 @@
 - Show roughly how much model memory a pause freed, in the status, the dashboard and the pause notification.
 - **Test round-trip** and `--verify` now test Ollama after LM Studio and report its steps.
 - Clicking **Activity** a second time closes the Activity log.
+- The owner requested publication. No owner test report for this build was supplied. LM Studio and Ollama 0.35.1 were exercised live on one PC with a stand-in game; the dashboard was checked only through rendered fixtures, the process provider only with stand-in programs, and game suggestions and the ask prompt were not exercised against real games. See [Acceptance](docs/ACCEPTANCE.md).
 
 ## 1.7.0 — 2026-10-06
 
