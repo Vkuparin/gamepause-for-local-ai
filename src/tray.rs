@@ -23,11 +23,44 @@ use windows_sys::Win32::{
     },
     System::Diagnostics::Debug::MessageBeep,
     System::LibraryLoader::GetModuleHandleW,
-    UI::{Shell::*, WindowsAndMessaging::*},
+    UI::{
+        Input::KeyboardAndMouse::{MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey},
+        Shell::*,
+        WindowsAndMessaging::*,
+    },
 };
 use winreg::{RegKey, enums::*};
 
 const CALLBACK: u32 = WM_APP + 1;
+const HOTKEY_ID: i32 = 1;
+thread_local! {
+    /// Shortcut text last applied to the tray window, registered or refused.
+    static HOTKEY: RefCell<String> = const { RefCell::new(String::new()) };
+}
+/// Keep the registered system shortcut in step with saved settings. Runs on
+/// the tray UI thread; no borrow or lock spans the Win32 calls.
+fn sync_hotkey(hwnd: HWND, shared: &crate::app::SharedState) {
+    let wanted = shared
+        .lock()
+        .map(|s| s.config.pause_hotkey.clone())
+        .unwrap_or_default();
+    if HOTKEY.with(|current| *current.borrow() == wanted) {
+        return;
+    }
+    HOTKEY.with(|current| current.borrow_mut().clone_from(&wanted));
+    unsafe {
+        UnregisterHotKey(hwnd, HOTKEY_ID);
+    }
+    if let Ok(Some((modifiers, key))) = crate::config::parse_hotkey(&wanted)
+        && unsafe { RegisterHotKey(hwnd, HOTKEY_ID, modifiers | MOD_NOREPEAT, key) } == 0
+    {
+        crate::app::local_result(
+            shared,
+            crate::commands::Outcome::Failed,
+            format!("The shortcut {wanted} is in use by another program; choose a different one."),
+        );
+    }
+}
 const SHOW_DASHBOARD: u32 = WM_APP + 2;
 const STARTUP_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 static WINDOW: AtomicIsize = AtomicIsize::new(0);
@@ -626,6 +659,7 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> L
                 return 0;
             }
             if let Some(ui) = ui_snapshot() {
+                sync_hotkey(hwnd, &ui.shared);
                 #[cfg(test)]
                 if ui.menu_open {
                     MENU_TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
@@ -733,7 +767,27 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> L
             }
             0
         }
+        WM_HOTKEY if w == HOTKEY_ID as usize => {
+            // One toggle: pause when that is allowed, otherwise resume through
+            // the same guarded path as the tray's Resume AI.
+            if let Some(ui) = ui_snapshot() {
+                let pause = ui
+                    .shared
+                    .lock()
+                    .map(|s| s.controls().availability().allows(CoreCommand::Pause))
+                    .unwrap_or(false);
+                if pause {
+                    crate::app::request_core(&ui.shared, &ui.tx, CoreCommand::Pause);
+                } else if crate::ui_commands::allowed(&ui.shared, Command::Resume) {
+                    crate::restore_dialog::request(hwnd, &ui.shared, &ui.tx);
+                }
+            }
+            0
+        }
         WM_DESTROY => {
+            unsafe {
+                UnregisterHotKey(hwnd, HOTKEY_ID);
+            }
             dashboard::close();
             if let Some(ui) = ui_snapshot() {
                 unsafe {

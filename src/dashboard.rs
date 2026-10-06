@@ -1504,6 +1504,10 @@ impl Dashboard {
                         });
                         if appearance!=s.config.appearance {self.action(Action::Appearance(appearance),"Appearance");}
                         ui.colored_label(p.muted,"High contrast follows Windows colors. Closing the window keeps GamePause in the tray.");
+                        ui.add_space(8.0);ui.label("Pause AI / Resume AI shortcut");
+                        self.dirty |= ui.add(TextEdit::singleline(&mut self.edit_config.pause_hotkey).hint_text("None, for example Ctrl+Alt+P")).changed();
+                        ui.colored_label(p.muted,"Works everywhere, including in games. Needs Ctrl, Alt or Win plus one key. Leave empty for no shortcut.");
+                        self.save_bar(ui,s,p);
                         if ui.button("Keyboard help").clicked(){self.modal=Some(Modal::Help);}
                     },
                     SettingsPage::Detection=> {

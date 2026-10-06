@@ -14,6 +14,7 @@ The complete starting configuration is [config.example.json](../config.example.j
 | `restore_delay_seconds` | `30` | Grace period after the last detected game exits; 0 disables delay |
 | `retry_seconds` | `30` | Independent provider retry backoff, minimum 5 seconds |
 | `ask_games` | `[]` | Game paths that do not pause AI on their own; GamePause asks instead |
+| `pause_hotkey` | `""` | System-wide Pause AI / Resume AI shortcut such as `Ctrl+Alt+P`; needs Ctrl, Alt or Win plus one letter, digit, F1-F24 or a named key (Pause, Space, Home, End, Insert, Delete, PageUp, PageDown). Empty registers nothing |
 | `providers` | LM Studio and Ollama enabled | Typed provider entries; see below |
 | `advanced_settings_visible` | `false` | Show noncore settings/tools in dashboard and tray |
 | `notifications_enabled` | `true` | Windows completion/failure notifications |

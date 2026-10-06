@@ -58,6 +58,9 @@ pub struct Config {
     pub extra_games: Vec<ExtraGame>,
     pub excluded_executables: Vec<String>,
     pub excluded_paths: Vec<String>,
+    /// System-wide Pause AI / Resume AI shortcut such as `Ctrl+Alt+P`.
+    /// Empty registers nothing.
+    pub pause_hotkey: String,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Source {
@@ -159,7 +162,62 @@ impl Default for Config {
             extra_games: vec![],
             excluded_executables: vec![],
             excluded_paths: vec![],
+            pause_hotkey: String::new(),
         }
+    }
+}
+/// Parses `Ctrl+Alt+P` style text into Win32 modifier flags and a virtual
+/// key. Requires Ctrl, Alt or Win so plain typing can never trigger it.
+pub fn parse_hotkey(text: &str) -> Result<Option<(u32, u32)>> {
+    const ALT: u32 = 1;
+    const CONTROL: u32 = 2;
+    const SHIFT: u32 = 4;
+    const WIN: u32 = 8;
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    let (mut modifiers, mut key) = (0, None);
+    for part in text.split('+').map(str::trim) {
+        let upper = part.to_ascii_uppercase();
+        let modifier = match upper.as_str() {
+            "CTRL" | "CONTROL" => CONTROL,
+            "ALT" => ALT,
+            "SHIFT" => SHIFT,
+            "WIN" | "WINDOWS" => WIN,
+            _ => 0,
+        };
+        if modifier != 0 {
+            modifiers |= modifier;
+            continue;
+        }
+        let bytes = upper.as_bytes();
+        let code = match bytes {
+            [c] if c.is_ascii_uppercase() || c.is_ascii_digit() => u32::from(*c),
+            [b'F', digits @ ..] if !digits.is_empty() && digits.len() <= 2 => {
+                match upper[1..].parse::<u32>() {
+                    Ok(n @ 1..=24) => 0x6F + n,
+                    _ => 0,
+                }
+            }
+            _ => match upper.as_str() {
+                "PAUSE" => 0x13,
+                "SPACE" => 0x20,
+                "HOME" => 0x24,
+                "END" => 0x23,
+                "INSERT" => 0x2D,
+                "DELETE" => 0x2E,
+                "PAGEUP" => 0x21,
+                "PAGEDOWN" => 0x22,
+                _ => 0,
+            },
+        };
+        if code == 0 || key.replace(code).is_some() {
+            bail!("pause_hotkey must be modifiers plus one key, such as Ctrl+Alt+P");
+        }
+    }
+    match key {
+        Some(key) if modifiers & (CONTROL | ALT | WIN) != 0 => Ok(Some((modifiers, key))),
+        _ => bail!("pause_hotkey needs Ctrl, Alt or Win plus one key, such as Ctrl+Alt+P"),
     }
 }
 impl Config {
@@ -354,6 +412,7 @@ impl Config {
         if !["active", "observe"].contains(&self.mode.as_str()) {
             bail!("mode must be active or observe");
         }
+        parse_hotkey(&self.pause_hotkey)?;
         if self.settings_version != 4 {
             bail!("Unsupported settings version; configuration retained");
         }
@@ -739,5 +798,31 @@ mod tests {
         write_json(&p, &serde_json::json!({"second":2})).unwrap();
         assert!(fs::read_to_string(&p).unwrap().contains("second"));
         fs::remove_file(p).unwrap();
+    }
+
+    #[test]
+    fn hotkey_text_needs_a_real_modifier_and_exactly_one_key() {
+        assert_eq!(parse_hotkey("").unwrap(), None);
+        assert_eq!(parse_hotkey("  ").unwrap(), None);
+        assert_eq!(parse_hotkey("Ctrl+Alt+P").unwrap(), Some((3, 0x50)));
+        assert_eq!(parse_hotkey("ctrl + shift + f9").unwrap(), Some((6, 0x78)));
+        assert_eq!(parse_hotkey("Win+Pause").unwrap(), Some((8, 0x13)));
+        assert_eq!(parse_hotkey("Alt+7").unwrap(), Some((1, 0x37)));
+        for invalid in [
+            "P", "Shift+P", "Ctrl", "Ctrl+Alt", "Ctrl+P+Q", "Ctrl+F25", "Ctrl+é", "Ctrl++P",
+        ] {
+            assert!(parse_hotkey(invalid).is_err(), "{invalid}");
+        }
+        let config = Config {
+            pause_hotkey: "Shift+P".into(),
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+        assert!(
+            Config::parse(r#"{"settings_version":4}"#)
+                .unwrap()
+                .pause_hotkey
+                .is_empty()
+        );
     }
 }
