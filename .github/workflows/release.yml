@@ -1,18 +1,20 @@
-name: Build Windows release
+name: Release
+# Pushing a v* tag builds, verifies and publishes the release. A manual run
+# builds the same packages as a workflow artifact without publishing.
 on:
   workflow_dispatch:
   push:
     tags: ['v*']
 permissions:
-  contents: read
+  contents: write
 jobs:
-  build:
+  release:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - run: rustup toolchain install 1.99.0 --profile minimal --component rustfmt --component clippy
+      - run: rustup toolchain install 1.99.0 --profile minimal
+      - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked
-      - run: cargo run --locked --release --features resilience-test --example resilience_probe
       - name: Install official Inno Setup compiler
         shell: pwsh
         run: |
@@ -35,3 +37,28 @@ jobs:
             dist/*-Setup.exe
             dist/SHA256SUMS.txt
             dist/BUILD-INFO.json
+      - name: Publish the release with its changelog section as notes
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $taskVersion = (Get-Content -LiteralPath 'dist\BUILD-INFO.json' -Raw | ConvertFrom-Json).version
+          if ($env:GITHUB_REF_NAME -cne "v$taskVersion") { throw "Tag $env:GITHUB_REF_NAME does not match package version $taskVersion" }
+          $taskNotes = [Collections.Generic.List[string]]::new()
+          $taskInSection = $false
+          foreach ($taskLine in Get-Content -LiteralPath 'CHANGELOG.md') {
+            if ($taskLine -match '^## ') {
+              if ($taskInSection) { break }
+              $taskInSection = $taskLine -match ('^## ' + [regex]::Escape($taskVersion) + '(\s|$)')
+              continue
+            }
+            if ($taskInSection) { $taskNotes.Add($taskLine) }
+          }
+          if (-not ($taskNotes | Where-Object { $_.Trim() })) { throw "CHANGELOG.md has no entry for $taskVersion" }
+          $taskNotes.Add('')
+          $taskNotes.Add('Download the Setup.exe for a per-user installation or the windows-x64.zip for portable use. Quit a running GamePause from the tray before upgrading. The binaries are unsigned; compare downloads against SHA256SUMS.txt.')
+          $taskNotesFile = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+          $taskNotes | Set-Content -LiteralPath $taskNotesFile -Encoding utf8
+          gh release create $env:GITHUB_REF_NAME --title "GamePause $taskVersion" --notes-file $taskNotesFile --verify-tag "dist/GamePause-$taskVersion-Setup.exe" "dist/GamePause-$taskVersion-windows-x64.zip" dist/SHA256SUMS.txt dist/BUILD-INFO.json
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }

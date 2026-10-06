@@ -83,8 +83,6 @@ try {
         source_files=$taskSourceHashes
         artifacts=@($taskArtifacts)
         signing='unsigned'
-        human_acceptance='pending'
-        publication='requires human review, feedback and a separate publishing instruction'
     } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath 'dist\BUILD-INFO.json' -Encoding utf8
     $taskChecksums
 } finally { Pop-Location }

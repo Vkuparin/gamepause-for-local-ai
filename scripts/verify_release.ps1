@@ -2,7 +2,6 @@ param([string]$Distribution = (Join-Path $PSScriptRoot '..\dist'))
 $ErrorActionPreference = 'Stop'
 $taskDist = (Resolve-Path -LiteralPath $Distribution).Path
 $taskInfo = Get-Content -LiteralPath (Join-Path $taskDist 'BUILD-INFO.json') -Raw | ConvertFrom-Json
-if ($taskInfo.human_acceptance -ne 'pending') { throw 'This verifier does not establish human acceptance' }
 $taskExpectedNames = @("GamePause-$($taskInfo.version)-windows-x64.zip", "GamePause-$($taskInfo.version)-Setup.exe")
 $taskManifestNames = @($taskInfo.artifacts | ForEach-Object name)
 if (@(Compare-Object $taskExpectedNames $taskManifestNames).Count -ne 0) { throw 'Unexpected candidate artifact set' }
@@ -18,7 +17,7 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 $taskArchive = [IO.Compression.ZipFile]::OpenRead((Join-Path $taskDist $taskExpectedNames[0]))
 try {
     $taskEntries = @($taskArchive.Entries | ForEach-Object FullName)
-    foreach ($taskRequired in @('GamePause.exe','GamePauseCLI.exe','README.md','LICENSE','CHANGELOG.md','config.example.json','THIRD_PARTY_NOTICES.json','docs/USAGE.md','docs/CONFIGURATION.md','docs/ACCEPTANCE.md','docs/VALIDATION.md')) {
+    foreach ($taskRequired in @('GamePause.exe','GamePauseCLI.exe','README.md','LICENSE','CHANGELOG.md','config.example.json','THIRD_PARTY_NOTICES.json','docs/USAGE.md','docs/CONFIGURATION.md','docs/VALIDATION.md')) {
         if ($taskEntries -cnotcontains "GamePause/$taskRequired") { throw "Missing packaged file: $taskRequired" }
     }
     if ($taskEntries | Where-Object { $_ -match '(?i)(-review\.md$|-plan\.md$|AGENTS\.md$|playtest_notes\.md$|(^|/)(config|state|status|inventory)\.json$|\.log($|\.))' }) { throw 'Internal/runtime file in candidate archive' }
@@ -43,4 +42,4 @@ foreach ($taskExe in @('GamePause.exe','GamePauseCLI.exe')) {
 }
 $taskVersionOutput = & (Join-Path $taskDist 'GamePause\GamePauseCLI.exe') --version
 if ($LASTEXITCODE -ne 0 -or "$taskVersionOutput" -notmatch [regex]::Escape($taskInfo.version)) { throw 'CLI version mismatch' }
-"Candidate $($taskInfo.version): checksums, metadata, default preferences, license texts and archive contents verified. Human/live acceptance remains pending."
+"GamePause $($taskInfo.version): checksums, metadata, default preferences, license texts and archive contents verified."

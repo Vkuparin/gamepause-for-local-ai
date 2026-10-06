@@ -1,6 +1,8 @@
 name: CI
+# Tags are built and tested by the release workflow.
 on:
   push:
+    branches: ['**']
   pull_request:
 permissions:
   contents: read
@@ -10,7 +12,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install 1.99.0 --profile minimal --component rustfmt --component clippy
-      - run: cargo test --locked
-      - run: cargo run --locked --release --features resilience-test --example resilience_probe
+      - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
+      - run: cargo test --locked
       - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo run --locked --release --features resilience-test --example resilience_probe

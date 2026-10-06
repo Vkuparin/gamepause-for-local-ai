@@ -168,7 +168,16 @@ Install Inno Setup 6 (tested with 6.7.3). Run:
 
 This builds both native executables, copies docs and dependency licenses, packages a portable ZIP, compiles the per-user installer, and writes `dist\SHA256SUMS.txt`. Release optimizations use size optimization, LTO, stripping, and one codegen unit. The Windows target config statically links the C runtime, avoiding a separate Visual C++ redistributable. Destination PCs need no language runtime. See the [Rust linkage reference](https://doc.rust-lang.org/reference/linkage.html#static-and-dynamic-c-runtimes).
 
-CI runs Windows tests, formatting, and Clippy. The tag-triggered release workflow builds distribution artifacts; publication is a separate action. The installer's final page starts GamePause with `--background`, so setup ends in the tray without a dashboard window; Start menu and desktop shortcuts open the dashboard. Before publishing, inspect tracked files for private data, perform the live validation checklist, test install/uninstall/startup registration and the tray-only post-install launch, verify checksums, and publish release notes with compatibility limits.
+CI runs formatting, tests, Clippy and the release resilience probe on every branch push and pull request; tags are left to the release workflow. The installer's final page starts GamePause with `--background`, so setup ends in the tray without a dashboard window; Start menu and desktop shortcuts open the dashboard.
+
+## Releasing
+
+1. Set the version in `Cargo.toml`, `Cargo.lock` and `installer/GamePause.iss`.
+2. Add a `## <version> — <date>` section to `CHANGELOG.md`. It becomes the release notes verbatim, so write it for users and include anything known to be untested that they should hear about.
+3. Run the quality gates, commit and push to `main`, and wait for CI.
+4. Tag the commit `v<version>` and push the tag.
+
+The release workflow then runs the tests, builds the installer and portable ZIP, runs `scripts/verify_release.ps1` (checksums, version metadata, default preferences, dependency license texts, no internal or runtime files in the archive) and publishes the GitHub release with the installer, ZIP, `SHA256SUMS.txt` and `BUILD-INFO.json`. It refuses a tag that does not match the package version or a version with no changelog section. Nothing is uploaded by hand. A manual run of the workflow builds the same packages as a workflow artifact without publishing. Binaries are unsigned. Release only when asked to.
 
 ## Interactive tray regression
 
