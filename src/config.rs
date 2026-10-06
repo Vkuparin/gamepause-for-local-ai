@@ -44,6 +44,9 @@ pub struct Config {
     pub settings_version: u32,
     pub automation_enabled: bool,
     pub ignored_games: Vec<String>,
+    /// Games that never pause AI on their own: GamePause asks instead, and
+    /// AI keeps running until the user answers.
+    pub ask_games: Vec<String>,
     pub providers: Vec<Provider>,
     pub advanced_settings_visible: bool,
     pub appearance: Appearance,
@@ -144,6 +147,7 @@ impl Default for Config {
             settings_version: 4,
             automation_enabled: true,
             ignored_games: vec![],
+            ask_games: vec![],
             providers: default_providers(),
             advanced_settings_visible: false,
             appearance: Appearance::System,
@@ -159,6 +163,12 @@ impl Default for Config {
     }
 }
 impl Config {
+    /// The "ask" rule for a game folder or executable path.
+    pub fn asks(&self, path: &str) -> bool {
+        self.ask_games
+            .iter()
+            .any(|ask| crate::discovery::canonical(ask) == crate::discovery::canonical(path))
+    }
     pub fn any_provider_enabled(&self) -> bool {
         self.providers.iter().any(Provider::enabled)
     }

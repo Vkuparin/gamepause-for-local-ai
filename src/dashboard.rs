@@ -313,6 +313,7 @@ struct Row {
     platform: String,
     custom: bool,
     ignored: bool,
+    ask: bool,
     pid: Option<u32>,
 }
 fn ignored(config: &Config, path: &str) -> bool {
@@ -338,6 +339,7 @@ fn rows(shared: &Shared, page: Page, query: &str) -> Vec<Row> {
                 platform: g.launcher.clone(),
                 custom: g.launcher == "Custom",
                 ignored: ignored(&shared.config, &g.path),
+                ask: shared.config.asks(&g.path),
                 pid: status(&g.path).map(|g| g.pid),
             })
             .collect(),
@@ -357,6 +359,7 @@ fn rows(shared: &Shared, page: Page, query: &str) -> Vec<Row> {
                         .into(),
                     custom: false,
                     ignored: ignored(&shared.config, &a.path),
+                    ask: shared.config.asks(&a.path),
                     pid: status(&a.path).map(|g| g.pid),
                 }
             })
@@ -382,6 +385,7 @@ fn rows(shared: &Shared, page: Page, query: &str) -> Vec<Row> {
                         .into(),
                     custom: game.is_some_and(|g| g.launcher == "Custom"),
                     ignored: true,
+                    ask: false,
                     pid: status(path).map(|g| g.pid),
                 }
             })
@@ -1137,7 +1141,13 @@ impl Dashboard {
                                                 !s.commands.settings_pending,
                                                 Checkbox::new(
                                                     &mut on,
-                                                    if entry.ignored { "Off" } else { "On" },
+                                                    if entry.ignored {
+                                                        "Off"
+                                                    } else if entry.ask {
+                                                        "Ask"
+                                                    } else {
+                                                        "On"
+                                                    },
                                                 ),
                                             )
                                             .changed()
@@ -1347,6 +1357,20 @@ impl Dashboard {
                 ui.spacing_mut().interact_size.y = 44.0;
                 ui.spacing_mut().button_padding.x = 18.0;
                 ui.menu_button("More...", |ui| {
+                    if self.page == Page::Games
+                        && ui
+                            .button(if row.ask {
+                                "Pause automatically"
+                            } else {
+                                "Ask before pausing"
+                            })
+                            .clicked()
+                    {
+                        let mut c = s.config.clone();
+                        set_ask(&mut c, &row.path, !row.ask);
+                        self.save(c, false);
+                        ui.close();
+                    }
                     if self.page == Page::Running && ui.button("Ignore executable").clicked() {
                         let mut c = s.config.clone();
                         set_ignored(&mut c, &row.path, true);
@@ -1378,7 +1402,18 @@ fn ui_input_arrow(response: &Response) -> bool {
         .ctx
         .input(|i| i.key_pressed(Key::Enter) || i.key_pressed(Key::Space))
 }
+/// "Ask" and "ignore" are exclusive rules for one game.
+fn set_ask(config: &mut Config, path: &str, ask: bool) {
+    config.ask_games.retain(|p| canonical(p) != canonical(path));
+    if ask {
+        set_ignored(config, path, false);
+        config.ask_games.push(path.into());
+    }
+}
 fn set_ignored(config: &mut Config, path: &str, off: bool) {
+    if off {
+        config.ask_games.retain(|p| canonical(p) != canonical(path));
+    }
     config
         .ignored_games
         .retain(|p| canonical(p) != canonical(path));
@@ -1881,6 +1916,25 @@ impl Dashboard {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         self.hero(ui, s, &hero, palette);
+                        if !s.ask_prompt.is_empty() {
+                            palette.card().inner_margin(16).show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(format!(
+                                        "{} is running and set to ask. AI is still running.",
+                                        s.ask_prompt.join(", ")
+                                    ));
+                                    if Push::new("Pause AI for this game")
+                                        .icon(Icon::Pause)
+                                        .min(vec2(230.0, 44.0))
+                                        .show(ui, palette)
+                                        .clicked()
+                                    {
+                                        let _ = self.tx.send(Action::PauseForGame);
+                                    }
+                                });
+                            });
+                        }
                         ui.add_space(4.0);
                         self.settings_strip(ui, s, palette);
                         ui.add_space(4.0);
@@ -2796,5 +2850,19 @@ mod preserved_behavior_tests {
         let err = super::apply_rename(&cfg, "C:\\Games\\App\\game.exe", "   ")
             .expect_err("a blank name must be rejected");
         assert!(err.contains("empty"), "got: {err}");
+    }
+
+    #[test]
+    fn ask_and_ignore_are_exclusive_rules_for_one_game() {
+        let mut config = Config::default();
+        let path = r"D:\Games\Fixture";
+        set_ask(&mut config, path, true);
+        assert!(config.asks(path) && !ignored(&config, path));
+        set_ignored(&mut config, path, true);
+        assert!(!config.asks(path) && ignored(&config, path));
+        set_ask(&mut config, path, true);
+        assert!(config.asks(path) && !ignored(&config, path));
+        set_ask(&mut config, path, false);
+        assert!(!config.asks(path) && !ignored(&config, path));
     }
 }

@@ -11,6 +11,8 @@ pub enum Kind {
     Paused,
     Restored,
     Failure,
+    /// A game set to "ask" started; AI is still running.
+    Ask,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Event {
@@ -40,12 +42,15 @@ pub struct Input<'a> {
     pub failure: Option<&'a str>,
     /// Approximate bytes released by the pause being announced; 0 if unknown.
     pub freed: u64,
+    /// Prompt text while an unanswered "ask" game is running.
+    pub ask: Option<&'a str>,
 }
 #[derive(Clone, Default)]
 pub struct Queue {
     pause: u64,
     restore: u64,
     last_failure: bool,
+    asked: bool,
     queued: Option<(Event, Duration)>,
 }
 impl Queue {
@@ -56,6 +61,24 @@ impl Queue {
         visual: bool,
         sound: bool,
     ) -> Option<Delivery> {
+        // One prompt per appearance of an "ask" game, delivered at once.
+        let ask = input.ask.filter(|_| !self.asked && input.failure.is_none());
+        self.asked = input.ask.is_some();
+        if let Some(text) = ask {
+            self.pause = input.pause;
+            self.restore = input.restore;
+            let event = Event {
+                kind: Kind::Ask,
+                text: text.chars().take(512).collect(),
+            };
+            return if visual {
+                Some(Delivery::Toast { event, sound })
+            } else if sound {
+                Some(Delivery::Sound(event))
+            } else {
+                None
+            };
+        }
         let restored = input.restore != self.restore;
         let paused = input.pause != self.pause;
         self.pause = input.pause;
@@ -122,7 +145,7 @@ impl Queue {
                 .is_some_and(|(event, _)| match event.kind {
                     Kind::Paused => !pause_current,
                     Kind::Restored => !restore_current,
-                    Kind::Failure => true,
+                    Kind::Failure | Kind::Ask => true,
                 })
             {
                 self.queued = None;
@@ -173,6 +196,7 @@ mod tests {
             pending: true,
             failure: None,
             freed: 0,
+            ask: None,
         }
     }
     fn restored() -> Input<'static> {
@@ -183,6 +207,7 @@ mod tests {
             pending: false,
             failure: None,
             freed: 0,
+            ask: None,
         }
     }
     #[test]
@@ -269,6 +294,7 @@ mod tests {
                     "LM Studio recovery retry countdown changed"
                 }),
                 freed: 0,
+                ask: None,
             };
             let delivery = queue.poll(Duration::from_secs(time), input, true, false);
             if time == 1 {
@@ -328,11 +354,74 @@ mod tests {
     fn pause_notification_names_the_freed_memory_when_it_is_known() {
         let input = || Input {
             freed: 18_448_625_171,
+            ask: None,
             ..paused()
         };
         let mut queue = Queue::default();
         assert!(queue.poll(Duration::ZERO, input(), true, false).is_none());
         let delivered = queue.poll(Duration::from_secs(3), input(), true, false);
         assert!(format!("{delivered:?}").contains("AI paused: about 17.2 GB freed."));
+    }
+
+    #[test]
+    fn an_ask_game_prompts_once_per_appearance_and_never_over_a_failure() {
+        let asking = |ask| Input {
+            pause: 0,
+            restore: 0,
+            activity: Activity::Watching,
+            pending: false,
+            failure: None,
+            freed: 0,
+            ask,
+        };
+        let mut queue = Queue::default();
+        let first = queue.poll(
+            Duration::ZERO,
+            asking(Some("Pause AI for Fixture?")),
+            true,
+            true,
+        );
+        assert_eq!(
+            first,
+            Some(Delivery::Toast {
+                event: Event {
+                    kind: Kind::Ask,
+                    text: "Pause AI for Fixture?".into()
+                },
+                sound: true
+            })
+        );
+        for second in 1..4 {
+            assert!(
+                queue
+                    .poll(
+                        Duration::from_secs(second),
+                        asking(Some("Pause AI for Fixture?")),
+                        true,
+                        true
+                    )
+                    .is_none()
+            );
+        }
+        assert!(
+            queue
+                .poll(Duration::from_secs(5), asking(None), true, true)
+                .is_none()
+        );
+        assert!(
+            queue
+                .poll(
+                    Duration::from_secs(6),
+                    asking(Some("Pause AI for Fixture?")),
+                    true,
+                    true
+                )
+                .is_some()
+        );
+        let mut queue = Queue::default();
+        let mut failing = asking(Some("Pause AI for Fixture?"));
+        failing.failure = Some("fixture failure");
+        let delivered = queue.poll(Duration::ZERO, failing, true, false);
+        assert!(format!("{delivered:?}").contains("fixture failure"));
     }
 }

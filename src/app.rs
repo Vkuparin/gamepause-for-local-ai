@@ -21,12 +21,24 @@ use std::{
 
 #[derive(Clone, Debug)]
 pub enum Action {
-    Tracked { id: u64, action: Box<Action> },
-    RemoveCustom { path: String, name: String },
+    Tracked {
+        id: u64,
+        action: Box<Action>,
+    },
+    RemoveCustom {
+        path: String,
+        name: String,
+    },
     Pause,
+    /// Answer to an "ask" game: pause for it as for any other game, and
+    /// restore normally when it exits.
+    PauseForGame,
     Resume,
     Restore,
-    ConfirmedRestore { offer_id: u64, ignored: Vec<String> },
+    ConfirmedRestore {
+        offer_id: u64,
+        ignored: Vec<String>,
+    },
     RetryGameplayRestore,
     Disable,
     Refresh,
@@ -37,7 +49,10 @@ pub enum Action {
     Settings(Box<Config>),
     AdvancedSettings(Box<Config>),
     AdvancedVisibility(bool),
-    NotificationPreferences { visual: bool, sound: bool },
+    NotificationPreferences {
+        visual: bool,
+        sound: bool,
+    },
     Appearance(crate::config::Appearance),
 }
 impl Action {
@@ -88,6 +103,8 @@ pub struct Shared {
     pub lm_missing: bool,
     /// Approximate model memory released by the current pause; 0 if unknown.
     pub freed_bytes: u64,
+    /// Running games whose rule is "ask" and that have not been answered.
+    pub ask_prompt: Vec<String>,
     pub power: Arc<crate::power::Signal>,
 }
 
@@ -587,6 +604,7 @@ pub fn main(console: bool) -> Result<()> {
         doctor_pending: false,
         lm_missing: false,
         freed_bytes: 0,
+        ask_prompt: vec![],
         power: Default::default(),
     }));
     let (tx, rx) = mpsc::channel();
@@ -886,6 +904,8 @@ fn apply_action_detected(
     }
     match action {
         Action::Tracked { .. } => unreachable!(),
+        // Consumed by the watcher loop, which owns the answer's lifetime.
+        Action::PauseForGame => (),
         Action::RemoveCustom { path, name } => {
             let updated = remove_custom(&engine.config, &path, &name)?;
             return apply_action_detected(
@@ -1188,7 +1208,12 @@ pub fn remove_custom(config: &Config, path: &str, name: &str) -> Result<Config> 
     updated.validate()?;
     Ok(updated)
 }
-fn evidence_from(all: Vec<ActiveGame>, trigger_scanner: &Scanner, config: &Config) -> GameEvidence {
+fn evidence_from(
+    all: Vec<ActiveGame>,
+    trigger_scanner: &Scanner,
+    config: &Config,
+    ask_approved: bool,
+) -> GameEvidence {
     let triggers = all
         .iter()
         .filter(|game| {
@@ -1197,6 +1222,7 @@ fn evidence_from(all: Vec<ActiveGame>, trigger_scanner: &Scanner, config: &Confi
                 && !config.ignored_games.iter().any(|path| {
                     crate::discovery::canonical(path) == crate::discovery::canonical(&game.path)
                 })
+                && (ask_approved || !config.asks(&game.path))
         })
         .cloned()
         .collect();
@@ -1208,7 +1234,7 @@ fn scan_evidence(guard: &mut Scanner, config: &Config, games: &[Game]) -> Option
         return None;
     }
     let trigger_scanner = Scanner::new(config.clone()).ok()?;
-    let evidence = evidence_from(all, &trigger_scanner, config);
+    let evidence = evidence_from(all, &trigger_scanner, config, false);
     evidence.reliable().then_some(evidence)
 }
 fn restore_outcome<B: Backend>(engine: &Engine<B>, result: &Result<()>) -> String {
@@ -1347,11 +1373,15 @@ struct DetectionInput {
     steam_roots: Vec<String>,
     guarded: bool,
     ready: bool,
+    /// The user answered the current "ask" games with Pause.
+    ask_approved: bool,
 }
 #[derive(Clone)]
 struct DetectionFrame {
     power_generation: u64,
     config: Value,
+    /// Running "ask" games, answered or not.
+    asking: Vec<String>,
     active: Vec<ActiveGame>,
     all: Vec<ActiveGame>,
     evidence: Option<GameEvidence>,
@@ -1402,18 +1432,31 @@ impl NativeDetection {
         } else {
             scanned.clone()
         };
+        let mut asking = scanned
+            .iter()
+            .filter(|game| input.config.asks(&game.path))
+            .map(|game| game.game.clone())
+            .collect::<Vec<_>>();
+        asking.dedup();
         let active = scanned
             .into_iter()
             .filter(|game| {
                 !input.config.ignored_games.iter().any(|path| {
                     crate::discovery::canonical(path) == crate::discovery::canonical(&game.path)
-                })
+                }) && (input.ask_approved || !input.config.asks(&game.path))
             })
             .collect();
         let evidence = (input.ready
             && !self.scanner.uncertain_games
             && (!input.guarded || !self.guard.uncertain_games))
-            .then(|| evidence_from(all.clone(), &self.scanner, &input.config))
+            .then(|| {
+                evidence_from(
+                    all.clone(),
+                    &self.scanner,
+                    &input.config,
+                    input.ask_approved,
+                )
+            })
             .filter(GameEvidence::reliable);
         if !input.power.permits(input.power_generation) {
             bail!("Power state changed during game detection");
@@ -1421,6 +1464,7 @@ impl NativeDetection {
         Ok(DetectionFrame {
             power_generation: input.power_generation,
             config,
+            asking,
             active,
             all,
             evidence,
@@ -1603,6 +1647,7 @@ fn run(
         steam_roots: vec![],
         guarded: engine.pending(),
         ready: false,
+        ask_approved: false,
     };
     let mut native_detection = NativeDetection::new(&engine.config)?;
     let detection_state = state.clone();
@@ -1652,6 +1697,7 @@ fn run(
     let mut last_status = Value::Null;
     let mut inventory_pending = false;
     let mut force_requested = false;
+    let mut ask_approved = false;
     let mut generation = 0u64;
     let mut minimum_inventory_generation = 0u64;
     let mut queued = None;
@@ -1733,6 +1779,7 @@ fn run(
         if power.snapshot().suspended {
             match commands.recv_timeout(Duration::from_secs_f64(engine.config.poll_seconds)) {
                 Ok(Action::Quit) => break,
+                Ok(Action::PauseForGame) => ask_approved = true,
                 Ok(action) => queued = Some(action),
                 Err(mpsc::RecvTimeoutError::Timeout) => (),
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -1791,8 +1838,18 @@ fn run(
                 steam_roots: steam_roots.clone(),
                 guarded: guarded_scan,
                 ready: inventory_ready && errors.is_empty(),
+                ask_approved,
             };
             let frame = fresh_detection(&detection, detection_input.clone())?;
+            // An answer lasts while an "ask" game runs; the next launch asks again.
+            if frame.asking.is_empty() {
+                ask_approved = false;
+            }
+            let ask_prompt = if ask_approved {
+                vec![]
+            } else {
+                frame.asking.clone()
+            };
             let new_candidate = frame.candidate != last_candidate;
             last_candidate = frame.candidate;
             force_requested |= new_candidate;
@@ -1877,6 +1934,17 @@ fn run(
                     "Watching games; LM Studio is not open, so there is nothing to pause".into()
                 };
             }
+            if !ask_prompt.is_empty()
+                && !gaming
+                && !engine.pending()
+                && !engine.manual_pause
+                && engine.config.mode != "observe"
+            {
+                engine.message = format!(
+                    "{} is running; AI kept running. Choose Pause AI for this game to free memory.",
+                    ask_prompt.join(", ")
+                );
+            }
             let status = json!({"version":env!("CARGO_PKG_VERSION"),"implementation":"Rust","mode":engine.config.mode,"automation_enabled":engine.config.automation_enabled,"message":engine.message,"active_games":active,"installed_locations":games.len(),"detection_disabled":engine.disabled,"manual_pause":engine.manual_pause,"last_error":engine.last_error,"discovery_errors":errors,"inaccessible_processes":frame.inaccessible,"recovery_pending":engine.pending(),"provider_outcomes":engine.provider_statuses});
             if let Ok(mut shared) = state.lock() {
                 shared.restore_offer = engine.gameplay.offer();
@@ -1906,6 +1974,7 @@ fn run(
                 shared.provider_statuses = engine.provider_statuses.clone();
                 shared.lm_missing = engine.lm_missing;
                 shared.freed_bytes = engine.freed_bytes;
+                shared.ask_prompt = ask_prompt.clone();
                 shared.pending = engine.pending();
                 shared.active_mode = engine.config.mode == "active";
                 shared.config = engine.config.clone();
@@ -1978,6 +2047,7 @@ fn run(
         }
         match commands.recv_timeout(Duration::from_secs_f64(engine.config.poll_seconds)) {
             Ok(Action::Quit) => break,
+            Ok(Action::PauseForGame) => ask_approved = true,
             Ok(action) => queued = Some(action),
             Err(mpsc::RecvTimeoutError::Timeout) => (),
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -2125,6 +2195,7 @@ mod tests {
             steam_roots: vec![],
             guarded: true,
             ready: true,
+            ask_approved: false,
         };
         let worker = BackgroundDetection::start(
             input,
@@ -2159,6 +2230,7 @@ mod tests {
         let mut frame = DetectionFrame {
             power_generation: 0,
             config: serde_json::to_value(Config::default()).unwrap(),
+            asking: vec![],
             active: vec![game.clone()],
             all: vec![game.clone()],
             evidence: Some(crate::gameplay::fixtures::evidence(vec![game.clone()])),
@@ -2210,6 +2282,7 @@ mod tests {
             steam_roots: vec![],
             guarded: true,
             ready: true,
+            ask_approved: false,
         };
         let worker = BackgroundDetection::start(
             input.clone(),
@@ -2219,6 +2292,7 @@ mod tests {
                 Ok(DetectionFrame {
                     power_generation: input.power_generation,
                     config: serde_json::to_value(&input.config).unwrap(),
+                    asking: vec![],
                     active: vec![],
                     all: vec![],
                     evidence: Some(crate::gameplay::fixtures::evidence(vec![])),
@@ -2289,6 +2363,7 @@ mod tests {
             steam_roots: vec![],
             guarded: false,
             ready: true,
+            ask_approved: false,
         };
         let mut native = NativeDetection::new(&config).unwrap();
         let (published, frames) = mpsc::channel();
@@ -3515,6 +3590,35 @@ mod tests {
         assert_eq!(
             escape_field("name\tvalue\nnext\rline"),
             "name\\tvalue\\nnext\\rline"
+        );
+    }
+
+    #[test]
+    fn ask_rule_withholds_the_trigger_until_answered_and_excludes_ignore() {
+        let game = crate::gameplay::fixtures::game(42, 10);
+        let other = crate::gameplay::fixtures::game(43, 10);
+        let mut config = Config::default();
+        config.ask_games.push(game.path.to_uppercase());
+        assert!(config.asks(&game.path) && !config.asks(&other.path));
+        let scanner = Scanner::new(config.clone()).unwrap();
+        let all = vec![game.clone(), other.clone()];
+        let unanswered = evidence_from(all.clone(), &scanner, &config, false);
+        assert_eq!(unanswered.triggers, vec![other.clone()]);
+        assert_eq!(unanswered.all.len(), 2);
+        let answered = evidence_from(all.clone(), &scanner, &config, true);
+        assert_eq!(answered.triggers.len(), 2);
+        // An answer never overrides a game the user ignores.
+        config.ignored_games.push(other.path.clone());
+        let ignored = evidence_from(all, &scanner, &config, true);
+        assert_eq!(ignored.triggers, vec![game]);
+        // The setting round-trips and defaults to empty for existing files.
+        let saved = serde_json::to_string(&config).unwrap();
+        assert_eq!(Config::parse(&saved).unwrap().ask_games.len(), 1);
+        assert!(
+            Config::parse(r#"{"settings_version":4}"#)
+                .unwrap()
+                .ask_games
+                .is_empty()
         );
     }
 }

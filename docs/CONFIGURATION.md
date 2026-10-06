@@ -13,6 +13,7 @@ The complete starting configuration is [config.example.json](../config.example.j
 | `discovery_seconds` | `30` | Local inventory refresh, minimum 10 seconds |
 | `restore_delay_seconds` | `30` | Grace period after the last detected game exits; 0 disables delay |
 | `retry_seconds` | `30` | Independent provider retry backoff, minimum 5 seconds |
+| `ask_games` | `[]` | Game paths that do not pause AI on their own; GamePause asks instead |
 | `providers` | LM Studio and Ollama enabled | Typed provider entries; see below |
 | `advanced_settings_visible` | `false` | Show noncore settings/tools in dashboard and tray |
 | `notifications_enabled` | `true` | Windows completion/failure notifications |

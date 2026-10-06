@@ -489,7 +489,7 @@ struct NativeNotifications {
 fn notification_kind(kind: crate::notifications::Kind) -> StateKind {
     match kind {
         crate::notifications::Kind::Paused => StateKind::Paused,
-        crate::notifications::Kind::Restored => StateKind::Idle,
+        crate::notifications::Kind::Restored | crate::notifications::Kind::Ask => StateKind::Idle,
         crate::notifications::Kind::Failure => StateKind::Attention,
     }
 }
@@ -660,6 +660,12 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> L
                 if let Some(snapshot) = snapshot {
                     let failure = activity_kind(snapshot.activity) == StateKind::Attention
                         || snapshot.message.starts_with("Needs attention:");
+                    let ask = (!snapshot.ask_prompt.is_empty()).then(|| {
+                        format!(
+                            "{} is running. AI is still running: open GamePause to pause it for this game.",
+                            snapshot.ask_prompt.join(", ")
+                        )
+                    });
                     let delivery = UI_STATE.with(|state| {
                         let mut state = state.borrow_mut();
                         let current = state.as_mut()?;
@@ -671,6 +677,7 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> L
                                 activity: snapshot.activity,
                                 pending: snapshot.pending,
                                 freed: snapshot.freed_bytes,
+                                ask: ask.as_deref(),
                                 failure: failure.then_some(snapshot.message.as_str()),
                             },
                             snapshot.config.notifications_enabled,
@@ -1006,6 +1013,7 @@ mod tests {
             doctor_pending: false,
             lm_missing: false,
             freed_bytes: 0,
+            ask_prompt: vec![],
             power: Default::default(),
         }));
         {
@@ -1118,6 +1126,7 @@ mod tests {
             doctor_pending: false,
             lm_missing: false,
             freed_bytes: 0,
+            ask_prompt: vec![],
             power: Default::default(),
         }));
         let (tx, _rx) = mpsc::channel();
