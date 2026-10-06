@@ -29,7 +29,7 @@ It is local only: no telemetry, no downloads, no administrator service, and mode
 
 GamePause started as a fix for one situation: an assistant such as [Hermes Agent](https://hermes-agent.nousresearch.com) or [OpenClaw](https://openclaw.ai) keeps a large local model loaded around the clock, and then you want to play something. Any assistant, agent or chat app that runs on LM Studio or Ollama works the same way, because GamePause pauses the model server underneath it. Nothing has to be set up in the assistant.
 
-While a game runs, the assistant's requests to the local model fail or wait, as they would with the AI app closed, and they work again once the models are back. An assistant that reloads models on its own can undo the pause, so stop long-running jobs before you play.
+While a game runs, the assistant's requests to the local model fail or wait, as they would with the AI app closed, and they work again once the models are back. An assistant that reloads models on its own can undo the pause, so crons should be configured not to run unless model provider process is running.
 
 ## One window, four states
 
