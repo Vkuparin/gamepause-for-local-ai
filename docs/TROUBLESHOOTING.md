@@ -2,16 +2,9 @@
 
 ## Gather diagnostics
 
-Read-only Doctor, Status and cached Games work alongside the watcher. Under Advanced settings, Read-only diagnostics shows the same independent provider evidence without a terminal. Quit the watcher before a second observation run, Restore or disruptive Verify. From the installed/portable folder:
+Open **Advanced > Diagnostics** and choose **Check enabled providers** for read-only evidence about LM Studio, Ollama and other AI apps. **Activity** shows recent state changes and can load the recent worker log. **Advanced > Recovery > Test round-trip...** runs a live pause and restore on request.
 
-```powershell
-.\GamePauseCLI.exe --doctor
-.\GamePauseCLI.exe --discover
-.\GamePauseCLI.exe --observe --headless --duration 30
-.\GamePauseCLI.exe --verify
-```
-
-Reports, `status.json`, `inventory.json`, and rotated `gamepause.log` files are in `%LOCALAPPDATA%\GamePause`. Use `--data-dir DIRECTORY` consistently for a custom installation. Doctor reports independent probe outcomes without changing LM Studio model/server state; unavailable CLI, busy inference, protocol errors, or unwritable storage do not discard all results. WS compatibility is unknown when the server is stopped or no model is loaded. `--verify` is disruptive: it persists recovery, unloads, confirms an empty inventory, restores and compares settings. Close the GUI/games and finish inference first. Existing/corrupt recovery blocks a new verify. Failed or deferred restoration remains in `state.json`; use Restore or `--restore` after games exit. The report uses `capture`, `unload`, `verify-unloaded`, `restore`, and `verify-fields`. Actual WS operation logs include the instance and `lm=cli:...`; this identifies the CLI version, not an independently measured server version. Review and redact reports before posting them.
+Reports, `status.json`, `inventory.json`, and rotated `gamepause.log` files are in `%LOCALAPPDATA%\GamePause`. Use `--data-dir DIRECTORY` consistently for a custom installation. Doctor reports independent probe outcomes without changing LM Studio model/server state; unavailable CLI, busy inference, protocol errors, or unwritable storage do not discard all results. WS compatibility is unknown when the server is stopped or no model is loaded. **Test round-trip** is disruptive: it persists recovery, unloads, confirms an empty inventory, restores and compares settings. Close games and finish inference first. Existing/corrupt recovery blocks a new verify. Failed or deferred restoration remains in `state.json`; use **Resume AI** after games exit. The report uses `capture`, `unload`, `verify-unloaded`, `restore`, and `verify-fields`. Actual WS operation logs include the instance and `lm=cli:...`; this identifies the CLI version, not an independently measured server version. Review and redact reports before posting them.
 
 ## A game is missed
 
@@ -25,7 +18,7 @@ Select its game entry and click **Ignore selected**. Advanced exclusions also su
 
 ## AI does not pause
 
-Verify **Automatically pause AI while gaming** is checked and the game is enabled. Keep LM Studio open; its server is handled automatically. `--doctor` should report `snapshot_ok`. Busy inference/queued requests defer capture; retry occurs after the backoff interval. A capture failure leaves models loaded and reports the error.
+Verify **Automatically pause AI while gaming** is checked and the game is enabled. Keep LM Studio open; its server is handled automatically. Diagnostics should show the LM Studio CLI version and server state. Busy inference/queued requests defer capture; retry occurs after the backoff interval. A capture failure leaves models loaded and reports the error.
 
 If the CLI is missing, install/bootstrap it in LM Studio or choose the file under **Advanced > LM Studio > lms executable**. GamePause stays running and looks again every 30 seconds. Native API or WebSocket failures can indicate a port, token, server, or LM Studio protocol compatibility problem. Upgrading LM Studio may require an updated GamePause version.
 
@@ -35,10 +28,10 @@ Wait until every recognized game process exits, then allow the configured 30-sec
 
 Recovery checks exact model selection, identifiers, TTL policy, raw load fields, and native configuration. A mismatch preserves `state.json`; it does not silently accept different settings. Missing model files, changed settings, or a conflicting instance with the same identifier need resolution. Restore manually in LM Studio if necessary, comparing the saved journal. Do not delete the journal just to dismiss an error.
 
-With GamePause quit and no game running, retry recovery using:
+Normally **Resume AI** retries recovery. If GamePause will not stay open, quit it, close games and retry once from a terminal; a message box reports the result:
 
 ```powershell
-.\GamePauseCLI.exe --restore
+& "$env:LOCALAPPDATA\Programs\GamePause\GamePause.exe" --restore
 ```
 
 ## Startup or multiple-instance problems

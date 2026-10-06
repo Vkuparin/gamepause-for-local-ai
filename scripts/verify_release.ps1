@@ -17,9 +17,10 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 $taskArchive = [IO.Compression.ZipFile]::OpenRead((Join-Path $taskDist $taskExpectedNames[0]))
 try {
     $taskEntries = @($taskArchive.Entries | ForEach-Object FullName)
-    foreach ($taskRequired in @('GamePause.exe','GamePauseCLI.exe','README.md','LICENSE','CHANGELOG.md','config.example.json','THIRD_PARTY_NOTICES.json','docs/USAGE.md','docs/CONFIGURATION.md','docs/VALIDATION.md')) {
+    foreach ($taskRequired in @('GamePause.exe','README.md','LICENSE','CHANGELOG.md','config.example.json','THIRD_PARTY_NOTICES.json','docs/USAGE.md','docs/CONFIGURATION.md','docs/VALIDATION.md')) {
         if ($taskEntries -cnotcontains "GamePause/$taskRequired") { throw "Missing packaged file: $taskRequired" }
     }
+    if ($taskEntries -ccontains 'GamePause/GamePauseCLI.exe') { throw 'The development console build must not be packaged' }
     if ($taskEntries | Where-Object { $_ -match '(?i)(-review\.md$|-plan\.md$|AGENTS\.md$|playtest_notes\.md$|(^|/)(config|state|status|inventory)\.json$|\.log($|\.))' }) { throw 'Internal/runtime file in candidate archive' }
     $taskConfigEntry = $taskArchive.GetEntry('GamePause/config.example.json')
     $taskReader = [IO.StreamReader]::new($taskConfigEntry.Open())
@@ -35,11 +36,6 @@ try {
         if (@($taskEntries | Where-Object { $_.StartsWith($taskLicensePrefix) -and -not $_.EndsWith('/') }).Count -eq 0) { throw "Missing dependency license text: $($taskNotice.name)" }
     }
 } finally { $taskArchive.Dispose() }
-foreach ($taskExe in @('GamePause.exe','GamePauseCLI.exe')) {
-    $taskPath = Join-Path $taskDist "GamePause\$taskExe"
-    $taskVersion = (Get-Item -LiteralPath $taskPath).VersionInfo.ProductVersion
-    if ($taskVersion -ne $taskInfo.version -and $taskVersion -ne "$($taskInfo.version).0") { throw "Executable version mismatch: $taskExe ($taskVersion)" }
-}
-$taskVersionOutput = & (Join-Path $taskDist 'GamePause\GamePauseCLI.exe') --version
-if ($LASTEXITCODE -ne 0 -or "$taskVersionOutput" -notmatch [regex]::Escape($taskInfo.version)) { throw 'CLI version mismatch' }
+$taskVersion = (Get-Item -LiteralPath (Join-Path $taskDist 'GamePause\GamePause.exe')).VersionInfo.ProductVersion
+if ($taskVersion -ne $taskInfo.version -and $taskVersion -ne "$($taskInfo.version).0") { throw "Executable version mismatch: $taskVersion" }
 "GamePause $($taskInfo.version): checksums, metadata, default preferences, license texts and archive contents verified."

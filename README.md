@@ -1,6 +1,6 @@
 # GamePause for Local AI
 
-[![CI](https://github.com/Vkuparin/gamepause-lmstudio/actions/workflows/ci.yml/badge.svg)](https://github.com/Vkuparin/gamepause-lmstudio/actions/workflows/ci.yml)
+[![CI](https://github.com/Vkuparin/gamepause-for-local-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/Vkuparin/gamepause-for-local-ai/actions/workflows/ci.yml)
 [![MIT](https://img.shields.io/badge/license-MIT-155e75.svg)](LICENSE)
 [![Windows x64](https://img.shields.io/badge/platform-Windows_x64-155e75.svg)](docs/INSTALLATION.md)
 
@@ -10,7 +10,7 @@ GamePause is a small native Windows tray app. When a game starts, it saves what 
 
 ![GamePause dashboard, dark theme: AI paused while a game runs](docs/images/dashboard-dark.png)
 
-**[Download the latest release](https://github.com/Vkuparin/gamepause-lmstudio/releases/latest)** (installer or portable ZIP) · [Changelog](CHANGELOG.md) · [Installation guide](docs/INSTALLATION.md)
+**[Download the latest release](https://github.com/Vkuparin/gamepause-for-local-ai/releases/latest)** (installer or portable ZIP) · [Changelog](CHANGELOG.md) · [Installation guide](docs/INSTALLATION.md)
 
 ## What it does
 
@@ -27,7 +27,7 @@ It is local only: no telemetry, no downloads, no administrator service, and mode
 
 ## One window, four states
 
-The status card always shows one of four color-coded states: **AI running** (blue), **AI paused** (orange), **Loading** (yellow) and **AI needs attention** (red). Below it are one line per AI app, the game that triggered the pause, and roughly how much memory was freed.
+The status card always shows one of four color-coded states: **AI running** (blue), **AI paused** (orange), **Loading** (yellow) and **AI needs attention** (red). Below it are one line for each AI app you have installed or running, the game that triggered the pause, and roughly how much memory was freed.
 
 ![GamePause dashboard, light theme: AI running and watching for games](docs/images/dashboard-light.png)
 
@@ -41,7 +41,7 @@ Closing the window leaves GamePause watching from the tray. Left-click the icon 
 
 ## Get started
 
-1. Download **Setup.exe** from [Releases](https://github.com/Vkuparin/gamepause-lmstudio/releases) and install it. GamePause starts in the tray and, by default, at Windows sign-in.
+1. Download **Setup.exe** from [Releases](https://github.com/Vkuparin/gamepause-for-local-ai/releases) and install it. GamePause starts in the tray and, by default, at Windows sign-in.
 2. Use LM Studio or Ollama as usual. For LM Studio, its `lms` command-line tool must be installed; GamePause finds it on its own.
 3. Play. Automatic pausing is on from the first launch.
 
@@ -52,22 +52,20 @@ The installer and executables are unsigned, so Windows may show a publisher warn
 ## Good to know
 
 - **Busy models wait.** If a model is generating when a game starts, unloading waits until it finishes. Stop long-running agents before playing if you need the memory right away.
-- **Ollama restores a subset.** Embedding models and models with unknown format are unloaded but not reloaded; load options, parallelism and conversations are not preserved. Tested with Ollama 0.35.1 only. [Details](docs/USAGE.md#background-ai-applications).
-- **LM Studio updates can need a GamePause update.** Full settings restoration uses LM Studio's internal protocol. Run `GamePauseCLI.exe --doctor` after upgrading LM Studio. If a complete snapshot cannot be captured, GamePause refuses to unload.
+- **Ollama restores a subset.** Embedding models and models with unknown format are unloaded but not reloaded; load options, parallelism and conversations are not preserved. [Details](docs/USAGE.md#background-ai-applications).
+- **LM Studio updates can need a GamePause update.** Full settings restoration uses LM Studio's internal protocol. After upgrading LM Studio, check **Advanced > Diagnostics**. If a complete snapshot cannot be captured, GamePause refuses to unload.
 - **Quitting keeps a pending restore.** Models paused when you quit come back the next time GamePause runs. Restore before uninstalling.
 - **Detection is best effort.** Protected processes and unusual installations may need to be added by hand.
 
-## For scripts
+## Tested with
 
-`GamePauseCLI.exe` prints stable, one-line-per-item output:
+| AI app | Version | Notes |
+|---|---|---|
+| LM Studio | 0.4.25 | Full restore uses LM Studio's internal protocol, so a newer version can need a GamePause update. |
+| Ollama | 0.35.1 | One local GGUF model. Embedding, vision and multi-model sessions have automated coverage only. |
+| llama.cpp, KoboldCpp | none yet | Stop and restart was tested with stand-in programs. |
 
-| Command | Output |
-|---|---|
-| `--status` | Current state as `key=value` lines, safe to run beside the app |
-| `--games` | Known games as `name<TAB>launcher<TAB>path` |
-| `--doctor` | Read-only report on LM Studio, Ollama and the data folder |
-| `--verify` | Round-trip test: unload, confirm, restore, compare settings. Close the app first |
-| `--restore` | Retry a pending restore with the app closed |
+Using another version? **Advanced > Diagnostics** shows what GamePause can see, and a [report](https://github.com/Vkuparin/gamepause-for-local-ai/issues) with that output helps extend this table.
 
 ## Documentation
 

@@ -1,17 +1,17 @@
 #ifndef AppVersion
-  #define AppVersion "2.0.1"
+  #define AppVersion "2.1.0"
 #endif
 
 [Setup]
 AppId={{4E394232-957B-4E05-B0EC-F81F31DBFC2D}
-AppName=GamePause for LM Studio
+AppName=GamePause for Local AI
 AppVersion={#AppVersion}
 AppPublisher=GamePause contributors
-AppPublisherURL=https://github.com/Vkuparin/gamepause-lmstudio
-AppSupportURL=https://github.com/Vkuparin/gamepause-lmstudio/issues
-AppUpdatesURL=https://github.com/Vkuparin/gamepause-lmstudio/releases
+AppPublisherURL=https://github.com/Vkuparin/gamepause-for-local-ai
+AppSupportURL=https://github.com/Vkuparin/gamepause-for-local-ai/issues
+AppUpdatesURL=https://github.com/Vkuparin/gamepause-for-local-ai/releases
 DefaultDirName={localappdata}\Programs\GamePause
-DefaultGroupName=GamePause for LM Studio
+DefaultGroupName=GamePause for Local AI
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
@@ -36,10 +36,10 @@ Name: "desktopicon"; Description: "Create a desktop shortcut that opens the dash
 Source: "..\dist\GamePause\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{group}\GamePause"; Filename: "{app}\GamePause.exe"; Comment: "Open the GamePause dashboard"
+Name: "{group}\GamePause for Local AI"; Filename: "{app}\GamePause.exe"; Comment: "Open the GamePause dashboard"
 Name: "{group}\Usage guide"; Filename: "{app}\docs\USAGE.md"
 Name: "{group}\Uninstall GamePause"; Filename: "{uninstallexe}"
-Name: "{userdesktop}\GamePause"; Filename: "{app}\GamePause.exe"; Comment: "Open the GamePause dashboard"; Tasks: desktopicon
+Name: "{userdesktop}\GamePause for Local AI"; Filename: "{app}\GamePause.exe"; Comment: "Open the GamePause dashboard"; Tasks: desktopicon
 
 [Registry]
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "GamePause"; ValueData: """{app}\GamePause.exe"" --background"; Tasks: startup; Flags: uninsdeletevalue

@@ -7,7 +7,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Rust release build failed' }
     $taskMetadata = cargo metadata --locked --format-version 1 --filter-platform x86_64-pc-windows-msvc | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0) { throw 'Dependency metadata failed' }
-    $taskVersion = ($taskMetadata.packages | Where-Object name -eq 'gamepause-lmstudio').version
+    $taskVersion = ($taskMetadata.packages | Where-Object name -eq 'gamepause').version
     $taskBundle = Join-Path $taskRoot 'dist\GamePause'
     # Rebuild staging from scratch so removed docs/licenses cannot leak into a
     # later candidate. Refuse redirected directories before recursive removal.
@@ -22,7 +22,7 @@ try {
         Remove-Item -LiteralPath $taskResolvedBundle -Recurse -Force
     }
     New-Item -ItemType Directory -Path $taskBundle -Force | Out-Null
-    Copy-Item -LiteralPath 'target\release\GamePause.exe','target\release\GamePauseCLI.exe' -Destination $taskBundle -Force
+    Copy-Item -LiteralPath 'target\release\GamePause.exe' -Destination $taskBundle -Force
     foreach ($taskFile in @('README.md','LICENSE','CHANGELOG.md','config.example.json')) { Copy-Item -LiteralPath $taskFile -Destination $taskBundle -Force }
     New-Item -ItemType Directory -Path (Join-Path $taskBundle 'docs') -Force | Out-Null
     $taskUserDocs = Get-ChildItem -LiteralPath 'docs' -File | Where-Object { $_.Name -notlike '*-review.md' -and $_.Name -notlike '*-plan.md' }
@@ -34,7 +34,7 @@ try {
     if (Test-Path -LiteralPath 'docs\images') { Copy-Item -LiteralPath 'docs\images' -Destination (Join-Path $taskBundle 'docs') -Recurse -Force }
     $taskNotices = @()
     foreach ($taskPackage in ($taskMetadata.packages | Sort-Object name,version)) {
-        if ($taskPackage.name -eq 'gamepause-lmstudio') { continue }
+        if ($taskPackage.name -eq 'gamepause') { continue }
         $taskNotices += [ordered]@{name=$taskPackage.name; version=$taskPackage.version; license=$taskPackage.license; repository=$taskPackage.repository}
         $taskPackageRoot = Split-Path -Parent $taskPackage.manifest_path
         $taskLicenseFiles = Get-ChildItem -LiteralPath $taskPackageRoot -File | Where-Object { $_.Name -match '^(LICENSE|LICENCE|COPYING|NOTICE)' }

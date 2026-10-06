@@ -10,7 +10,7 @@ Destination PCs do not need Python, Node.js, Rust, or administrator rights. The 
 
 ## Installer
 
-Download the setup EXE and `SHA256SUMS.txt` from [the same release](https://github.com/Vkuparin/gamepause-lmstudio/releases). Compare the published hash with:
+Download the setup EXE and `SHA256SUMS.txt` from [the same release](https://github.com/Vkuparin/gamepause-for-local-ai/releases). Compare the published hash with:
 
 ```powershell
 Get-FileHash .\GamePause-1.0.0-Setup.exe -Algorithm SHA256
@@ -30,7 +30,7 @@ The tray startup command includes a custom data directory when used. Keep the ex
 
 ## Portable ZIP
 
-Extract the whole ZIP into a permanent directory. Run `GamePause.exe` for the tray or `GamePauseCLI.exe` for diagnostics. Both are standalone native executables. Keep documentation and dependency licenses alongside them. Enable startup under **Advanced > General** if desired.
+Extract the whole ZIP into a permanent directory. Run `GamePause.exe`. It is a standalone native executable. Keep documentation and dependency licenses alongside them. Enable startup under **Advanced > General** if desired.
 
 ## LM Studio configuration
 
@@ -59,7 +59,6 @@ Install Rust through rustup and Visual Studio C++ Build Tools with the Windows S
 ```powershell
 cargo build --locked --release
 .\target\release\GamePause.exe
-.\target\release\GamePauseCLI.exe --doctor
 ```
 
 Installer builds also need Inno Setup 6; see [Development](DEVELOPMENT.md).

@@ -28,9 +28,7 @@ The complete starting configuration is [config.example.json](../config.example.j
 | `excluded_executables` | `[]` | Additional executable names/globs (`*`, `?`), case-insensitive |
 | `excluded_paths` | `[]` | Directories to exclude from gaming detection |
 
-CLI `--active` and `--observe` override `mode` for that run without modifying config.
-Other switches: `--background` (quiet tray startup), `--headless`, `--duration N`, `--discover`, `--doctor`, `--restore`,
-`--data-dir DIRECTORY`, `--version`.
+`GamePause.exe` accepts `--background` (start in the tray), `--data-dir DIRECTORY` and `--restore` (retry a pending restore once and report the result). `--active` and `--observe` override `mode` for that run without modifying config.
 
 ## Provider entries
 
