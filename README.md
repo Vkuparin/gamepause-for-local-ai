@@ -8,7 +8,7 @@
 
 GamePause is a small native Windows tray app. When a game starts, it saves what LM Studio and Ollama have loaded, unloads it, and puts everything back after you stop playing. There is no model list to maintain and nothing to configure first.
 
-![GamePause dashboard, dark theme: AI paused while a game runs](docs/images/dashboard-dark.png)
+![GamePause for Local AI dashboard, dark theme](docs/images/dashboard-dark.png)
 
 **[Download the latest release](https://github.com/Vkuparin/gamepause-for-local-ai/releases/latest)** (installer or portable ZIP) · [Changelog](CHANGELOG.md) · [Installation guide](docs/INSTALLATION.md)
 
@@ -29,7 +29,7 @@ It is local only: no telemetry, no downloads, no administrator service, and mode
 
 The status card always shows one of four color-coded states: **AI running** (blue), **AI paused** (orange), **Loading** (yellow) and **AI needs attention** (red). Below it are one line for each AI app you have installed or running, the game that triggered the pause, and roughly how much memory was freed.
 
-![GamePause dashboard, light theme: AI running and watching for games](docs/images/dashboard-light.png)
+![GamePause for Local AI dashboard, light theme](docs/images/dashboard-light.png)
 
 Light, dark and Windows high-contrast themes are supported, and the dashboard follows your Windows setting by default. **Advanced** holds the connection settings, detection options, the shortcut, read-only diagnostics and a round-trip test that pauses and restores your live models on request.
 
@@ -90,5 +90,3 @@ cargo build --locked --release
 ```
 
 See [Contributing](CONTRIBUTING.md), [Security](SECURITY.md) and the [roadmap](docs/ROADMAP.md). Free under the [MIT license](LICENSE); binary distributions include dependency licenses. GamePause is an independent community project, not affiliated with LM Studio, Ollama or any launcher vendor.
-
-Screenshots show fictional sample data.
