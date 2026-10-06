@@ -19,11 +19,17 @@ GamePause is a small native Windows tray app. When a game starts, it saves what 
 - **LM Studio, restored exactly.** Every loaded LLM and embedding model returns with the same identifier, variant, TTL and load configuration, and the result is verified. The local server is stopped while you play, so clients cannot load models back in, and returned to its original state afterward.
 - **Ollama, when it is running.** Local models are unloaded. GGUF completion models are reloaded with their context and the keep-alive time they had left. If Ollama is not running, nothing happens and nothing is reported as an error.
 - **Other AI servers.** Pick a program file, such as `llama-server.exe` or `koboldcpp.exe`, and GamePause stops it for gaming and starts it again with the same command line. Not yet tested with those tools themselves.
-- **A rule per game.** **On** pauses automatically, **Off** ignores the game, **Ask** leaves AI running and offers a one-click pause.
+- **A rule per game.** **On** pauses automatically, **Off** ignores the game, **Ask** leaves AI running and offers a one-click pause, with **Always pause** and **Never pause** to remember the answer.
 - **Manual control.** **Pause AI** and **Resume AI** in the dashboard and tray, plus an optional system-wide shortcut that works inside games.
 - **Recovery that survives crashes.** What was unloaded is written to disk before anything changes. If GamePause or the PC goes down mid-pause, start GamePause again and it finishes the job.
 
 It is local only: no telemetry, no downloads, no administrator service, and model control stays on localhost.
+
+## Made for always-on AI assistants
+
+GamePause started as a fix for one situation: an assistant such as [Hermes Agent](https://hermes-agent.nousresearch.com) or [OpenClaw](https://openclaw.ai) keeps a large local model loaded around the clock, and then you want to play something. Any assistant, agent or chat app that runs on LM Studio or Ollama works the same way, because GamePause pauses the model server underneath it. Nothing has to be set up in the assistant.
+
+While a game runs, the assistant's requests to the local model fail or wait, as they would with the AI app closed, and they work again once the models are back. An assistant that reloads models on its own can undo the pause, so stop long-running jobs before you play.
 
 ## One window, four states
 

@@ -205,6 +205,24 @@ pub struct Discovery {
     retained: BTreeMap<String, Vec<Game>>,
     packages: Vec<Game>,
     package_at: Option<f64>,
+    /// Xbox game folders found on fixed drives, and when they were looked for.
+    xbox_roots: Vec<PathBuf>,
+    xbox_roots_at: Option<f64>,
+}
+/// How long the Xbox folder list and package inventory stand.
+const XBOX_REFRESH_SECONDS: f64 = 300.;
+/// Root folders of local fixed disks. Network, removable and optical drives
+/// are left alone: probing them can block or wake hardware for nothing.
+fn fixed_drives() -> Vec<PathBuf> {
+    use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives};
+    const DRIVE_FIXED: u32 = 3;
+    let present = unsafe { GetLogicalDrives() };
+    (b'A'..=b'Z')
+        .filter(|letter| present & (1 << (letter - b'A')) != 0)
+        .map(|letter| format!("{}:\\", letter as char))
+        .filter(|root| unsafe { GetDriveTypeW(crate::wide(root).as_ptr()) } == DRIVE_FIXED)
+        .map(PathBuf::from)
+        .collect()
 }
 impl Discovery {
     pub fn refresh(
@@ -535,9 +553,14 @@ impl Discovery {
         Ok(games)
     }
     fn xbox(&mut self, now: f64, force: bool, defer: bool) -> Result<Vec<Game>> {
+        // Every drive was once probed on each 30-second refresh. The folders
+        // rarely change, so they are looked for when forced and otherwise
+        // every five minutes, on fixed disks only.
+        let stale = self
+            .xbox_roots_at
+            .is_none_or(|at| now - at >= XBOX_REFRESH_SECONDS);
         let mut roots = BTreeSet::new();
-        for drive in b'C'..=b'Z' {
-            let drive = PathBuf::from(format!("{}:\\", drive as char));
+        for drive in (force || stale).then(fixed_drives).into_iter().flatten() {
             let file = drive.join(".GamingRoot");
             if let Ok(bytes) = read_metadata(file)
                 && bytes.len() > 8
@@ -556,8 +579,12 @@ impl Discovery {
             }
             roots.insert(drive.join("XboxGames"));
         }
+        if force || stale {
+            self.xbox_roots = roots.into_iter().filter(|root| root.is_dir()).collect();
+            self.xbox_roots_at = Some(now);
+        }
         let mut games = vec![];
-        for root in roots {
+        for root in self.xbox_roots.clone() {
             for child in entries(&root) {
                 let content = child.join("Content");
                 let location = if content.is_dir() {
@@ -583,7 +610,12 @@ impl Discovery {
                 }
             }
         }
-        if !defer && (force || self.package_at.is_none_or(|n| now - n >= 300.)) {
+        if !defer
+            && (force
+                || self
+                    .package_at
+                    .is_none_or(|n| now - n >= XBOX_REFRESH_SECONDS))
+        {
             let script = r#"$ErrorActionPreference='Stop'; $items=@(Get-AppxPackage | ForEach-Object {$p=$_; try {$m=Get-AppxPackageManifest -Package $p.PackageFullName; if ($m.OuterXml -match '(?i)windows\.game|XboxLive|MicrosoftGame') {[pscustomobject]@{name=$p.Name; path=$p.InstallLocation}}} catch {}}); ConvertTo-Json -InputObject $items -Compress"#;
             let bytes = run_command(
                 "powershell.exe",

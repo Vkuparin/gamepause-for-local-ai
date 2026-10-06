@@ -1038,6 +1038,8 @@ pub fn run_command(program: &str, args: &[&str], timeout: Duration) -> Result<Ve
     let result = (|| {
         let (mut output, mut errors) = (Vec::new(), Vec::new());
         let (mut out_done, mut err_done, mut truncated) = (false, false, false);
+        // Set when the command itself has exited and its pipes were last busy.
+        let mut exited_quiet: Option<Instant> = None;
         loop {
             if Instant::now() >= deadline {
                 bail!("Local command timed out (including pipe completion)");
@@ -1049,7 +1051,21 @@ pub fn run_command(program: &str, args: &[&str], timeout: Duration) -> Result<Ve
             if !err_done {
                 err_done = drain(&mut stderr, &mut errors, &mut truncated, &mut progress)?;
             }
-            if let Some(status) = child.try_wait()?
+            let status = child.try_wait()?;
+            // `lms` can start LM Studio, which inherits these pipes and never
+            // closes them. Everything the command wrote is already buffered,
+            // so once it has exited and the pipes stay quiet they count as done.
+            if status.is_some() {
+                if progress {
+                    exited_quiet = None;
+                } else if exited_quiet.get_or_insert_with(Instant::now).elapsed()
+                    >= Duration::from_millis(250)
+                {
+                    out_done = true;
+                    err_done = true;
+                }
+            }
+            if let Some(status) = status
                 && out_done
                 && err_done
             {
@@ -1519,7 +1535,9 @@ mod tests {
         assert!(!log.contains("secret"));
     }
     #[test]
-    fn command_timeout_includes_inherited_pipe_handles() {
+    fn a_finished_command_is_not_held_open_by_a_process_it_started() {
+        // The fixture exits at once and leaves a two-second descendant holding
+        // the pipes, as `lms` does when it starts LM Studio.
         let started = Instant::now();
         let result = run_command(
             &std::env::current_exe().unwrap().to_string_lossy(),
@@ -1529,10 +1547,11 @@ mod tests {
                 "lmstudio::tests::command_descendant_fixture",
                 "--nocapture",
             ],
-            Duration::from_millis(500),
+            Duration::from_secs(10),
         );
-        assert!(result.unwrap_err().to_string().contains("pipe completion"));
-        assert!(started.elapsed() < Duration::from_secs(2));
+        let output = String::from_utf8_lossy(&result.unwrap()).into_owned();
+        assert!(output.contains("command_descendant_fixture"));
+        assert!(started.elapsed() < Duration::from_millis(1800));
     }
     #[test]
     #[ignore = "subprocess fixture: invoked only by command timeout regression"]

@@ -61,6 +61,12 @@ pub struct Engine<B: Backend> {
     /// LM Studio is enabled but not installed and owes no recovery, so it
     /// takes no part in control until its CLI appears.
     pub lm_missing: bool,
+    /// The watcher saw no LM Studio process in its last scan. Its CLI starts
+    /// LM Studio when asked anything, so a closed LM Studio that owes no
+    /// recovery is left out of control instead of being woken by a game.
+    pub lm_closed: bool,
+    /// `lm_closed` applies: nothing is owed to LM Studio.
+    lm_idle: bool,
     /// Approximate model memory the current pause released; 0 when unknown,
     /// including after a restart mid-pause.
     pub freed_bytes: u64,
@@ -124,6 +130,8 @@ impl<B: Backend> Engine<B> {
             gameplay: GameplayControl::default(),
             provider_statuses: vec![],
             lm_missing: false,
+            lm_closed: false,
+            lm_idle: false,
             freed_bytes: 0,
             verify_scope: None,
             provider_progress: None,
@@ -273,7 +281,7 @@ impl<B: Backend> Engine<B> {
     /// owes no recovery is left out, exactly as if it were turned off.
     fn control_config(&self) -> Config {
         let mut config = self.config.clone();
-        if self.lm_missing {
+        if self.lm_missing || self.lm_idle {
             for provider in &mut config.providers {
                 if let crate::config::Provider::LMStudio { enabled, .. } = provider {
                     *enabled = false;
@@ -291,6 +299,7 @@ impl<B: Backend> Engine<B> {
                     .any(|entry| entry.binding.kind == crate::provider::Kind::LMStudio)
             });
         self.lm_missing = self.config.lm_enabled() && !owed && !self.backend.installed();
+        self.lm_idle = self.config.lm_enabled() && !owed && self.lm_closed;
     }
     /// The session's journal holds no model and no stopped service: every
     /// provider was absent or had nothing loaded.
@@ -501,6 +510,8 @@ impl<B: Backend> Engine<B> {
             self.set_activity(Activity::Watching);
             self.message = if self.lm_missing {
                 "Watching games; no AI app was found to pause".into()
+            } else if self.lm_idle {
+                "Watching games; LM Studio is not running, so there is nothing to pause".into()
             } else {
                 "No AI provider is enabled; choose one in Advanced settings".into()
             };
@@ -1143,7 +1154,7 @@ impl<B: Backend> Engine<B> {
         let mut phase = "guard";
         let result = (|| -> Result<()> {
             self.refresh_installed();
-            let test_lm = self.config.lm_enabled() && !self.lm_missing;
+            let test_lm = self.config.lm_enabled() && !self.lm_missing && !self.lm_idle;
             let test_ollama = self.config.ollama_enabled();
             if self.config.mode != "active"
                 || !(test_lm || test_ollama)
@@ -2742,6 +2753,30 @@ mod tests {
             .availability();
             assert!(!availability.pause && !availability.restore && !availability.resume);
         }
+    }
+    #[test]
+    fn a_closed_lm_studio_is_not_contacted_until_it_owes_recovery() {
+        // Running: a game pauses it as usual.
+        let mut e = engine(Fake::new());
+        e.step(true, 0., &mut || false);
+        assert!(e.pending());
+        // From here LM Studio is closed, but its models are owed: recovery proceeds.
+        e.lm_closed = true;
+        e.step(true, 1., &mut || false);
+        assert!(e.pending() && !e.lm_idle);
+
+        // Closed from the start: a game starts no capture and makes no call.
+        let mut e = engine(Fake::new());
+        e.lm_closed = true;
+        e.step(true, 0., &mut || false);
+        assert!(!e.pending(), "nothing was captured");
+        assert!(e.lm_idle);
+        assert_eq!(e.activity, Activity::Watching);
+        assert!(e.message.contains("LM Studio is not running"));
+        // It is opened later: the next game pauses it.
+        e.lm_closed = false;
+        e.step(true, 1., &mut || false);
+        assert!(e.pending());
     }
     #[test]
     fn partial_pause_and_restore_are_never_completed_pause_evidence() {

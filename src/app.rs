@@ -335,6 +335,9 @@ pub fn main(console: bool) -> Result<()> {
     if args.doctor {
         let _ = fs::create_dir_all(&folder);
         let config_result = (|| -> Result<Config> {
+            if folder.exists() && !folder.is_dir() {
+                bail!("The data directory path is not a folder; no settings were read");
+            }
             let value: Config = match fs::read_to_string(folder.join("config.json")) {
                 Ok(text) => Config::parse(&text)?,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::default(),
@@ -1757,16 +1760,20 @@ fn run(
                 } else {
                     let changed = games != updated;
                     let ollama = ollama_installed();
+                    let was_ready = inventory_ready;
                     inventory_ready = true;
                     steam_roots = roots;
                     games = updated;
                     errors = updated_errors;
                     inventory_pending = false;
                     inventory_dirty = true;
-                    log(
-                        &folder,
-                        &format!("Inventory refreshed: {} installed locations", games.len()),
-                    );
+                    // A refresh every 30 seconds is not news unless it changed something.
+                    if changed || !was_ready {
+                        log(
+                            &folder,
+                            &format!("Inventory refreshed: {} installed locations", games.len()),
+                        );
+                    }
                     if let Ok(mut shared) = state.lock() {
                         let error_text = errors
                             .iter()
@@ -1848,6 +1855,7 @@ fn run(
                 .cloned()
                 .collect();
             engine.remember_games(records)?;
+            engine.lm_closed = !frame.lm_running;
             if inventory_ready && errors.is_empty() {
                 let mut guard_input = detection_input.clone();
                 guard_input.guarded = true;

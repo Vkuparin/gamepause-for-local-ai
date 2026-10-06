@@ -1,5 +1,17 @@
 # Changelog
 
+## 2.2.0 — unreleased
+
+- A closed LM Studio is no longer started when a game launches. GamePause used to ask LM Studio's command-line tool what was loaded, and that tool starts LM Studio in the background when it is not running. LM Studio is now left alone while it is closed and owes no restore.
+- **Ask** games: the prompt has **Always pause** and **Never pause**, which remember the answer by setting the game's rule to On or Off.
+- Xbox game folders are looked for every five minutes on fixed local disks, instead of every 30 seconds on every drive letter, so network and sleeping drives are no longer touched.
+- A command that starts another program no longer makes GamePause wait for that program: the first LM Studio command after LM Studio was closed used to time out after 25 seconds.
+- The memory-freed line in the status card lines up with the text below it.
+- The worker log records a game-list refresh only when the list changed.
+- Scoop bucket in this repository: `scoop bucket add gamepause https://github.com/Vkuparin/gamepause-for-local-ai`, then `scoop install gamepause`.
+- README: how GamePause fits always-on assistants such as Hermes Agent and OpenClaw.
+- Diagnostics no longer probe AI apps with default settings when the data folder path is not a folder.
+
 ## 2.1.0 — 2026-10-07
 
 - The app is now called **GamePause for Local AI**, in the window title, installer and Start menu, and the repository moved to `gamepause-for-local-ai`. The program file, install folder and data folder keep the name GamePause, so settings and pending recovery carry over.

@@ -387,8 +387,10 @@ impl Scanner {
                 .is_some_and(|name| name.eq_ignore_ascii_case(executable))
         })
     }
+    /// The desktop app (also when it runs windowless as a service) or the
+    /// headless `llmster` daemon.
     pub fn lmstudio_running(&self) -> bool {
-        self.running("LM Studio.exe")
+        self.running("LM Studio.exe") || self.running("llmster.exe")
     }
     /// The Ollama server process. Read from the scan already taken; the
     /// service itself is not contacted while idle.

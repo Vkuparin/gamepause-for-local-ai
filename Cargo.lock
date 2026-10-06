@@ -1115,7 +1115,7 @@ dependencies = [
 
 [[package]]
 name = "gamepause"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "eframe",

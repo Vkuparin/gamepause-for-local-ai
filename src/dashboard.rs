@@ -1490,6 +1490,27 @@ fn ui_input_arrow(response: &Response) -> bool {
         .ctx
         .input(|i| i.key_pressed(Key::Enter) || i.key_pressed(Key::Space))
 }
+/// Locations of the running games whose rule is "ask".
+fn asking_paths(s: &Shared) -> Vec<String> {
+    let mut paths: Vec<String> = s
+        .active_games
+        .iter()
+        .filter(|game| s.config.asks(&game.path))
+        .map(|game| game.path.clone())
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+/// Settings with the ask rule of these games replaced by On (`pause`) or Off.
+fn answer_ask(config: &Config, paths: &[String], pause: bool) -> Config {
+    let mut updated = config.clone();
+    for path in paths {
+        set_ask(&mut updated, path, false);
+        set_ignored(&mut updated, path, !pause);
+    }
+    updated
+}
 /// "Ask" and "ignore" are exclusive rules for one game.
 fn set_ask(config: &mut Config, path: &str, ask: bool) {
     config.ask_games.retain(|p| canonical(p) != canonical(path));
@@ -2088,6 +2109,27 @@ impl Dashboard {
                                     {
                                         self.action(Action::PauseForGame, "Pause AI for this game");
                                     }
+                                    // The remembered answers are the game's ordinary rule.
+                                    let asking = asking_paths(s);
+                                    ui.add_enabled_ui(
+                                        !asking.is_empty() && !s.commands.settings_pending,
+                                        |ui| {
+                                            if ui
+                                                .button("Always pause")
+                                                .on_hover_text("Pause AI automatically whenever this game runs.")
+                                                .clicked()
+                                            {
+                                                self.save(answer_ask(&s.config, &asking, true), false);
+                                            }
+                                            if ui
+                                                .button("Never pause")
+                                                .on_hover_text("Ignore this game. Change it later under Ignored.")
+                                                .clicked()
+                                            {
+                                                self.save(answer_ask(&s.config, &asking, false), false);
+                                            }
+                                        },
+                                    );
                                 });
                             });
                         }
@@ -3137,6 +3179,23 @@ mod preserved_behavior_tests {
             *endpoint = "127.0.0.1:4321".into();
         }
         assert!(rebase_draft(&base, &draft, &clash).is_none());
+    }
+    #[test]
+    fn a_remembered_ask_answer_becomes_the_games_rule() {
+        let mut s = Shared::default();
+        s.active_games.push(crate::gameplay::fixtures::game(42, 10));
+        let path = s.active_games[0].path.clone();
+        assert!(asking_paths(&s).is_empty());
+        set_ask(&mut s.config, &path, true);
+        assert_eq!(asking_paths(&s), vec![path.clone()]);
+        let always = answer_ask(&s.config, &asking_paths(&s), true);
+        assert!(!always.asks(&path) && !ignored(&always, &path));
+        let never = answer_ask(&s.config, &asking_paths(&s), false);
+        assert!(!never.asks(&path) && ignored(&never, &path));
+        // Other games keep their rules.
+        let other = crate::gameplay::fixtures::game(7, 2).path;
+        set_ask(&mut s.config, &other, true);
+        assert!(answer_ask(&s.config, &[path], true).asks(&other));
     }
     #[test]
     fn ask_and_ignore_are_exclusive_rules_for_one_game() {
