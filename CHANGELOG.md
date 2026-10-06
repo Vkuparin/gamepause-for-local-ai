@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.1.0 — unreleased
+## 2.1.0 — 2026-10-07
 
 - The app is now called **GamePause for Local AI**, in the window title, installer and Start menu, and the repository moved to `gamepause-for-local-ai`. The program file, install folder and data folder keep the name GamePause, so settings and pending recovery carry over.
 - The status card lists only the AI apps this PC has: LM Studio when it is installed, Ollama when it is installed or running. An app you do not use no longer gets a line.
@@ -10,6 +10,9 @@
 - README: a table of the LM Studio and Ollama versions GamePause was tested with.
 - Old planning and review documents moved to `docs/history` and are no longer packaged.
 - Releases are built and published by the tag workflow, with this changelog section as the release notes.
+- Upgrading from 2.0 keeps settings and the sign-in startup entry, replaces the Start menu shortcuts with ones under the new name, and removes files that are no longer shipped.
+
+Checked on one Windows 11 PC: a silent upgrade from 2.0.1, and a full pause and restore of LM Studio (one 27B model) and Ollama 0.40.0 (one small model) around a real game. Not yet tested: uninstalling, the installer's interactive pages, sleep and wake, a real Ollama reload slower than ten seconds, real llama.cpp or KoboldCpp, and Windows 10.
 
 ## 2.0.1 — 2026-10-06
 
