@@ -111,6 +111,12 @@ pub fn doctor(config: &Config, folder: &Path) -> Value {
                         json!({"error":format!("{error:#}"),"compatibility":"unverified"})
                     }
                 },
+                // Names only: start commands can hold secrets and stay unread here.
+                Provider::Process { apps, .. } => json!({
+                    "apps": apps.iter().map(|app| json!({"name":app.name,
+                        "executable":crate::process_session::file_name(&app.path),
+                        "relaunch":app.relaunch})).collect::<Vec<_>>(),
+                    "detail":"Untested with the real tools. Stops the chosen executables and relaunches them with the recorded command line and folder; environment variables and in-flight work are not preserved."}),
             }
         };
         evidence["id"] = json!(provider.id());
@@ -210,6 +216,7 @@ pub fn render(shared: &crate::app::Shared) -> String {
         let fields: &[&str] = match provider {
             Provider::LMStudio { .. } => &["cli_version", "server", "loaded_models", "ws_protocol"],
             Provider::Ollama { .. } => &["version", "inventory"],
+            Provider::Process { .. } => &[],
         };
         for field in fields {
             let probe = &evidence[*field];

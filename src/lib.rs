@@ -21,6 +21,7 @@ pub mod ollama_session;
 pub mod ownership;
 pub mod power;
 pub mod presentation;
+pub mod process_session;
 pub mod processes;
 pub mod provider;
 pub mod provider_runtime;

@@ -21,6 +21,9 @@ pub enum Routed<L, O> {
     LMStudio(L),
     Ollama(O),
 }
+/// The two-way router carries LM Studio and Ollama; `Providers` handles the
+/// process provider itself and never passes it down.
+const UNROUTED: &str = "Process provider is not routed here; recovery retained";
 pub struct Work<L, O> {
     binding: Binding,
     operation: Routed<L, O>,
@@ -71,12 +74,14 @@ impl<L: Runtime, O: Runtime> Runtime for Router<L, O> {
                     restore_complete: entry.restore_complete,
                 }
             }
+            Kind::Process => bail!("{UNROUTED}"),
         })
     }
     fn validate(&self, entry: &Entry<Self::Payload>, games: &[Game]) -> Result<()> {
         match entry.binding.kind {
             Kind::LMStudio => self.lm.validate(&lm_entry(entry)?, games),
             Kind::Ollama => self.ollama.validate(&ollama_entry(entry)?, games),
+            Kind::Process => bail!("{UNROUTED}"),
         }
     }
     fn validate_transition(&self, original: &Self::Payload, updated: &Self::Payload) -> Result<()> {
@@ -116,12 +121,14 @@ impl<L: Runtime, O: Runtime> Runtime for Router<L, O> {
             Kind::Ollama => {
                 ollama_entry(entry).is_ok_and(|entry| self.ollama.can_continue(&entry, intent))
             }
+            Kind::Process => false,
         }
     }
     fn retry(&self, binding: &Binding) {
         match binding.kind {
             Kind::LMStudio => self.lm.retry(binding),
             Kind::Ollama => self.ollama.retry(binding),
+            Kind::Process => (),
         }
     }
     fn note(&self, payload: &Self::Payload) -> String {
@@ -150,6 +157,7 @@ impl<L: Runtime, O: Runtime> Runtime for Router<L, O> {
                     Routed::Ollama(planned.work),
                 )
             }
+            Kind::Process => bail!("{UNROUTED}"),
         };
         Ok(Planned {
             checkpoint,
@@ -326,8 +334,72 @@ impl Runtime for OllamaRef<'_> {
         self.0.execute(binding, work)
     }
 }
+/// Engine-owned process adapter, kept across ticks like the Ollama runtime.
+#[derive(Default)]
+pub struct ProcessRuntime {
+    adapter: Option<crate::process_session::Adapter<crate::process_session::Windows>>,
+    active: bool,
+}
+impl ProcessRuntime {
+    fn configure(&mut self, config: &Config) {
+        let configured = config.providers.iter().find_map(|provider| match provider {
+            crate::config::Provider::Process { id, apps, .. } if provider.enabled() => {
+                Some((id, apps))
+            }
+            _ => None,
+        });
+        self.active = config.mode == "active" && configured.is_some();
+        if self.adapter.is_none()
+            && let Some((id, apps)) = configured
+        {
+            self.adapter = crate::process_session::Adapter::new(
+                crate::process_session::Windows,
+                process_binding(id),
+                apps.clone(),
+            )
+            .ok();
+        }
+    }
+    fn adapter(
+        &mut self,
+    ) -> Result<&mut crate::process_session::Adapter<crate::process_session::Windows>> {
+        self.adapter
+            .as_mut()
+            .filter(|_| self.active)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Other AI apps are turned off or observation is active; recovery retained"
+                )
+            })
+    }
+}
+fn process_binding(id: &str) -> Binding {
+    Binding {
+        id: id.into(),
+        kind: Kind::Process,
+        endpoint: crate::process_session::ROUTE.into(),
+        configured_endpoint: crate::process_session::ROUTE.into(),
+        payload_version: 1,
+        guarantee: Guarantee::ProcessRelaunch,
+    }
+}
+fn process_entry(entry: &Entry<Payload>) -> Result<Entry<crate::process_session::Snapshot>> {
+    match &entry.payload {
+        Payload::Process(snapshot) if entry.binding.kind == Kind::Process => Ok(Entry {
+            binding: entry.binding.clone(),
+            payload: snapshot.clone(),
+            restore_complete: entry.restore_complete,
+        }),
+        _ => bail!("Provider kind/payload mismatch; recovery retained"),
+    }
+}
+pub enum ProviderWork {
+    Routed(Work<LMWork, crate::ollama_session::Work>),
+    Process(crate::process_session::Work),
+}
 pub struct Providers<'a, B: Backend> {
     pub router: Router<LMRuntime<B>, OllamaRef<'a>>,
+    processes: &'a mut ProcessRuntime,
 }
 impl<'a, B: Backend> Providers<'a, B> {
     pub fn with_progress(mut self, progress: crate::lm_session::Progress) -> Self {
@@ -339,13 +411,16 @@ impl<'a, B: Backend> Providers<'a, B> {
         config: Config,
         verify_raw: bool,
         ollama: &'a mut OllamaRuntime,
+        processes: &'a mut ProcessRuntime,
     ) -> Self {
         ollama.configure(&config);
+        processes.configure(&config);
         Self {
             router: Router {
                 lm: LMRuntime::new(backend, config, verify_raw),
                 ollama: OllamaRef(ollama),
             },
+            processes,
         }
     }
 }
@@ -404,6 +479,9 @@ impl<B: Backend> Providers<'_, B> {
             .iter()
             .filter(|provider| provider.enabled())
             .map(|provider| {
+                if provider.kind() == Kind::Process {
+                    return Ok(process_binding(provider.id()));
+                }
                 let endpoint = normalized_endpoint(provider.endpoint())?;
                 Ok(Binding {
                     id: provider.id().into(),
@@ -414,6 +492,7 @@ impl<B: Backend> Providers<'_, B> {
                     guarantee: match provider.kind() {
                         Kind::LMStudio => Guarantee::CapturedConfiguration,
                         Kind::Ollama => Guarantee::SupportedFields,
+                        Kind::Process => Guarantee::ProcessRelaunch,
                     },
                 })
             })
@@ -426,6 +505,8 @@ fn wrap(entry: &Entry<Payload>) -> Entry<Routed<Payload, crate::ollama_session::
         payload: match &entry.payload {
             Payload::LMStudio(_) => Routed::LMStudio(entry.payload.clone()),
             Payload::Ollama(snapshot) => Routed::Ollama(snapshot.clone()),
+            // Never reached: `Providers` handles process entries before routing.
+            Payload::Process(_) => Routed::LMStudio(entry.payload.clone()),
         },
         restore_complete: entry.restore_complete,
     }
@@ -438,8 +519,16 @@ fn unwrap(payload: Routed<Payload, crate::ollama_session::Snapshot>) -> Result<P
 }
 impl<B: Backend> Runtime for Providers<'_, B> {
     type Payload = Payload;
-    type Work = Work<LMWork, crate::ollama_session::Work>;
+    type Work = ProviderWork;
     fn capture(&mut self, binding: &Binding, games: &[Game]) -> Result<Entry<Payload>> {
+        if binding.kind == Kind::Process {
+            let entry = self.processes.adapter()?.capture(binding, games)?;
+            return Ok(Entry {
+                binding: entry.binding,
+                payload: Payload::Process(entry.payload),
+                restore_complete: entry.restore_complete,
+            });
+        }
         let entry = self.router.capture(binding, games)?;
         Ok(Entry {
             binding: entry.binding,
@@ -448,6 +537,13 @@ impl<B: Backend> Runtime for Providers<'_, B> {
         })
     }
     fn validate(&self, entry: &Entry<Payload>, games: &[Game]) -> Result<()> {
+        if entry.binding.kind == Kind::Process || matches!(entry.payload, Payload::Process(_)) {
+            let typed = process_entry(entry)?;
+            return match &self.processes.adapter {
+                Some(adapter) if !entry.restore_complete => adapter.validate(&typed, games),
+                _ => typed.payload.validate(),
+            };
+        }
         self.router.validate(&wrap(entry), games)
     }
     fn validate_transition(&self, original: &Payload, updated: &Payload) -> Result<()> {
@@ -456,6 +552,7 @@ impl<B: Backend> Runtime for Providers<'_, B> {
                 self.router.lm.validate_transition(original, updated)
             }
             (Payload::Ollama(old), Payload::Ollama(new)) => old.validate_transition(new),
+            (Payload::Process(old), Payload::Process(new)) => old.validate_transition(new),
             _ => bail!("Provider payload kind changed; all recovery retained"),
         }
     }
@@ -469,16 +566,21 @@ impl<B: Backend> Runtime for Providers<'_, B> {
                 snapshot.begin();
                 Ok(())
             }
+            Payload::Process(snapshot) => {
+                snapshot.begin();
+                Ok(())
+            }
         }
     }
     fn complete(&self, payload: &Payload, intent: Intent) -> bool {
         match payload {
             Payload::LMStudio(_) => self.router.lm.complete(payload, intent),
             Payload::Ollama(snapshot) => intent == Intent::Pause && snapshot.pause_complete,
+            Payload::Process(snapshot) => intent == Intent::Pause && snapshot.pause_complete,
         }
     }
     fn can_continue(&self, entry: &Entry<Payload>, intent: Intent) -> bool {
-        self.router.can_continue(&wrap(entry), intent)
+        entry.binding.kind != Kind::Process && self.router.can_continue(&wrap(entry), intent)
     }
     fn retry(&self, binding: &Binding) {
         self.router.retry(binding);
@@ -487,6 +589,7 @@ impl<B: Backend> Runtime for Providers<'_, B> {
         match payload {
             Payload::LMStudio(_) => String::new(),
             Payload::Ollama(snapshot) => snapshot.note(),
+            Payload::Process(snapshot) => snapshot.note(),
         }
     }
     fn plan(
@@ -494,18 +597,39 @@ impl<B: Backend> Runtime for Providers<'_, B> {
         entry: &Entry<Payload>,
         intent: Intent,
     ) -> Result<Planned<Payload, Self::Work>> {
+        if entry.binding.kind == Kind::Process {
+            let planned = self
+                .processes
+                .adapter()?
+                .plan(&process_entry(entry)?, intent)?;
+            return Ok(Planned {
+                checkpoint: Payload::Process(planned.checkpoint),
+                work: ProviderWork::Process(planned.work),
+            });
+        }
         let planned = self.router.plan(&wrap(entry), intent)?;
         Ok(Planned {
             checkpoint: unwrap(planned.checkpoint)?,
-            work: planned.work,
+            work: ProviderWork::Routed(planned.work),
         })
     }
     fn execute(&mut self, binding: &Binding, work: Self::Work) -> Result<Outcome<Payload>> {
-        let outcome = self.router.execute(binding, work)?;
-        Ok(Outcome {
-            payload: unwrap(outcome.payload)?,
-            restore_complete: outcome.restore_complete,
-        })
+        match work {
+            ProviderWork::Process(work) => {
+                let outcome = self.processes.adapter()?.execute(binding, work)?;
+                Ok(Outcome {
+                    payload: Payload::Process(outcome.payload),
+                    restore_complete: outcome.restore_complete,
+                })
+            }
+            ProviderWork::Routed(work) => {
+                let outcome = self.router.execute(binding, work)?;
+                Ok(Outcome {
+                    payload: unwrap(outcome.payload)?,
+                    restore_complete: outcome.restore_complete,
+                })
+            }
+        }
     }
 }
 
@@ -657,6 +781,7 @@ mod tests {
                 let (id, endpoint, guarantee) = match kind {
                     Kind::LMStudio => ("lm", "127.0.0.1:1234", Guarantee::CapturedConfiguration),
                     Kind::Ollama => ("ollama", "127.0.0.1:11434", Guarantee::SupportedFields),
+                    Kind::Process => unreachable!(),
                 };
                 Binding {
                     id: id.into(),

@@ -1,7 +1,7 @@
 # Security and privacy
 
 GamePause reads local launcher metadata and process paths. It communicates only with the
-configured loopback LM Studio and Ollama addresses. There is no telemetry, store authentication, or cloud API.
+configured loopback LM Studio and Ollama addresses. There is no telemetry, store authentication, or cloud API. Start commands of other AI apps that GamePause stops are stored encrypted with Windows per-user data protection, since they can contain API keys; this guards a copied or shared journal, not other programs already running as the same user.
 The app does not change game files or filesystem permissions.
 
 Local configuration, inventory, status, recovery state, and rotated logs live under

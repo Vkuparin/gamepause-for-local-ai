@@ -17,12 +17,15 @@ impl std::error::Error for InferenceBusy {}
 pub enum Kind {
     LMStudio,
     Ollama,
+    /// Chosen executables stopped for gaming and relaunched afterwards.
+    Process,
 }
 impl Kind {
     pub fn name(self) -> &'static str {
         match self {
             Self::LMStudio => "LM Studio",
             Self::Ollama => "Ollama",
+            Self::Process => "Other AI apps",
         }
     }
 }
@@ -34,6 +37,8 @@ pub enum Guarantee {
     CapturedConfiguration,
     /// Explicit limited fields; not original live settings or conversations.
     SupportedFields,
+    /// Same executable, command line and working directory; nothing else.
+    ProcessRelaunch,
     MonitorOnly,
 }
 

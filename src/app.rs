@@ -2778,6 +2778,7 @@ mod tests {
             match provider {
                 config::Provider::LMStudio { enabled, .. } => *enabled = false,
                 config::Provider::Ollama { enabled, .. } => *enabled = true,
+                config::Provider::Process { .. } => (),
             }
         }
         shared.config.validate().unwrap();

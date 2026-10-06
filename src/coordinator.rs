@@ -766,8 +766,12 @@ fn same_provider(configured: &Binding, captured: &Binding) -> Result<()> {
         || configured.kind != captured.kind
         || configured.payload_version != captured.payload_version
         || configured.guarantee != captured.guarantee
-        || normalized_endpoint(&configured.configured_endpoint)?
-            != normalized_endpoint(&captured.configured_endpoint)?
+        || if configured.kind == Kind::Process {
+            configured.configured_endpoint != captured.configured_endpoint
+        } else {
+            normalized_endpoint(&configured.configured_endpoint)?
+                != normalized_endpoint(&captured.configured_endpoint)?
+        }
     {
         bail!("Provider identity/route/policy changed; recovery retained");
     }
@@ -790,6 +794,15 @@ pub(crate) fn validate_bindings<'a>(bindings: impl Iterator<Item = &'a Binding>)
             || !kinds.insert(binding.kind as u8)
         {
             bail!("Unsupported or duplicate provider binding; recovery retained");
+        }
+        if binding.kind == Kind::Process {
+            // Local processes have one fixed route identity instead of a port.
+            if binding.endpoint != crate::process_session::ROUTE
+                || binding.configured_endpoint != crate::process_session::ROUTE
+            {
+                bail!("Unsupported process provider route; recovery retained");
+            }
+            continue;
         }
         for endpoint in [&binding.configured_endpoint, &binding.endpoint] {
             let route = normalized_endpoint(endpoint)?;
@@ -929,7 +942,7 @@ mod tests {
                     original_raw: "fixture original raw config".into(),
                     progress,
                 },
-                Kind::Ollama => Payload::Other {
+                Kind::Ollama | Kind::Process => Payload::Other {
                     original_digest: "fixture original content digest".into(),
                     progress,
                 },

@@ -21,6 +21,12 @@
       "id": "ollama-main",
       "enabled": true,
       "endpoint": "127.0.0.1:11434"
+    },
+    {
+      "kind": "process",
+      "id": "apps-main",
+      "enabled": true,
+      "apps": []
     }
   ],
   "advanced_settings_visible": false,

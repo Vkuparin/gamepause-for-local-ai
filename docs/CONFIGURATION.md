@@ -15,7 +15,7 @@ The complete starting configuration is [config.example.json](../config.example.j
 | `retry_seconds` | `30` | Independent provider retry backoff, minimum 5 seconds |
 | `ask_games` | `[]` | Game paths that do not pause AI on their own; GamePause asks instead |
 | `pause_hotkey` | `""` | System-wide Pause AI / Resume AI shortcut such as `Ctrl+Alt+P`; needs Ctrl, Alt or Win plus one letter, digit, F1-F24 or a named key (Pause, Space, Home, End, Insert, Delete, PageUp, PageDown). Empty registers nothing |
-| `providers` | LM Studio and Ollama enabled | Typed provider entries; see below |
+| `providers` | LM Studio and Ollama enabled; no other apps chosen | Typed provider entries; see below |
 | `advanced_settings_visible` | `false` | Show noncore settings/tools in dashboard and tray |
 | `notifications_enabled` | `true` | Windows completion/failure notifications |
 | `sound_enabled` | `true` | One sound source per event; independent of visuals |
@@ -32,9 +32,11 @@ Other switches: `--background` (quiet tray startup), `--headless`, `--duration N
 
 ## Provider entries
 
-Each entry has a stable `id`, a `kind` (`lmstudio` or `ollama`) and an `enabled` boolean. IDs, kinds and normalized endpoints must be unique. Endpoints accept only `localhost` or `127.0.0.1` with a valid port. Remote control is refused.
+Each entry has a stable `id`, a `kind` (`lmstudio`, `ollama` or `process`) and an `enabled` boolean. IDs, kinds and normalized endpoints must be unique. Endpoints accept only `localhost` or `127.0.0.1` with a valid port. Remote control is refused.
 
 LM Studio stores `endpoint` (default `127.0.0.1:1234`), `lms_path` (empty for autodetection) and `stop_server_during_gaming` (default `true`) inside `connection`. Ollama stores `endpoint` (default `127.0.0.1:11434`) directly on its entry and is enabled by default. When nothing answers at that address, GamePause treats Ollama as not running and does nothing with it. Set `enabled` to `false` to turn it off; read the [restore subset and limits](USAGE.md#background-ai-applications). Version-3 settings, where Ollama was off by default, get the Ollama entry enabled once when they migrate to version 4; a `false` saved afterwards is kept. GamePause does not start Ollama or download models.
+
+The `process` entry lists other AI apps to stop for gaming in `apps`. Each app has a `name`, the full `path` of its `.exe` file and `relaunch` (`true` to start it again after gaming). Paths must be absolute and distinct, at most 32. With an empty list the entry does nothing. Only a process running from exactly that file is stopped, so a copy bundled inside another program is left alone.
 
 Unfinished recovery blocks disabling/removing its provider or changing its ID/endpoint. Complete that provider's recovery first. A completed provider can be edited while another remains pending. Legacy flat LM fields are accepted only through guarded migration; new version-3 files must use provider entries. See [migration and downgrade](USAGE.md#settings-migration).
 

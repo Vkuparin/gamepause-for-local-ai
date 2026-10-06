@@ -50,18 +50,19 @@ pub struct Binding {
 pub enum Payload {
     LMStudio(Snapshot),
     Ollama(crate::ollama_session::Snapshot),
+    Process(crate::process_session::Snapshot),
 }
 impl Payload {
     pub fn lm(&self) -> Result<&Snapshot> {
         match self {
             Self::LMStudio(snapshot) => Ok(snapshot),
-            Self::Ollama(_) => bail!("Expected LM Studio recovery payload; all recovery retained"),
+            _ => bail!("Expected LM Studio recovery payload; all recovery retained"),
         }
     }
     pub fn lm_mut(&mut self) -> Result<&mut Snapshot> {
         match self {
             Self::LMStudio(snapshot) => Ok(snapshot),
-            Self::Ollama(_) => bail!("Expected LM Studio recovery payload; all recovery retained"),
+            _ => bail!("Expected LM Studio recovery payload; all recovery retained"),
         }
     }
 }
@@ -102,8 +103,9 @@ impl Binding {
         let configured = config.providers.iter().find(|provider| provider.id() == self.id).context("Recovery provider ID is missing; restore its original configuration. Recovery retained")?;
         if !configured.enabled()
             || configured.kind() != self.kind
-            || config::normalized_endpoint(configured.endpoint())?
-                != config::normalized_endpoint(&self.configured_endpoint)?
+            || (self.kind != Kind::Process
+                && config::normalized_endpoint(configured.endpoint())?
+                    != config::normalized_endpoint(&self.configured_endpoint)?)
         {
             bail!(
                 "{} recovery is pending; its provider was disabled or its endpoint/kind changed. Restore the original configuration; recovery retained",
@@ -132,7 +134,7 @@ impl Journal {
         if self.schema != 3 {
             bail!("Unsupported recovery format; source retained");
         }
-        if !(1..=2).contains(&self.providers.len()) {
+        if !(1..=3).contains(&self.providers.len()) {
             bail!("Unsupported recovery provider set; source retained");
         }
         crate::coordinator::validate_bindings(self.providers.iter().map(|entry| &entry.binding))?;
@@ -175,6 +177,16 @@ impl Journal {
                             }))
                     {
                         bail!("Ollama recovery binding/progress mismatch; source retained");
+                    }
+                }
+                (Payload::Process(snapshot), Kind::Process, Guarantee::ProcessRelaunch) => {
+                    snapshot.validate()?;
+                    if binding.endpoint != crate::process_session::ROUTE
+                        || binding.configured_endpoint != crate::process_session::ROUTE
+                        || (self.session.intent == Intent::Restore && snapshot.pause_complete)
+                        || (entry.restore_complete && !snapshot.restore_finished())
+                    {
+                        bail!("Process recovery binding/progress mismatch; source retained");
                     }
                 }
                 _ => bail!("Recovery provider kind/payload/guarantee mismatch; source retained"),
@@ -275,7 +287,7 @@ pub fn load(path: &Path, config: &Config) -> Result<Option<Journal>> {
             // Disabled/missing experimental control is a retained obligation,
             // not a reason to prevent the healthy LM provider from recovering.
             if entry.restore_complete
-                || (entry.binding.kind == Kind::Ollama
+                || (entry.binding.kind != Kind::LMStudio
                     && !config
                         .providers
                         .iter()

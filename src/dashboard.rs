@@ -303,6 +303,7 @@ enum SettingsPage {
     Detection,
     LMStudio,
     Ollama,
+    Apps,
     Recovery,
     Diagnostics,
 }
@@ -1472,6 +1473,7 @@ impl Dashboard {
                     (SettingsPage::Detection, "Detection"),
                     (SettingsPage::LMStudio, "LM Studio"),
                     (SettingsPage::Ollama, "Ollama"),
+                    (SettingsPage::Apps, "Other apps"),
                     (SettingsPage::Recovery, "Recovery"),
                     (SettingsPage::Diagnostics, "Diagnostics"),
                 ] {
@@ -1562,6 +1564,42 @@ impl Dashboard {
                         });
                         if !editable {ui.colored_label(p.accent,"Finish pending Ollama recovery before turning it off or changing its endpoint.");}
                         ui.hyperlink_to("Report Ollama problems or contribute fixes",concat!(env!("CARGO_PKG_REPOSITORY"),"/blob/main/CONTRIBUTING.md"));
+                    },
+                    SettingsPage::Apps=> {
+                        ui.heading("Other AI apps");
+                        ui.colored_label(p.accent,"Not yet tested with real AI tools such as llama.cpp or KoboldCpp.");
+                        ui.label("Choose the program file of a local AI server, for example llama-server.exe or koboldcpp.exe. GamePause stops that exact file when a game starts and starts it again afterwards with the same command line and folder.");
+                        ui.label("Work in progress is interrupted. Environment variables set by a launcher are not kept. The saved start command is encrypted for your Windows account and never shown.");
+                        let editable=!s.provider_pending(crate::provider::Kind::Process);
+                        if !editable {ui.colored_label(p.accent,"Finish the pending restart before changing these apps.");}
+                        ui.add_enabled_ui(editable,|ui| {
+                            if let Some(crate::config::Provider::Process{enabled,apps,..})=self.edit_config.providers.iter_mut().find(|p|p.kind()==crate::provider::Kind::Process) {
+                                self.dirty |= ui.styled_checkbox(enabled,"Stop these apps while gaming").changed();
+                                let mut remove=None;
+                                for (index,app) in apps.iter_mut().enumerate() {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(RichText::new(&app.name).strong());
+                                        ui.colored_label(p.muted,&app.path);
+                                        self.dirty |= ui.styled_checkbox(&mut app.relaunch,"Start again after gaming").changed();
+                                        if ui.button("Remove").clicked(){remove=Some(index);}
+                                    });
+                                }
+                                if let Some(index)=remove {apps.remove(index);self.dirty=true;}
+                                if apps.is_empty(){ui.colored_label(p.muted,"No app chosen. Nothing is stopped.");}
+                                if ui.button("Add app...").clicked(){
+                                    match browse(self.owner){
+                                        Ok(Some(path))=>{
+                                            let name=crate::process_session::file_name(&path).trim_end_matches(".exe").trim_end_matches(".EXE").to_owned();
+                                            apps.push(crate::config::ProcessApp{name,path,relaunch:true});
+                                            self.dirty=true;
+                                        },
+                                        Ok(None)=>(),
+                                        Err(e)=>self.validation=format!("File picker: {e:#}"),
+                                    }
+                                }
+                            } else {ui.label("No entry for other apps is configured.");}
+                        });
+                        self.save_bar(ui,s,p);
                     },
                     SettingsPage::Recovery=> {
                         ui.heading("Pause and recovery");
@@ -2449,6 +2487,7 @@ mod tests {
                     SettingsPage::Detection,
                     SettingsPage::LMStudio,
                     SettingsPage::Ollama,
+                    SettingsPage::Apps,
                     SettingsPage::Recovery,
                     SettingsPage::Diagnostics,
                 ] {
@@ -2545,6 +2584,7 @@ mod tests {
                             SettingsPage::Detection,
                             SettingsPage::LMStudio,
                             SettingsPage::Ollama,
+                            SettingsPage::Apps,
                             SettingsPage::Recovery,
                             SettingsPage::Diagnostics,
                         ][self.stage - 5];

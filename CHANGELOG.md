@@ -10,6 +10,7 @@
 - Status messages name the enabled provider instead of always saying LM Studio.
 - A missing AI app is no longer an error: LM Studio that is not installed reads **Not installed** and is skipped, and a closed LM Studio no longer raises the attention state while idle.
 - When a game starts and no models were loaded, the status says nothing was paused, and no success notification is sent.
+- Other AI apps: choose a program file (for example `llama-server.exe` or `koboldcpp.exe`) to stop for gaming and start again afterwards, with a per-app relaunch switch and the start command encrypted for the Windows account. Not yet tested with those tools themselves.
 - Optional system-wide shortcut that toggles Pause AI / Resume AI; none is set by default.
 - Per-game rules: besides On and Off, a game can be set to **Ask**, which keeps AI running and offers **Pause AI for this game** in a notification and the dashboard.
 - Show roughly how much model memory a pause freed, in the status, the dashboard and the pause notification.

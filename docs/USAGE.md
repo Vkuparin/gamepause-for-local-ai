@@ -90,6 +90,18 @@ A previous gameplay coexistence choice is held while discovery refreshes and is 
 
 `--status` checks the instance lock and prints `status=absent` after quit/crash, even if an old status file remains. `--games` reads cached inventory and returns `games=absent` only when that file is missing. Permission/I/O errors and corrupt cached files are errors. Text fields escape backslashes, tabs, carriage returns and newlines as `\\`, `\t`, `\r`, `\n`; paths use the same escaping. `active_games` is a JSON array on one status line.
 
+## Other AI apps
+
+For local AI servers without their own integration, such as llama.cpp's `llama-server.exe` or KoboldCpp, GamePause can stop the program for gaming and start it again afterwards. This has not been tested with those tools themselves; the process handling was tested with stand-in programs. Under Advanced > Other apps, choose **Add app...** and pick the program file. Each app has a **Start again after gaming** switch.
+
+- When a game starts, every running copy of that exact file is asked to close and then ended. Work in progress is interrupted; GamePause cannot wait for a generation to finish.
+- After the game, each instance that was running is started again with the same command line and working folder, minimised. Environment variables set by a launcher or script are not kept, and a program started by a supervisor that restarts it on its own will fight the pause.
+- If GamePause cannot read how a program was started (for example, it runs as administrator), it leaves that program running and reports the reason instead of stopping something it could not bring back.
+- The start command is saved encrypted for your Windows account, because it can contain an API key. It is never shown or logged. If the journal is moved to another account or PC it cannot be read, and the app is reported as stopped and not restarted.
+- With the switch off, the app is only stopped, and the status names it as stopped without relaunch.
+
+**Test round-trip** does not cover these apps.
+
 A system-wide shortcut can pause and resume AI without opening GamePause, including from inside a game. None is set by default: enter one, for example `Ctrl+Alt+P`, under Advanced > General and save. The shortcut pauses AI when pausing is available and otherwise resumes through the same guarded path as **Resume AI**, so a running game still asks for confirmation. If another program already owns the combination, GamePause says so and registers nothing.
 
 Each game has one of three rules. **On** pauses AI automatically, **Off** ignores the game, and **Ask** leaves AI running and asks: when the game starts, a notification and a prompt in the dashboard offer **Pause AI for this game**. If you do not answer, nothing is paused. If you accept, AI is paused as for any other game and restored when the game exits; the next launch asks again. Set the rule from a selected game's **More...** menu (**Ask before pausing** / **Pause automatically**); the row's checkbox shows On, Off or Ask.

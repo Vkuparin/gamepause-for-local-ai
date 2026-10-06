@@ -262,6 +262,7 @@ fn provider_lines(shared: &Shared, fallback: &str) -> String {
                 return match provider.kind() {
                     Kind::LMStudio => format!("{}: {fallback}", provider.kind().name()),
                     Kind::Ollama => "Ollama: AI state unknown until capture.".into(),
+                    Kind::Process => "Other AI apps: left running until a game starts.".into(),
                 };
             };
             let state = match report.state {

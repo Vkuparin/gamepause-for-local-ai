@@ -26,6 +26,7 @@ fn enabled_ollama_is_left_alone_in_observation() {
                 *enabled = true;
                 *route = endpoint.clone();
             }
+            config::Provider::Process { .. } => (),
         }
     }
     config.validate().unwrap();
@@ -288,6 +289,7 @@ fn doctor_skips_disabled_provider_endpoints() {
                 *enabled = false;
                 *endpoint = listener.local_addr().unwrap().to_string();
             }
+            config::Provider::Process { .. } => (),
         }
     }
     write_json(&fixture.0.join("config.json"), &config).unwrap();

@@ -87,6 +87,21 @@ pub enum Provider {
         enabled: bool,
         endpoint: String,
     },
+    /// Executables to stop for gaming. Not tied to a port or protocol.
+    Process {
+        id: String,
+        enabled: bool,
+        apps: Vec<ProcessApp>,
+    },
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessApp {
+    pub name: String,
+    /// Full path of the executable; only this exact file is ever stopped.
+    pub path: String,
+    /// Start it again after gaming with its recorded command line.
+    pub relaunch: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -98,24 +113,28 @@ pub struct LMConnection {
 impl Provider {
     pub fn id(&self) -> &str {
         match self {
-            Self::LMStudio { id, .. } | Self::Ollama { id, .. } => id,
+            Self::LMStudio { id, .. } | Self::Ollama { id, .. } | Self::Process { id, .. } => id,
         }
     }
     pub fn enabled(&self) -> bool {
         match self {
             Self::LMStudio { enabled, .. } | Self::Ollama { enabled, .. } => *enabled,
+            // With no app chosen there is nothing to control.
+            Self::Process { enabled, apps, .. } => *enabled && !apps.is_empty(),
         }
     }
     pub fn kind(&self) -> crate::provider::Kind {
         match self {
             Self::LMStudio { .. } => crate::provider::Kind::LMStudio,
             Self::Ollama { .. } => crate::provider::Kind::Ollama,
+            Self::Process { .. } => crate::provider::Kind::Process,
         }
     }
     pub fn endpoint(&self) -> &str {
         match self {
             Self::LMStudio { connection, .. } => &connection.endpoint,
             Self::Ollama { endpoint, .. } => endpoint,
+            Self::Process { .. } => crate::process_session::ROUTE,
         }
     }
 }
@@ -136,6 +155,11 @@ fn default_providers() -> Vec<Provider> {
             // default settings; fixtures enable it against private endpoints.
             enabled: !cfg!(test),
             endpoint: "127.0.0.1:11434".into(),
+        },
+        Provider::Process {
+            id: "apps-main".into(),
+            enabled: true,
+            apps: vec![],
         },
     ]
 }
@@ -302,6 +326,13 @@ impl Config {
                     provider["enabled"] = true.into();
                 }
             }
+            // Version 4 adds the entry for other AI apps, with none chosen.
+            if let Some(providers) = map.get_mut("providers").and_then(|v| v.as_array_mut())
+                && !providers.iter().any(|p| p["kind"] == "process")
+                && providers.len() < 3
+            {
+                providers.push(serde_json::to_value(&default_providers()[2])?);
+            }
             map.insert("settings_version".into(), 4.into());
         }
         let config: Self = serde_json::from_value(raw).context("Invalid configuration")?;
@@ -419,8 +450,8 @@ impl Config {
         let mut ids = std::collections::HashSet::new();
         let mut kinds = std::collections::HashSet::new();
         let mut endpoints = std::collections::HashSet::new();
-        if self.providers.len() > 2 {
-            bail!("Only one endpoint per supported provider kind is allowed");
+        if self.providers.len() > 3 {
+            bail!("Only one entry per supported provider kind is allowed");
         }
         for provider in &self.providers {
             let id = provider.id();
@@ -436,7 +467,21 @@ impl Config {
             if !kinds.insert(provider.kind()) {
                 bail!("Duplicate provider kind");
             }
-            if !endpoints.insert(normalized_endpoint(provider.endpoint())?) {
+            if let Provider::Process { apps, .. } = provider {
+                let mut paths = std::collections::HashSet::new();
+                if apps.len() > 32
+                    || apps.iter().any(|app| {
+                        app.name.trim().is_empty()
+                            || !std::path::Path::new(&app.path).is_absolute()
+                            || !app.path.to_ascii_lowercase().ends_with(".exe")
+                            || !paths.insert(crate::discovery::canonical(&app.path))
+                    })
+                {
+                    bail!(
+                        "Other AI apps need a name and a distinct full path to an .exe file, at most 32"
+                    );
+                }
+            } else if !endpoints.insert(normalized_endpoint(provider.endpoint())?) {
                 bail!("Duplicate provider endpoint");
             }
         }

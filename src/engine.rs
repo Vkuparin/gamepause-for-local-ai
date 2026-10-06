@@ -70,6 +70,7 @@ pub struct Engine<B: Backend> {
     coordinator_memory: Option<crate::coordinator::Continuation<crate::recovery::Payload>>,
     adapter_progress: Option<crate::lm_session::Progress>,
     ollama_runtime: crate::provider_runtime::OllamaRuntime,
+    process_runtime: crate::provider_runtime::ProcessRuntime,
     provider_now: Duration,
     progress: Option<Box<dyn FnMut(Activity) + Send>>,
     quiet_since: Option<f64>,
@@ -129,6 +130,7 @@ impl<B: Backend> Engine<B> {
             coordinator_memory: None,
             adapter_progress: None,
             ollama_runtime: Default::default(),
+            process_runtime: Default::default(),
             provider_now: Duration::ZERO,
             progress: None,
             quiet_since: None,
@@ -177,6 +179,7 @@ impl<B: Backend> Engine<B> {
                     journal.providers.iter().all(|entry| match &entry.payload {
                         crate::recovery::Payload::LMStudio(snapshot) => snapshot.pause_complete,
                         crate::recovery::Payload::Ollama(snapshot) => snapshot.pause_complete,
+                        crate::recovery::Payload::Process(snapshot) => snapshot.pause_complete,
                     })
                 },
             )
@@ -298,6 +301,7 @@ impl<B: Backend> Engine<B> {
                     snapshot.models.is_empty() && !snapshot.server_stopped
                 }
                 crate::recovery::Payload::Ollama(snapshot) => snapshot.units() == 0,
+                crate::recovery::Payload::Process(snapshot) => snapshot.units() == 0,
             })
         })
     }
@@ -324,6 +328,7 @@ impl<B: Backend> Engine<B> {
             match &entry.payload {
                 crate::recovery::Payload::LMStudio(snapshot) => lm |= !snapshot.models.is_empty(),
                 crate::recovery::Payload::Ollama(snapshot) => ollama |= snapshot.units() > 0,
+                crate::recovery::Payload::Process(_) => (),
             }
         }
         let lm = if lm { self.backend.captured_bytes() } else { 0 };
@@ -378,6 +383,9 @@ impl<B: Backend> Engine<B> {
         if !self.provider_pending(crate::provider::Kind::Ollama) {
             self.ollama_runtime = Default::default();
         }
+        if !self.provider_pending(crate::provider::Kind::Process) {
+            self.process_runtime = Default::default();
+        }
         self.retry_providers();
         self.retry_at = 0.;
         self.disabled = false;
@@ -414,6 +422,13 @@ impl<B: Backend> Engine<B> {
                 match &mut entry.payload {
                     crate::recovery::Payload::LMStudio(snapshot) => snapshot.pause_complete = false,
                     crate::recovery::Payload::Ollama(snapshot) => {
+                        if journal.session.intent == Intent::Pause {
+                            snapshot.begin();
+                        } else {
+                            snapshot.pause_complete = false;
+                        }
+                    }
+                    crate::recovery::Payload::Process(snapshot) => {
                         if journal.session.intent == Intent::Pause {
                             snapshot.begin();
                         } else {
@@ -764,6 +779,7 @@ impl<B: Backend> Engine<B> {
             control,
             false,
             &mut self.ollama_runtime,
+            &mut self.process_runtime,
         )
         .with_progress(progress);
         let mut bindings = runtime.bindings()?;
@@ -874,6 +890,7 @@ impl<B: Backend> Engine<B> {
                                         snapshot.models.len()
                                     }
                                     crate::recovery::Payload::Ollama(snapshot) => snapshot.units(),
+                                    crate::recovery::Payload::Process(snapshot) => snapshot.units(),
                                 })
                                 .sum::<usize>()
                         })
@@ -970,6 +987,7 @@ impl<B: Backend> Engine<B> {
                     .map(|entry| match &entry.payload {
                         crate::recovery::Payload::LMStudio(snapshot) => snapshot.models.len(),
                         crate::recovery::Payload::Ollama(snapshot) => snapshot.units(),
+                        crate::recovery::Payload::Process(snapshot) => snapshot.units(),
                     })
                     .sum::<usize>()
                     .saturating_mul(2)
@@ -989,6 +1007,7 @@ impl<B: Backend> Engine<B> {
             control,
             compare,
             &mut self.ollama_runtime,
+            &mut self.process_runtime,
         )
         .with_progress(progress);
         let mut bindings = runtime.bindings()?;
@@ -2160,6 +2179,7 @@ mod tests {
                         *enabled = true;
                         *route = endpoint.clone();
                     }
+                    crate::config::Provider::Process { .. } => (),
                 }
             }
             let initial_lm_events = e.backend.events.clone();
