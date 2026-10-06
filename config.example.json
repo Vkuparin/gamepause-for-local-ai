@@ -19,7 +19,7 @@
     {
       "kind": "ollama",
       "id": "ollama-main",
-      "enabled": false,
+      "enabled": true,
       "endpoint": "127.0.0.1:11434"
     }
   ],
@@ -34,5 +34,6 @@
   "excluded_paths": [],
   "settings_version": 3,
   "automation_enabled": true,
-  "ignored_games": []
+  "ignored_games": [],
+  "ollama_default_applied": true
 }

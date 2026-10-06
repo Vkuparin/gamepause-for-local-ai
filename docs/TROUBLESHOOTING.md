@@ -47,4 +47,4 @@ Enable **Start when I sign in to Windows** and check Windows Startup apps. The e
 
 ## Models reload during gaming
 
-Keep LM's `providers[].connection.stop_server_during_gaming` enabled. Pause clients that independently restart the server, control models through other interfaces, or load models from LM Studio's UI. GamePause unloads captured instances; it does not prevent every later model load. Experimental Ollama leaves the user-owned service running and does not fight later client reloads.
+Keep LM's `providers[].connection.stop_server_during_gaming` enabled. Pause clients that independently restart the server, control models through other interfaces, or load models from LM Studio's UI. GamePause unloads captured instances; it does not prevent every later model load. Ollama leaves the user-owned service running and does not fight later client reloads.

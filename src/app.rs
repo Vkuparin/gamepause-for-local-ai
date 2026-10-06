@@ -411,7 +411,7 @@ pub fn main(console: bool) -> Result<()> {
     }
     if args.help {
         println!(
-            "GamePause for LM Studio and experimental Ollama\n--headless --active --observe --duration SECONDS\n--doctor --discover --restore --verify --status --games --data-dir PATH\nDefault: automatic pausing with a native dashboard. --background starts in the tray. --observe is a diagnostic override. --verify unloads/reloads LM Studio models using durable recovery; close games and the GUI first. --doctor never starts/stops the server or unloads models. --status/--games print stable, parseable one-line-per-item output for scripting. Ollama is disabled by default and live-tested with Ollama 0.35.1 only. Opt in through Advanced settings or its explicit enabled config field. Local GGUF completion models are restored with their identity, context and the keep-alive time left at pause; other local models are unloaded without reload; full load options and conversations are not preserved. Contributor fixes and live evidence are welcome."
+            "GamePause for LM Studio and Ollama\n--headless --active --observe --duration SECONDS\n--doctor --discover --restore --verify --status --games --data-dir PATH\nDefault: automatic pausing with a native dashboard. --background starts in the tray. --observe is a diagnostic override. --verify unloads/reloads LM Studio models using durable recovery; close games and the GUI first. --doctor never starts/stops the server or unloads models. --status/--games print stable, parseable one-line-per-item output for scripting. Ollama is used when it is running and ignored when it is not; turn it off in Advanced settings or its enabled config field. Tested with Ollama 0.35.1. Local GGUF completion models are restored with their identity, context and the keep-alive time left at pause; other local models are unloaded without reload; full load options and conversations are not preserved."
         );
         return Ok(());
     }
@@ -486,11 +486,6 @@ pub fn main(console: bool) -> Result<()> {
         }
     };
     let mut config = Config::load(&folder.join("config.json"))?;
-    if args.headless && config.ollama_enabled() {
-        eprintln!(
-            "Ollama: experimental, live-tested with Ollama 0.35.1 only. Limited identity/context/remaining keep-alive guarantee; full load settings and conversations are not preserved."
-        );
-    }
     if args.active {
         config.mode = "active".into();
     }

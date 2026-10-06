@@ -2109,10 +2109,10 @@ mod tests {
     #[test]
     fn routed_provider_failure_preserves_healthy_pause_and_never_claims_whole_pause() {
         let mut e = engine(Fake::new());
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let unavailable_endpoint = listener.local_addr().unwrap().to_string();
-        drop(listener);
-        // An explicitly enabled private endpoint; no real provider is contacted.
+        // A reachable private endpoint that fails; a closed port would mean
+        // Ollama is simply not running. No real provider is contacted.
+        let (unavailable_endpoint, thread) =
+            crate::ollama_session::tests::http_server(2, |_, _| (500, vec![]));
         for provider in &mut e.config.providers {
             if let crate::config::Provider::Ollama {
                 enabled, endpoint, ..
@@ -2157,6 +2157,7 @@ mod tests {
                         && !report.pending)
             );
         }
+        thread.join().unwrap();
         assert_eq!(
             e.backend
                 .events

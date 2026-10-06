@@ -468,12 +468,16 @@ fn provider_status(s: &Shared) -> Vec<(String, &'static str, Tone)> {
         .iter()
         .filter(|p| p.enabled())
         .map(|p| {
-            let state = s
+            let report = s
                 .provider_statuses
                 .iter()
-                .find(|r| r.id == p.id() && r.kind == p.kind())
-                .map(|r| r.state);
+                .find(|r| r.id == p.id() && r.kind == p.kind());
+            let state = report.map(|r| r.state);
+            let absent = report.is_some_and(|r| r.note == crate::ollama_session::NOT_RUNNING);
             let (text, tone) = match (state, activity) {
+                (Some(State::Paused | State::Restored), _) if absent => {
+                    ("Not running", Tone::Neutral)
+                }
                 (Some(State::Failed), _) => ("Something went wrong", Tone::Error),
                 (Some(State::Deferred), _) => ("Waiting", Tone::Busy),
                 (Some(State::Pausing), _) => ("Pausing AI", Tone::Busy),
@@ -493,19 +497,7 @@ fn provider_status(s: &Shared) -> Vec<(String, &'static str, Tone)> {
                 }
                 _ => ("Ready", Tone::Success),
             };
-            (
-                format!(
-                    "{}{}:",
-                    p.kind().name(),
-                    if p.kind() == crate::provider::Kind::Ollama {
-                        " (experimental)"
-                    } else {
-                        ""
-                    }
-                ),
-                text,
-                tone,
-            )
+            (format!("{}:", p.kind().name()), text, tone)
         })
         .collect()
 }
@@ -594,7 +586,6 @@ enum Modal {
     Remove(Row),
     Resume(crate::gameplay::RestoreOffer, Vec<bool>),
     Verify,
-    Ollama(crate::config::Provider),
     Help,
 }
 struct Dashboard {
@@ -1497,18 +1488,16 @@ impl Dashboard {
                         self.save_bar(ui,s,p);
                     },
                     SettingsPage::Ollama=> {
-                        ui.heading("Experimental Ollama");
-                        ui.colored_label(p.accent,"Live-tested with Ollama 0.35.1 only.");
-                        ui.label("Supports local GGUF completion models with verified identity, supported context and finite observed expiry. Full load options, parallelism, conversations and KV cache are not preserved. Embedding/cloud models and unknown settings are refused.");
-                        ui.label("The user-owned service stays running. GamePause does not download models or fight later client reloads.");
+                        ui.heading("Ollama");
+                        ui.label("Works when Ollama is running; nothing happens when it is not. Local models are unloaded for gaming. GGUF completion models come back with their context and the keep-alive time they had left; other local models, such as embedding models, stay unloaded. Full load options, parallelism, conversations and KV cache are not preserved.");
+                        ui.label("Ollama itself keeps running. GamePause does not download models or fight later client reloads. Tested with Ollama 0.35.1.");
                         let saved=s.config.providers.iter().find(|p|p.kind()==crate::provider::Kind::Ollama);
                         let editable=!s.provider_pending(crate::provider::Kind::Ollama);
                         ui.add_enabled_ui(editable,|ui| {
                             if let Some(saved)=saved {
                                 let mut enabled=saved.enabled();
-                                if ui.styled_checkbox(&mut enabled,"Enable experimental Ollama control").changed(){
-                                    if enabled {self.modal=Some(Modal::Ollama(saved.clone()));}
-                                    else {let mut c=s.config.clone();if let Some(crate::config::Provider::Ollama{enabled,..})=c.providers.iter_mut().find(|p|p.kind()==crate::provider::Kind::Ollama){*enabled=false;}self.save(c,true);}
+                                if ui.styled_checkbox(&mut enabled,"Pause Ollama models while gaming").changed(){
+                                    let mut c=s.config.clone();if let Some(crate::config::Provider::Ollama{enabled:saved,..})=c.providers.iter_mut().find(|p|p.kind()==crate::provider::Kind::Ollama){*saved=enabled;}self.save(c,true);
                                 }
                                 if let Some(crate::config::Provider::Ollama{endpoint,..})=self.edit_config.providers.iter_mut().find(|p|p.kind()==crate::provider::Kind::Ollama) {
                                     ui.label("Loopback endpoint");self.dirty |= ui.text_edit_singleline(endpoint).changed();
@@ -1520,8 +1509,8 @@ impl Dashboard {
                                 }
                             } else {ui.label("No Ollama entry is configured.");}
                         });
-                        if !editable {ui.colored_label(p.accent,"Finish pending Ollama recovery before changing its enrollment or endpoint.");}
-                        ui.hyperlink_to("Contribute Ollama fixes or live evidence",concat!(env!("CARGO_PKG_REPOSITORY"),"/blob/main/CONTRIBUTING.md"));
+                        if !editable {ui.colored_label(p.accent,"Finish pending Ollama recovery before turning it off or changing its endpoint.");}
+                        ui.hyperlink_to("Report Ollama problems or contribute fixes",concat!(env!("CARGO_PKG_REPOSITORY"),"/blob/main/CONTRIBUTING.md"));
                     },
                     SettingsPage::Recovery=> {
                         ui.heading("Pause and recovery");
@@ -1656,7 +1645,6 @@ impl Dashboard {
             Modal::Remove(..) => "Remove custom game?",
             Modal::Resume(..) => "Resume AI while a game is running?",
             Modal::Verify => "Test live LM Studio recovery?",
-            Modal::Ollama(..) => "Enable experimental Ollama?",
             Modal::Help => "Keyboard and controls",
         };
         let response=egui::Modal::new(Id::new("gamepause-modal")).frame(p.card().inner_margin(20)).show(ctx,|ui| {
@@ -1688,12 +1676,6 @@ impl Dashboard {
                     ui.colored_label(p.muted,"Ignore selections are optional. Resume works without selecting any games.");
                 },
                 Modal::Verify=> {ui.label("This live test captures settings, unloads models and restores them. It can interrupt current inference. Recovery safeguards and fresh game checks remain in force.");},
-                Modal::Ollama(provider)=> {
-                    ui.label(format!("Saved endpoint: {}",provider.endpoint()));
-                    ui.colored_label(p.accent,"Experimental. Live-tested with Ollama 0.35.1 only.");
-                    ui.label("Local GGUF completion models are unloaded for gaming and restored with their identity, context and the keep-alive time left when the pause began. Other local models, such as embedding models, are unloaded and not reloaded. Full load settings, parallelism, conversations and KV cache are not preserved. Cloud models are refused.");
-                    ui.label("The user-owned service stays running. No model downloads or repeated unloading of later client reloads.");
-                },
                 Modal::Help=> {ui.label("Tab / Shift+Tab moves focus. Enter / Space activates controls. Arrow keys select table rows. Escape closes this dialog or returns to Games. F1 opens this help. Closing the dashboard keeps the tray watcher running. Quit uses the existing safe shutdown path.");},
             }
             if !self.validation.is_empty(){ui.colored_label(p.error,&self.validation);}
@@ -1703,7 +1685,7 @@ impl Dashboard {
                 // Cancel is first in keyboard order. Dangerous actions require explicit activation.
                 if first {cancel_button.request_focus();}
                 cancel=cancel_button.clicked();
-                let label=match modal {Modal::Add{..}=>"Add game",Modal::Rename(..)=>"Rename",Modal::Remove(..)=>"Remove",Modal::Resume(..)=>"Resume AI",Modal::Verify=>"Test round-trip",Modal::Ollama(..)=>"Enable Ollama",Modal::Help=>""};
+                let label=match modal {Modal::Add{..}=>"Add game",Modal::Rename(..)=>"Rename",Modal::Remove(..)=>"Remove",Modal::Resume(..)=>"Resume AI",Modal::Verify=>"Test round-trip",Modal::Help=>""};
                 if !label.is_empty(){accepted=ui.add_enabled(!s.commands.settings_pending,Button::new(label).fill(p.selected).stroke(Stroke::new(1.0_f32,p.accent))).clicked();}
             });
         });
@@ -1773,33 +1755,6 @@ impl Dashboard {
                         return;
                     }
                     self.validation="The test is no longer available. Wait for games, recovery or current work to finish.".into();
-                }
-                Modal::Ollama(provider) => {
-                    if !s.config.advanced_settings_visible
-                        || s.provider_pending(crate::provider::Kind::Ollama)
-                        || s.config
-                            .providers
-                            .iter()
-                            .find(|p| p.kind() == crate::provider::Kind::Ollama)
-                            != Some(provider)
-                    {
-                        self.validation =
-                            "Ollama settings changed while confirming. Cancel and try again."
-                                .into();
-                    } else {
-                        let mut c = s.config.clone();
-                        if let Some(crate::config::Provider::Ollama { enabled, .. }) = c
-                            .providers
-                            .iter_mut()
-                            .find(|p| p.kind() == crate::provider::Kind::Ollama)
-                        {
-                            *enabled = true;
-                        }
-                        self.save(c, true);
-                        if self.validation.is_empty() {
-                            return;
-                        }
-                    }
                 }
                 Modal::Help => return,
             }

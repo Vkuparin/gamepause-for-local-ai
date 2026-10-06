@@ -20,6 +20,17 @@ use std::{
 pub trait Transport {
     fn request(&mut self, path: &str, body: Option<serde_json::Value>) -> Result<Vec<u8>>;
 }
+/// Nothing accepted a connection on the endpoint: Ollama is not installed or
+/// not running. Timeouts and HTTP errors from a live service are not this.
+#[derive(Debug)]
+pub struct Unreachable;
+impl std::fmt::Display for Unreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Ollama is not running at its configured address")
+    }
+}
+impl std::error::Error for Unreachable {}
+pub const NOT_RUNNING: &str = "Not running; nothing to pause.";
 pub struct Http {
     endpoint: String,
     agent: ureq::Agent,
@@ -50,7 +61,14 @@ impl Transport for Http {
             Some(body) => self.agent.post(&url).send_json(body),
             None => self.agent.get(&url).call(),
         }
-        .map_err(|_| anyhow::anyhow!("Ollama local request failed"))?;
+        .map_err(|error| match error {
+            ureq::Error::Transport(transport)
+                if transport.kind() == ureq::ErrorKind::ConnectionFailed =>
+            {
+                anyhow::Error::new(Unreachable)
+            }
+            _ => anyhow::anyhow!("Ollama local request failed"),
+        })?;
         if response.status() != 200 {
             bail!("Ollama local request returned an unexpected status");
         }
@@ -118,6 +136,10 @@ pub struct Snapshot {
     pub models: Vec<Model>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unload_only: Vec<UnloadOnly>,
+    /// The service did not answer at capture, so this session holds no
+    /// Ollama obligation and sends it no request.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub absent: bool,
     pub pause_complete: bool,
 }
 impl Snapshot {
@@ -141,6 +163,9 @@ impl Snapshot {
     }
     /// Names the models this session unloads without a restore obligation.
     pub fn note(&self) -> String {
+        if self.absent {
+            return NOT_RUNNING.into();
+        }
         if self.unload_only.is_empty() {
             return String::new();
         }
@@ -160,6 +185,7 @@ impl Snapshot {
         if self.version != new.version
             || self.source_revision != new.source_revision
             || self.expiry_policy != new.expiry_policy
+            || self.absent != new.absent
             || self.models.len() != new.models.len()
             || self.unload_only.len() != new.unload_only.len()
             || self
@@ -185,6 +211,7 @@ impl Snapshot {
         if self.version != 1
             || self.source_revision != contract::SOURCE_REVISION
             || self.units() > 256
+            || (self.absent && self.units() != 0)
         {
             bail!("Unsupported Ollama recovery contract");
         }
@@ -371,7 +398,26 @@ impl<T: Transport, C: Clock> Runtime for Adapter<T, C> {
         self.started_monotonic = self.clock.monotonic();
         let policy = self.capture_policy;
         self.loaded_at.clear();
-        let inventory = self.inventory()?;
+        let inventory = match self.inventory() {
+            Ok(inventory) => inventory,
+            // No service means nothing to pause, not a failed pause.
+            Err(error) if error.downcast_ref::<Unreachable>().is_some() => {
+                return Ok(Entry {
+                    binding: binding.clone(),
+                    payload: Snapshot {
+                        version: 1,
+                        source_revision: contract::SOURCE_REVISION.into(),
+                        expiry_policy: policy.name().into(),
+                        models: vec![],
+                        unload_only: vec![],
+                        absent: true,
+                        pause_complete: false,
+                    },
+                    restore_complete: false,
+                });
+            }
+            Err(error) => return Err(error),
+        };
         let catalog =
             contract::parse_catalog(self.transport.request("/api/tags", None)?.as_slice())?;
         let mut models = Vec::new();
@@ -404,6 +450,7 @@ impl<T: Transport, C: Clock> Runtime for Adapter<T, C> {
             expiry_policy: policy.name().into(),
             models,
             unload_only,
+            absent: false,
             pause_complete: false,
         };
         snapshot.validate()?;
@@ -586,6 +633,8 @@ impl<T: Transport, C: Clock> Runtime for Adapter<T, C> {
                     }
                 }
             }
+            Operation::VerifyPause if snapshot.absent => snapshot.pause_complete = true,
+            Operation::VerifyRestore if snapshot.absent => complete = true,
             Operation::VerifyPause => {
                 let observed = self.inventory()?;
                 if !contract::captured_models_absent(&snapshot.unloaded(), &observed) {
@@ -709,6 +758,7 @@ pub(crate) mod tests {
         posts: Vec<Value>,
         fail: Option<(bool, bool)>, // unloading, failure after effect
         hold_unload: bool,
+        down: bool,
         evict: bool,
         embedding: bool,
         changed_capture: bool,
@@ -720,6 +770,9 @@ pub(crate) mod tests {
     }
     impl Transport for Fake {
         fn request(&mut self, path: &str, body: Option<Value>) -> Result<Vec<u8>> {
+            if self.down {
+                return Err(Unreachable.into());
+            }
             let value = match path {
                 "/api/ps" => {
                     self.inventories += 1;
@@ -852,6 +905,7 @@ pub(crate) mod tests {
             posts: vec![],
             fail: None,
             hold_unload: false,
+            down: false,
             evict: false,
             embedding: false,
             changed_capture: false,
@@ -1329,6 +1383,15 @@ pub(crate) mod tests {
             thread.join().unwrap();
         }
         assert!(Http::new("example.invalid:11434").is_err());
+        // A closed loopback port is the typed "not running" evidence.
+        let closed = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = closed.local_addr().unwrap().to_string();
+        drop(closed);
+        let error = Http::new(&endpoint)
+            .unwrap()
+            .request("/api/ps", None)
+            .unwrap_err();
+        assert!(error.downcast_ref::<Unreachable>().is_some());
         let mut transport = Http::new("127.0.0.1:1").unwrap();
         assert!(transport.request("/api/pull", Some(json!({}))).is_err());
     }
@@ -1504,6 +1567,45 @@ pub(crate) mod tests {
             ["fixture-a:latest"]
         );
         assert_eq!(c.runtime.transport.posts.len(), 4);
+    }
+    #[test]
+    fn absent_service_is_a_quiet_empty_session_without_any_control() {
+        let mut c = fixture();
+        c.runtime.transport.down = true;
+        drive(&mut c, Intent::Pause, 0);
+        assert!(c.pause_complete());
+        let report = &c.reports(Duration::ZERO)[0];
+        assert_eq!(
+            (report.state, report.note.as_str()),
+            (State::Paused, NOT_RUNNING)
+        );
+        let saved = c.journal().unwrap().providers[0].payload.clone();
+        assert!(saved.absent && saved.units() == 0);
+        let mut tampered = saved.clone();
+        tampered.absent = false;
+        assert!(saved.validate_transition(&tampered).is_err());
+        // The service appearing mid-session does not make this session touch it.
+        c.runtime.transport.down = false;
+        let reads = c.runtime.transport.inventories;
+        drive(&mut c, Intent::Restore, 1);
+        assert!(c.journal().is_none());
+        assert_eq!(c.reports(Duration::from_secs(1))[0].state, State::Restored);
+        assert_eq!(c.runtime.transport.inventories, reads);
+        assert!(c.runtime.transport.posts.is_empty());
+        assert_eq!(c.runtime.transport.resident.len(), 2);
+    }
+    #[test]
+    fn service_lost_after_capture_retains_recovery_instead_of_looking_absent() {
+        let mut c = fixture();
+        drive(&mut c, Intent::Pause, 0);
+        c.runtime.transport.down = true;
+        drive(&mut c, Intent::Restore, 1);
+        assert_eq!(c.statuses()["ollama-main"].state, State::Failed);
+        assert!(c.store.journal().is_some());
+        c.runtime.transport.down = false;
+        drive(&mut c, Intent::Restore, 11);
+        assert!(c.journal().is_none());
+        assert_eq!(c.runtime.transport.resident.len(), 2);
     }
     #[test]
     fn held_unload_only_model_defers_pause_until_it_is_absent() {

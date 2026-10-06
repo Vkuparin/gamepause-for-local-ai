@@ -355,6 +355,7 @@ pub(crate) fn ollama_fixture() -> Entry {
                 stage: crate::ollama_session::Stage::Captured,
             }],
             unload_only: vec![],
+            absent: false,
             pause_complete: false,
         }),
         restore_complete: false,

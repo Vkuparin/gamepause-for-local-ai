@@ -8,7 +8,7 @@ use std::{
 };
 static SERIAL: AtomicU64 = AtomicU64::new(0);
 #[test]
-fn experimental_ollama_opt_in_is_disclosed_without_control_in_observation() {
+fn enabled_ollama_is_left_alone_in_observation() {
     let fixture = Fixture::new();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -37,9 +37,6 @@ fn experimental_ollama_opt_in_is_disclosed_without_control_in_observation() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("experimental, live-tested with Ollama 0.35.1 only"));
-    assert!(stderr.contains("full load settings and conversations are not preserved"));
     assert_eq!(std::fs::read(path).unwrap(), before);
     assert_eq!(
         listener.accept().unwrap_err().kind(),
@@ -94,6 +91,13 @@ impl Fixture {
         std::fs::create_dir_all(&folder).unwrap();
         let mut config = Config::default();
         config.lm_mut().unwrap().lms_path = folder.join("absent-lms.exe").to_string_lossy().into();
+        // Tests that exercise Ollama enable it against a private endpoint;
+        // the rest must not probe a developer's real service.
+        for provider in &mut config.providers {
+            if let config::Provider::Ollama { enabled, .. } = provider {
+                *enabled = false;
+            }
+        }
         write_json(&folder.join("config.json"), &config).unwrap();
         Self(folder)
     }

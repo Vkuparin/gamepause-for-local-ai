@@ -6,7 +6,7 @@
 
 **Give your games room. Bring your local AI back afterward.**
 
-GamePause is a small native Rust app for Windows. It notices when a game starts, saves the models currently loaded in LM Studio, unloads them, and restores them afterward. Experimental Ollama control is available by explicit opt-in and is off by default. The model name can change: there is no fixed model list to maintain.
+GamePause is a small native Rust app for Windows. It notices when a game starts, saves the models currently loaded in LM Studio, unloads them, and restores them afterward. It does the same for Ollama when Ollama is running. The model name can change: there is no fixed model list to maintain.
 
 GamePause **1.7.0** was published on 2026-10-06 at the owner's request. Download the installer or portable ZIP from [Releases](https://github.com/Vkuparin/gamepause-lmstudio/releases/tag/v1.7.0). See [Acceptance](docs/ACCEPTANCE.md) for the approval and evidence limits.
 
@@ -64,7 +64,7 @@ On one Windows 11 / RTX 5090 PC with 16 logical CPUs, the installed v0.2.0 watch
 
 Discovery is best effort. Protected processes and unconventional installations can require registering a game through the dashboard. Earlier Steam / Witcher 3 measurements remain historical; the owner reported human tests passed for the final 1.0.0 build. Other launcher adapters have metadata/fixture evidence, not complete gameplay sessions.
 
-Ollama control is experimental and was live-tested with Ollama 0.35.1 only. GamePause unloads all local Ollama models for gaming and reloads local GGUF completion models with their identity/digest, context and the keep-alive time left when the pause began; other local models are unloaded without reload. It does not preserve all load options, parallelism, conversations or KV cache, start the service, download models or prevent later client reloads. [Limits and opt-in](docs/USAGE.md#background-ai-applications).
+Ollama needs no setup: it is used when it is running and ignored when it is not. It was tested with Ollama 0.35.1. GamePause unloads all local Ollama models for gaming and reloads local GGUF completion models with their identity/digest, context and the keep-alive time left when the pause began; other local models are unloaded without reload. It does not preserve all load options, parallelism, conversations or KV cache, start the service, download models or prevent later client reloads. [Limits](docs/USAGE.md#background-ai-applications).
 
 Complete settings preservation currently requires LM Studio's internal WebSocket protocol alongside its CLI and native REST API. Protocol changes can require a GamePause update. Run `GamePauseCLI.exe --doctor` after upgrading LM Studio. If a recoverable snapshot cannot be captured, GamePause refuses to unload. It does not launch LM Studio or supervise clients that independently restart its server.
 

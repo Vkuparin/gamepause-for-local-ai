@@ -249,7 +249,7 @@ fn provider_lines(shared: &Shared, fallback: &str) -> String {
             else {
                 return match provider.kind() {
                     Kind::LMStudio => format!("{}: {fallback}", provider.kind().name()),
-                    Kind::Ollama => "Ollama: experimental; AI state unknown until capture.".into(),
+                    Kind::Ollama => "Ollama: AI state unknown until capture.".into(),
                 };
             };
             let state = match report.state {
@@ -269,10 +269,12 @@ fn provider_lines(shared: &Shared, fallback: &str) -> String {
                 State::Failed if report.pending => "operation failed; recovery retained.",
                 State::Failed => "operation failed; completed protection is not established.",
             };
-            let mut text = format!("{}: {state}", report.kind.name());
-            if report.kind == Kind::Ollama {
-                text.push_str(" Experimental; live-tested with Ollama 0.35.1 only.");
+            if report.note == crate::ollama_session::NOT_RUNNING
+                && matches!(report.state, State::Paused | State::Restored)
+            {
+                return format!("{}: not running; nothing to pause.", report.kind.name());
             }
+            let mut text = format!("{}: {state}", report.kind.name());
             if !report.error.is_empty() {
                 // One bounded native menu row per provider; full detail stays in worker status.
                 let mut error = report.error.chars();
@@ -288,6 +290,9 @@ fn provider_lines(shared: &Shared, fallback: &str) -> String {
             }
             if !report.note.is_empty() {
                 text.push_str(&format!(" {}", report.note));
+            }
+            if report.kind == Kind::Ollama {
+                text.push_str(" Load options and conversations are not preserved.");
             }
             if let Some(seconds) = report.retry_seconds {
                 text.push_str(&format!(" Retry backoff at last update: {seconds}s."));

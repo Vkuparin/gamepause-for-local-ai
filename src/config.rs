@@ -55,6 +55,9 @@ pub struct Config {
     pub extra_games: Vec<ExtraGame>,
     pub excluded_executables: Vec<String>,
     pub excluded_paths: Vec<String>,
+    /// Set once Ollama's on-by-default has been applied to this file, so a
+    /// later choice to turn it off is kept.
+    pub ollama_default_applied: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -120,7 +123,9 @@ fn default_providers() -> Vec<Provider> {
         },
         Provider::Ollama {
             id: "ollama-main".into(),
-            enabled: false,
+            // Unit tests must not reach a developer's real Ollama through
+            // default settings; fixtures enable it against private endpoints.
+            enabled: !cfg!(test),
             endpoint: "127.0.0.1:11434".into(),
         },
     ]
@@ -147,6 +152,7 @@ impl Default for Config {
             extra_games: vec![],
             excluded_executables: vec![],
             excluded_paths: vec![],
+            ollama_default_applied: true,
         }
     }
 }
@@ -163,7 +169,9 @@ impl Config {
     pub fn parse(text: &str) -> Result<Self> {
         Ok(Self::decode(text)?.0)
     }
-    fn decode(text: &str) -> Result<(Self, bool)> {
+    /// Returns the settings, whether they were legacy, and whether Ollama's
+    /// default was applied to a version-3 file that predates it.
+    fn decode(text: &str) -> Result<(Self, bool, bool)> {
         let mut raw: serde_json::Value = serde_json::from_str(text.trim_start_matches('\u{feff}'))
             .context("Invalid configuration")?;
         let legacy = raw.get("settings_version").is_none() || raw["settings_version"] == 2;
@@ -207,16 +215,32 @@ impl Config {
                 map.insert("mode".into(), "active".into());
             }
         }
+        // Files saved before Ollama became a regular provider carry the old
+        // off-by-default entry. Turn it on once; the marker keeps later edits.
+        let promoted = !legacy && raw.get("ollama_default_applied").is_none();
+        if let Some(map) = raw.as_object_mut().filter(|_| promoted || legacy) {
+            map.insert("ollama_default_applied".into(), true.into());
+            if promoted
+                && let Some(providers) = map.get_mut("providers").and_then(|v| v.as_array_mut())
+            {
+                for provider in providers.iter_mut().filter(|p| p["kind"] == "ollama") {
+                    provider["enabled"] = true.into();
+                }
+            }
+        }
         let config: Self = serde_json::from_value(raw).context("Invalid configuration")?;
         config.validate()?;
-        Ok((config, legacy))
+        Ok((config, legacy, promoted))
     }
     pub fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
             write_json(path, &Self::default())?;
         }
         let text = fs::read_to_string(path)?;
-        let (config, legacy) = Self::decode(&text)?;
+        let (config, legacy, promoted) = Self::decode(&text)?;
+        if promoted {
+            write_json(path, &config).context("Settings update could not save; source retained")?;
+        }
         if legacy {
             let backup = path.with_extension("v2.backup.json");
             match OpenOptions::new()
@@ -542,10 +566,41 @@ mod tests {
         assert_eq!(fs::read(conflict.path()).unwrap(), original);
     }
     #[test]
-    fn ollama_opt_in_persists_explicitly_and_never_changes_the_default() {
+    fn earlier_settings_enable_ollama_once_and_a_later_disable_is_kept() {
+        let fixture = Fixture::new();
+        let mut earlier = serde_json::to_value(Config::default()).unwrap();
+        earlier
+            .as_object_mut()
+            .unwrap()
+            .remove("ollama_default_applied");
+        earlier["providers"][1]["enabled"] = false.into();
+        write_json(&fixture.path(), &earlier).unwrap();
+        // Doctor's in-memory parse applies the default without writing.
+        let text = fs::read_to_string(fixture.path()).unwrap();
+        assert!(Config::parse(&text).unwrap().ollama_enabled());
+        assert_eq!(fs::read_to_string(fixture.path()).unwrap(), text);
+        let mut loaded = Config::load(&fixture.path()).unwrap();
+        assert!(loaded.ollama_enabled() && loaded.ollama_default_applied);
+        assert!(
+            Config::parse(&fs::read_to_string(fixture.path()).unwrap())
+                .unwrap()
+                .ollama_enabled()
+        );
+        if let Provider::Ollama { enabled, .. } = &mut loaded.providers[1] {
+            *enabled = false;
+        }
+        write_json(&fixture.path(), &loaded).unwrap();
+        assert!(!Config::load(&fixture.path()).unwrap().ollama_enabled());
+        // Version-2 settings migrate with the provider default and the marker.
+        write_json(&fixture.path(), &serde_json::json!({"settings_version":2})).unwrap();
+        let migrated = Config::load(&fixture.path()).unwrap();
+        assert!(migrated.ollama_default_applied);
+        assert_eq!(migrated.ollama_enabled(), default_providers()[1].enabled());
+    }
+    #[test]
+    fn ollama_endpoint_and_enablement_persist() {
         let fixture = Fixture::new();
         let mut config = Config::default();
-        assert!(!config.providers[1].enabled());
         if let Provider::Ollama {
             enabled, endpoint, ..
         } = &mut config.providers[1]
