@@ -64,6 +64,11 @@ pub trait Backend {
     fn select_control_port(&mut self, _port: u16) -> Result<()> {
         Ok(())
     }
+    /// False when LM Studio's CLI cannot be found: nothing to pause, not a
+    /// failure. Checked without contacting the service.
+    fn installed(&mut self) -> bool {
+        true
+    }
 }
 
 /// Bridge existing LM transports and mocks to the neutral operation interface.
@@ -100,6 +105,9 @@ impl<B: Backend + ?Sized> Backend for &mut B {
     }
     fn select_control_port(&mut self, port: u16) -> Result<()> {
         (**self).select_control_port(port)
+    }
+    fn installed(&mut self) -> bool {
+        (**self).installed()
     }
 }
 /// Bridge existing LM transports and mocks to the neutral operation interface.

@@ -61,7 +61,7 @@ Under **Advanced > Recovery**, save the restore delay and retry interval with **
 
 The warning also offers separate, initially unchecked **Ignore in future** choices. Only selected executable paths are saved. Saving exclusions and restoring AI have separate results: a failed preference save does not cancel your explicit restore choice. Ignoring a game alone never restores AI, and remembered games still guard ordinary recovery. CLI Restore and Test round-trip retain their normal game guards.
 
-**Test round-trip** runs the capture, unload and restore cycle on purpose and reports each step. It requires confirmation and no running game or pending recovery.
+**Test round-trip** runs the capture, unload and restore cycle on purpose for every enabled AI app, LM Studio first and then Ollama, and reports each step. It requires confirmation and no running game or pending recovery.
 
 The hint line under the state distinguishes a gaming pause, your own pause, the resume delay, waiting for a response to finish, and each kind of failure. A recovery journal alone does not mean AI has been unloaded, so unfinished recovery shows **AI NEEDS ATTENTION**, not **AI PAUSED**. Watching without a provider probe does not establish LM Studio availability. Partial failures retain recovery and never report a completed pause or restore.
 
@@ -89,6 +89,8 @@ A previous gameplay coexistence choice is held while discovery refreshes and is 
 ```
 
 `--status` checks the instance lock and prints `status=absent` after quit/crash, even if an old status file remains. `--games` reads cached inventory and returns `games=absent` only when that file is missing. Permission/I/O errors and corrupt cached files are errors. Text fields escape backslashes, tabs, carriage returns and newlines as `\\`, `\t`, `\r`, `\n`; paths use the same escaping. `active_games` is a JSON array on one status line.
+
+An AI app that is not there is not an error. If LM Studio is not installed, its line reads **Not installed** and GamePause works with Ollama alone; if LM Studio is installed but closed, GamePause keeps watching without a warning. If Ollama is not running, its line reads **Not running**. When a game starts and no models were loaded anywhere, the status says nothing was paused, and no success notification is sent for the pause or the later restore.
 
 `--verify` unloads/reloads all current models through a durable schema-3 journal containing the original LM snapshot. Close the GUI and games and finish inference first. It rejects observation mode, discovery errors and existing recovery. A temporary server is used if needed, then returned to its original state after successful recovery. A game appearing between steps defers remaining loads. Failure/cancellation exits nonzero; unresolved models stay recoverable. The GUI action asks for confirmation and is unavailable during pause/recovery. `verify-unloaded` means an empty model inventory, not a stopped server.
 
@@ -120,7 +122,7 @@ When a game starts, GamePause unloads every local model Ollama has loaded. After
 
 Unloading waits for running inference: Ollama acknowledges the request at once but keeps the model until the current generation finishes, and GamePause reports the pause as waiting until the model is gone. Restoration does not preserve all live load options, parallelism, conversations or KV cache. The user-owned service stays running; GamePause never downloads models or fights later client reloads. Tag changes or final-set eviction retain recovery. Journals written by earlier builds keep their original rule, where time spent paused consumed the keep-alive.
 
-**Test round-trip** and `--verify` remain LM Studio tests; enabled Ollama is left untouched. The live checks cover one Ollama version and model; embedding, vision and multi-model sessions have fixture coverage only. [Contributions](../CONTRIBUTING.md) with fixes and sanitized live evidence are welcome; the Advanced contribution button opens the same project guidance in a browser.
+**Test round-trip** and `--verify` include Ollama: after the LM Studio steps, `ollama-unload` unloads what is loaded and confirms it is gone, and `ollama-restore` reloads the restorable models and checks identity, context and residency. Ollama not running, or nothing loaded, is reported as nothing to test and does not fail the run. The live checks cover one Ollama version and model; embedding, vision and multi-model sessions have fixture coverage only. [Contributions](../CONTRIBUTING.md) with fixes and sanitized live evidence are welcome; the Advanced contribution button opens the same project guidance in a browser.
 
 Clients using LM Studio's HTTP server are unavailable during gaming. Pause agents that independently restart the server or explicitly load models. With `stop_server_during_gaming: false`, a client using JIT loading can reload models immediately. GamePause does not prevent every later model load.
 

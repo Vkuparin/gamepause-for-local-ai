@@ -1003,6 +1003,7 @@ mod tests {
             provider_statuses: vec![],
             doctor_report: None,
             doctor_pending: false,
+            lm_missing: false,
             power: Default::default(),
         }));
         {
@@ -1113,6 +1114,7 @@ mod tests {
             provider_statuses: vec![],
             doctor_report: None,
             doctor_pending: false,
+            lm_missing: false,
             power: Default::default(),
         }));
         let (tx, _rx) = mpsc::channel();

@@ -475,6 +475,9 @@ fn provider_status(s: &Shared) -> Vec<(String, &'static str, Tone)> {
             let state = report.map(|r| r.state);
             let absent = report.is_some_and(|r| r.note == crate::ollama_session::NOT_RUNNING);
             let (text, tone) = match (state, activity) {
+                _ if s.lm_missing && p.kind() == crate::provider::Kind::LMStudio => {
+                    ("Not installed", Tone::Neutral)
+                }
                 (Some(State::Paused | State::Restored), _) if absent => {
                     ("Not running", Tone::Neutral)
                 }
@@ -1520,7 +1523,7 @@ impl Dashboard {
                         ui.colored_label(if s.pending {p.accent}else{p.muted},if s.pending {"Recovery is pending"}else{"No saved recovery is pending"});
                         self.save_bar(ui,s,p);
                         ui.add_space(design::GAP);
-                        if ui.add_enabled(crate::ui_commands::verify_available(s),Button::new("Test LM Studio round-trip...")).clicked(){self.modal=Some(Modal::Verify);}
+                        if ui.add_enabled(crate::ui_commands::verify_available(s),Button::new("Test round-trip...")).clicked(){self.modal=Some(Modal::Verify);}
                         ui.colored_label(p.muted,"The test captures, unloads and reloads your live LM Studio models. It requires no running games or pending recovery.");
                     },
                     SettingsPage::Diagnostics=> {
@@ -1644,7 +1647,7 @@ impl Dashboard {
             Modal::Rename(..) => "Rename game",
             Modal::Remove(..) => "Remove custom game?",
             Modal::Resume(..) => "Resume AI while a game is running?",
-            Modal::Verify => "Test live LM Studio recovery?",
+            Modal::Verify => "Test live pause and restore?",
             Modal::Help => "Keyboard and controls",
         };
         let response=egui::Modal::new(Id::new("gamepause-modal")).frame(p.card().inner_margin(20)).show(ctx,|ui| {

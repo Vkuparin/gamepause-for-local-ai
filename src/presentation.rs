@@ -242,6 +242,9 @@ fn provider_lines(shared: &Shared, fallback: &str) -> String {
         .iter()
         .filter(|provider| provider.enabled())
         .map(|provider| {
+            if shared.lm_missing && provider.kind() == Kind::LMStudio {
+                return "LM Studio: not installed; nothing to pause.".into();
+            }
             let Some(report) = shared
                 .provider_statuses
                 .iter()

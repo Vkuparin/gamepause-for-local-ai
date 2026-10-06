@@ -55,7 +55,7 @@ pub fn allowed(shared: &crate::app::SharedState, command: Command) -> bool {
 }
 pub fn verify_available(state: &crate::app::Shared) -> bool {
     state.config.advanced_settings_visible
-        && state.config.lm_enabled()
+        && state.config.any_provider_enabled()
         && state.active_mode
         && state.discovery_ready
         && state.detection_ok

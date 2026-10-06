@@ -58,6 +58,11 @@ pub struct Engine<B: Backend> {
     pub activity: Activity,
     pub gameplay: GameplayControl,
     pub provider_statuses: Vec<crate::coordinator::Report>,
+    /// LM Studio is enabled but not installed and owes no recovery, so it
+    /// takes no part in control until its CLI appears.
+    pub lm_missing: bool,
+    /// Round-trip verification drives one provider at a time.
+    verify_scope: Option<crate::provider::Kind>,
     provider_progress: Option<ProviderObserver>,
     coordinator_memory: Option<crate::coordinator::Continuation<crate::recovery::Payload>>,
     adapter_progress: Option<crate::lm_session::Progress>,
@@ -114,6 +119,8 @@ impl<B: Backend> Engine<B> {
             activity,
             gameplay: GameplayControl::default(),
             provider_statuses: vec![],
+            lm_missing: false,
+            verify_scope: None,
             provider_progress: None,
             coordinator_memory: None,
             adapter_progress: None,
@@ -173,7 +180,7 @@ impl<B: Backend> Engine<B> {
     /// Enabled provider names for status text; LM Studio when none is enabled.
     fn provider_names(&self) -> String {
         let names = self
-            .config
+            .control_config()
             .providers
             .iter()
             .filter(|provider| provider.enabled())
@@ -255,9 +262,52 @@ impl<B: Backend> Engine<B> {
     ) {
         self.provider_progress = Some(Box::new(observer));
     }
+    /// Settings as control sees them: a provider that is not installed and
+    /// owes no recovery is left out, exactly as if it were turned off.
+    fn control_config(&self) -> Config {
+        let mut config = self.config.clone();
+        if self.lm_missing {
+            for provider in &mut config.providers {
+                if let crate::config::Provider::LMStudio { enabled, .. } = provider {
+                    *enabled = false;
+                }
+            }
+        }
+        config
+    }
+    fn refresh_installed(&mut self) {
+        let owed = self.state.is_some()
+            || self.recovery.as_ref().is_some_and(|journal| {
+                journal
+                    .providers
+                    .iter()
+                    .any(|entry| entry.binding.kind == crate::provider::Kind::LMStudio)
+            });
+        self.lm_missing = self.config.lm_enabled() && !owed && !self.backend.installed();
+    }
+    /// The session's journal holds no model and no stopped service: every
+    /// provider was absent or had nothing loaded.
+    fn nothing_held(&self) -> bool {
+        self.recovery.as_ref().is_some_and(|journal| {
+            journal.providers.iter().all(|entry| match &entry.payload {
+                crate::recovery::Payload::LMStudio(snapshot) => {
+                    snapshot.models.is_empty() && !snapshot.server_stopped
+                }
+                crate::recovery::Payload::Ollama(snapshot) => snapshot.units() == 0,
+            })
+        })
+    }
+    fn paused_message(&self) -> &'static str {
+        match (self.manual_pause, self.nothing_held()) {
+            (true, true) => "No AI models were loaded; Resume AI releases the hold",
+            (true, false) => "AI paused by you; choose Resume AI to release the hold",
+            (false, true) => "Game running; no AI models were loaded, so nothing was paused",
+            (false, false) => "AI paused for gaming",
+        }
+    }
     fn providers_paused(&self) -> bool {
-        let enabled = self
-            .config
+        let config = self.control_config();
+        let enabled = config
             .providers
             .iter()
             .filter(|provider| provider.enabled())
@@ -400,15 +450,14 @@ impl<B: Backend> Engine<B> {
         if now.is_finite() && now >= 0. {
             self.provider_now = Duration::from_secs_f64(now);
         }
-        if !self
-            .config
-            .providers
-            .iter()
-            .any(|provider| provider.enabled())
-            && !self.pending()
-        {
+        self.refresh_installed();
+        if !self.control_config().any_provider_enabled() && !self.pending() {
             self.set_activity(Activity::Watching);
-            self.message = "No AI provider is enabled; choose one in Advanced settings".into();
+            self.message = if self.lm_missing {
+                "Watching games; no AI app was found to pause".into()
+            } else {
+                "No AI provider is enabled; choose one in Advanced settings".into()
+            };
             return;
         }
         if self.disabled {
@@ -636,12 +685,7 @@ impl<B: Backend> Engine<B> {
         if self.resume_pending || self.power_interrupted() {
             bail!("Power state changed; pause held until fresh resume reconciliation");
         }
-        if !self
-            .config
-            .providers
-            .iter()
-            .any(|provider| provider.enabled())
-        {
+        if !self.control_config().any_provider_enabled() {
             bail!("No AI provider is enabled; no pause was started");
         }
         if self.pause_verified() && self.activity != Activity::Recovery {
@@ -650,27 +694,20 @@ impl<B: Backend> Engine<B> {
             } else {
                 Activity::Paused
             });
-            self.message = if self.manual_pause {
-                "AI paused by you; choose Resume AI to release the hold"
-            } else {
-                "AI paused for gaming"
-            }
-            .into();
+            self.message = self.paused_message().into();
             return Ok(());
         }
         self.pause_units(cancelled, only_lm)?;
-        self.pause_completions += 1;
+        // A pause that found nothing loaded is not a success to announce.
+        if !self.nothing_held() {
+            self.pause_completions += 1;
+        }
         self.set_activity(if self.manual_pause {
             Activity::ManualHold
         } else {
             Activity::Paused
         });
-        self.message = if self.manual_pause {
-            "AI paused by you; choose Resume AI to release the hold"
-        } else {
-            "AI paused for gaming"
-        }
-        .into();
+        self.message = self.paused_message().into();
         Ok(())
     }
     fn pause_units(&mut self, cancelled: &mut dyn FnMut() -> bool, only_lm: bool) -> Result<()> {
@@ -688,16 +725,20 @@ impl<B: Backend> Engine<B> {
             Activity::Unloading
         });
         let power_guard = &self.power_guard;
+        let control = self.control_config();
         let runtime = crate::provider_runtime::Providers::new(
             &mut self.backend,
-            self.config.clone(),
+            control,
             false,
             &mut self.ollama_runtime,
         )
         .with_progress(progress);
         let mut bindings = runtime.bindings()?;
-        if only_lm {
-            bindings.retain(|binding| binding.kind == crate::provider::Kind::LMStudio);
+        if let Some(kind) = self
+            .verify_scope
+            .or(only_lm.then_some(crate::provider::Kind::LMStudio))
+        {
+            bindings.retain(|binding| binding.kind == kind);
         }
         let overhead = bindings.len().saturating_mul(2).saturating_add(4);
         let mut coordinator = if let Some(memory) = memory {
@@ -859,6 +900,7 @@ impl<B: Backend> Engine<B> {
             }
             return Ok(());
         }
+        let nothing_held = self.nothing_held();
         self.state = None;
         self.recovery = None;
         self.binding = None;
@@ -867,9 +909,13 @@ impl<B: Backend> Engine<B> {
         self.intent = Intent::Reconcile;
         self.remembered_games.clear();
         self.quiet_since = None;
-        self.restore_completions += 1;
         self.set_activity(Activity::Watching);
-        self.message = "AI restored".into();
+        if nothing_held {
+            self.message = "Nothing needed restoring".into();
+        } else {
+            self.restore_completions += 1;
+            self.message = "AI restored".into();
+        }
         Ok(())
     }
     /// Drain serial restore units, including healthy models after a local failure.
@@ -903,17 +949,22 @@ impl<B: Backend> Engine<B> {
             Default::default()
         };
         let power_guard = &self.power_guard;
+        let control = self.control_config();
         let runtime = crate::provider_runtime::Providers::new(
             &mut self.backend,
-            self.config.clone(),
+            control,
             compare,
             &mut self.ollama_runtime,
         )
         .with_progress(progress);
         let mut bindings = runtime.bindings()?;
-        if compare {
-            // Raw round-trip verification is an LM capability, independent of Ollama opt-in.
-            bindings.retain(|binding| binding.kind == crate::provider::Kind::LMStudio);
+        // Raw field comparison is an LM capability; verification scopes each
+        // phase to the provider it is testing.
+        if let Some(kind) = self
+            .verify_scope
+            .or(compare.then_some(crate::provider::Kind::LMStudio))
+        {
+            bindings.retain(|binding| binding.kind == kind);
         }
         let mut coordinator = if let Some(memory) = memory {
             Coordinator::resume(
@@ -1028,8 +1079,11 @@ impl<B: Backend> Engine<B> {
         let mut steps = Vec::new();
         let mut phase = "guard";
         let result = (|| -> Result<()> {
+            self.refresh_installed();
+            let test_lm = self.config.lm_enabled() && !self.lm_missing;
+            let test_ollama = self.config.ollama_enabled();
             if self.config.mode != "active"
-                || !self.config.lm_enabled()
+                || !(test_lm || test_ollama)
                 || self.disabled
                 || self.manual_pause
                 || self.pending()
@@ -1043,8 +1097,11 @@ impl<B: Backend> Engine<B> {
                     "Verification unavailable while a game is running or detection is unavailable"
                 );
             }
-            phase = "capture";
             self.set_activity(Activity::Verifying);
+            if !test_lm {
+                return self.verify_ollama(&mut steps, cancelled);
+            }
+            phase = "capture";
             let snapshot = self.backend.capture()?;
             snapshot.validate_recovery()?;
             self.intent = Intent::Pause;
@@ -1116,8 +1173,13 @@ impl<B: Backend> Engine<B> {
             });
             unloaded?;
             check?;
-            recovered
+            recovered?;
+            if test_ollama {
+                self.verify_ollama(&mut steps, cancelled)?;
+            }
+            Ok(())
         })();
+        self.verify_scope = None;
         if let Err(error) = result {
             if steps.is_empty() {
                 steps.push(VerifyStep {
@@ -1149,6 +1211,69 @@ impl<B: Backend> Engine<B> {
         let report = VerifyReport { steps, ok, summary };
         self.verify_report = Some(report.clone());
         report
+    }
+}
+
+impl<B: Backend> Engine<B> {
+    /// Ollama's half of the round-trip test: capture, unload with verified
+    /// absence, then reload and verify identity, context and residency.
+    fn verify_ollama(
+        &mut self,
+        steps: &mut Vec<VerifyStep>,
+        cancelled: &mut dyn FnMut() -> bool,
+    ) -> Result<()> {
+        self.verify_scope = Some(crate::provider::Kind::Ollama);
+        let unloaded = self.pause_scoped(cancelled, false);
+        let captured = self.recovery.as_ref().and_then(|journal| {
+            journal
+                .providers
+                .iter()
+                .find_map(|entry| match &entry.payload {
+                    crate::recovery::Payload::Ollama(snapshot) => Some(snapshot.clone()),
+                    _ => None,
+                })
+        });
+        steps.push(VerifyStep {
+            name: "ollama-unload".into(),
+            ok: unloaded.is_ok(),
+            detail: match (&unloaded, &captured) {
+                (Err(error), _) => format!("{error:#}"),
+                (Ok(()), Some(snapshot)) if snapshot.absent => {
+                    "Ollama is not running; nothing to test".into()
+                }
+                (Ok(()), Some(snapshot)) if snapshot.units() == 0 => {
+                    "No Ollama models are loaded; nothing to test".into()
+                }
+                (Ok(()), Some(snapshot)) => format!(
+                    "{} model(s) unloaded and verified absent. {}",
+                    snapshot.units(),
+                    snapshot.note()
+                )
+                .trim_end()
+                .into(),
+                (Ok(()), None) => "No Ollama capture was recorded".into(),
+            },
+        });
+        // Even a partial unload must be recovered; retain the original failure.
+        let recovered = self.restore_checked(cancelled, false).and_then(|()| {
+            if self.pending() {
+                bail!("Game detected; restoration deferred, recovery pending");
+            }
+            Ok(())
+        });
+        steps.push(VerifyStep {
+            name: "ollama-restore".into(),
+            ok: recovered.is_ok(),
+            detail: recovered
+                .as_ref()
+                .err()
+                .map(|e| format!("{e:#}"))
+                .unwrap_or_else(|| {
+                    "Restorable models reloaded; identity, context and residency verified".into()
+                }),
+        });
+        unloaded?;
+        recovered
     }
 }
 
@@ -2107,6 +2232,32 @@ mod tests {
         }
     }
     #[test]
+    fn a_pause_with_nothing_loaded_is_reported_as_such_and_not_counted() {
+        let mut backend = Fake::new();
+        backend.current.clear();
+        backend.running = false;
+        let mut e = engine(backend);
+        e.step(true, 0., &mut || false);
+        assert_eq!(e.activity, Activity::Paused);
+        assert_eq!(
+            e.message,
+            "Game running; no AI models were loaded, so nothing was paused"
+        );
+        assert_eq!(e.pause_completions, 0);
+        e.step(false, 1., &mut || false);
+        e.step(false, 40., &mut || false);
+        assert!(!e.pending());
+        assert_eq!(e.message, "Nothing needed restoring");
+        assert_eq!(e.restore_completions, 0);
+        // The ordinary case still announces both.
+        let mut e = engine(Fake::new());
+        e.step(true, 0., &mut || false);
+        assert_eq!(
+            (e.message.as_str(), e.pause_completions),
+            ("AI paused for gaming", 1)
+        );
+    }
+    #[test]
     fn routed_provider_failure_preserves_healthy_pause_and_never_claims_whole_pause() {
         let mut e = engine(Fake::new());
         // A reachable private endpoint that fails; a closed port would mean
@@ -2973,31 +3124,86 @@ mod tests {
         );
     }
     #[test]
-    fn lm_round_trip_leaves_enabled_ollama_untouched() {
+    fn round_trip_tests_lm_studio_then_ollama_and_reports_each() {
+        use serde_json::json;
+        let model = json!({"name":"fixture-http:latest", "model":"fixture-http:latest",
+            "digest":"c".repeat(64), "context_length":4096, "expires_at":"2262-01-01T00:00:00Z"});
+        let mut present = true;
+        let (endpoint, thread) = crate::ollama_session::tests::http_server(
+            12,
+            move |route, body| {
+                let value = match route {
+                    "/api/ps" => {
+                        json!({"models":if present { vec![model.clone()] } else { vec![] }})
+                    }
+                    "/api/tags" => json!({"models":[model.clone()]}),
+                    "/api/show" => {
+                        json!({"details":{"format":"gguf"}, "capabilities":["completion"],
+                        "model_info":{"general.architecture":"fixture", "fixture.context_length":8192}})
+                    }
+                    "/api/generate" => {
+                        let body = body.unwrap();
+                        let unloading = body["keep_alive"] == 0;
+                        present = !unloading;
+                        json!({"model":body["model"], "done":true,
+                            "done_reason":if unloading {"unload"} else {"load"}, "response":""})
+                    }
+                    _ => panic!("unexpected fixture route"),
+                };
+                (200, serde_json::to_vec(&value).unwrap())
+            },
+        );
         let mut e = engine(Fake::new());
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
         for provider in &mut e.config.providers {
             if let crate::config::Provider::Ollama {
-                enabled, endpoint, ..
+                enabled,
+                endpoint: route,
+                ..
             } = provider
             {
                 *enabled = true;
-                *endpoint = listener.local_addr().unwrap().to_string();
+                *route = endpoint.clone();
             }
         }
         e.config.validate().unwrap();
-        assert!(e.verify_round_trip(&mut || false).ok);
+        let report = e.verify_round_trip(&mut || false);
+        assert!(report.ok, "{report:?}");
         assert!(!e.pending());
         assert_eq!(e.backend.current.len(), 2);
+        thread.join().unwrap();
+        let names = report
+            .steps
+            .iter()
+            .map(|step| step.name.as_str())
+            .collect::<Vec<_>>();
         assert_eq!(
-            listener.accept().unwrap_err().kind(),
-            std::io::ErrorKind::WouldBlock
+            names,
+            [
+                "capture",
+                "unload",
+                "verify-unloaded",
+                "restore",
+                "verify-fields",
+                "ollama-unload",
+                "ollama-restore"
+            ]
         );
-        assert!(
-            e.provider_statuses
-                .iter()
-                .all(|report| report.kind == crate::provider::Kind::LMStudio)
+        assert!(report.steps[5].detail.starts_with("1 model(s) unloaded"));
+        // With nothing listening, the Ollama half reports that and still passes.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let unused = closed.local_addr().unwrap().to_string();
+        drop(closed);
+        for provider in &mut e.config.providers {
+            if let crate::config::Provider::Ollama { endpoint, .. } = provider {
+                *endpoint = unused.clone();
+            }
+        }
+        e.settings_changed();
+        let report = e.verify_round_trip(&mut || false);
+        assert!(report.ok, "{report:?}");
+        assert_eq!(
+            report.steps[5].detail,
+            "Ollama is not running; nothing to test"
         );
     }
     #[test]

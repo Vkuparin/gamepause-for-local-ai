@@ -84,6 +84,8 @@ pub struct Shared {
     pub provider_statuses: Vec<crate::coordinator::Report>,
     pub doctor_report: Option<Value>,
     pub doctor_pending: bool,
+    /// LM Studio is enabled but its CLI was not found; shown as not installed.
+    pub lm_missing: bool,
     pub power: Arc<crate::power::Signal>,
 }
 
@@ -581,6 +583,7 @@ pub fn main(console: bool) -> Result<()> {
         provider_statuses: vec![],
         doctor_report: None,
         doctor_pending: false,
+        lm_missing: false,
         power: Default::default(),
     }));
     let (tx, rx) = mpsc::channel();
@@ -675,6 +678,9 @@ impl Backend for OptionalBackend {
     }
     fn select_control_port(&mut self, port: u16) -> Result<()> {
         self.get()?.select_control_port(port)
+    }
+    fn installed(&mut self) -> bool {
+        self.get().is_ok()
     }
 }
 #[cfg(test)]
@@ -1129,7 +1135,7 @@ pub fn request_verify(state: &SharedState, tx: &mpsc::Sender<Action>) {
         if shared.verifying
             || !shared.config.advanced_settings_visible
             || !shared.active_mode
-            || !shared.config.lm_enabled()
+            || !shared.config.any_provider_enabled()
             || shared.disabled
             || shared.pending
             || shared.manual_pause
@@ -1853,11 +1859,15 @@ fn run(
                 && engine.config.automation_enabled
                 && engine.config.mode != "observe"
                 && engine.config.lm_enabled()
+                && !engine.lm_missing
                 && !frame.lm_running
             {
-                engine.activity = Activity::Unavailable;
-                engine.message =
-                    "Waiting for LM Studio — open it; automatic pausing will resume".into();
+                // A closed AI app is nothing to pause, not a problem to flag.
+                engine.message = if engine.config.ollama_enabled() {
+                    "Watching games; LM Studio is not open".into()
+                } else {
+                    "Watching games; LM Studio is not open, so there is nothing to pause".into()
+                };
             }
             let status = json!({"version":env!("CARGO_PKG_VERSION"),"implementation":"Rust","mode":engine.config.mode,"automation_enabled":engine.config.automation_enabled,"message":engine.message,"active_games":active,"installed_locations":games.len(),"detection_disabled":engine.disabled,"manual_pause":engine.manual_pause,"last_error":engine.last_error,"discovery_errors":errors,"inaccessible_processes":frame.inaccessible,"recovery_pending":engine.pending(),"provider_outcomes":engine.provider_statuses});
             if let Ok(mut shared) = state.lock() {
@@ -1886,6 +1896,7 @@ fn run(
                 shared.pause_completions = engine.pause_completions;
                 shared.restore_completions = engine.restore_completions;
                 shared.provider_statuses = engine.provider_statuses.clone();
+                shared.lm_missing = engine.lm_missing;
                 shared.pending = engine.pending();
                 shared.active_mode = engine.config.mode == "active";
                 shared.config = engine.config.clone();

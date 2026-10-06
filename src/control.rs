@@ -36,7 +36,7 @@ impl Activity {
             Self::Capturing => "AI: capturing provider settings before pausing",
             Self::Unloading => "AI: unloading captured models; pause not yet complete",
             Self::Restoring => "AI: restoring saved recovery; completion not yet verified",
-            Self::Verifying => "LM Studio: testing unload and restoration",
+            Self::Verifying => "Testing unload and restoration",
             _ => "",
         }
     }
