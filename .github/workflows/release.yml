@@ -60,5 +60,5 @@ jobs:
           $taskNotes.Add('Download the Setup.exe for a per-user installation or the windows-x64.zip for portable use. Quit a running GamePause from the tray before upgrading. The binaries are unsigned; compare downloads against SHA256SUMS.txt.')
           $taskNotesFile = Join-Path $env:RUNNER_TEMP 'release-notes.md'
           $taskNotes | Set-Content -LiteralPath $taskNotesFile -Encoding utf8
-          gh release create $env:GITHUB_REF_NAME --title "GamePause $taskVersion" --notes-file $taskNotesFile --verify-tag "dist/GamePause-$taskVersion-Setup.exe" "dist/GamePause-$taskVersion-windows-x64.zip" dist/SHA256SUMS.txt dist/BUILD-INFO.json
+          gh release create $env:GITHUB_REF_NAME --title "GamePause for Local AI $taskVersion" --notes-file $taskNotesFile --verify-tag "dist/GamePause-$taskVersion-Setup.exe" "dist/GamePause-$taskVersion-windows-x64.zip" dist/SHA256SUMS.txt dist/BUILD-INFO.json
           if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }
