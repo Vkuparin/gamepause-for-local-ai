@@ -379,12 +379,21 @@ impl Scanner {
         apps.sort_by_key(|app| app.name.to_lowercase());
         apps
     }
-    pub fn lmstudio_running(&self) -> bool {
+    /// Whether a process with this file name was seen in the last scan.
+    fn running(&self, executable: &str) -> bool {
         self.cache.values().any(|path| {
             path.rsplit(['\\', '/'])
                 .next()
-                .is_some_and(|name| name.eq_ignore_ascii_case("LM Studio.exe"))
+                .is_some_and(|name| name.eq_ignore_ascii_case(executable))
         })
+    }
+    pub fn lmstudio_running(&self) -> bool {
+        self.running("LM Studio.exe")
+    }
+    /// The Ollama server process. Read from the scan already taken; the
+    /// service itself is not contacted while idle.
+    pub fn ollama_running(&self) -> bool {
+        self.running("ollama.exe")
     }
     pub fn new_game_candidate(&mut self, games: &[Game], roots: &[String]) -> bool {
         self.candidates_seen

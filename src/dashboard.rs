@@ -176,7 +176,7 @@ pub fn show(shared: SharedState, tx: Sender<Action>, folder: PathBuf) {
                 let app_folder = folder.clone();
                 let app_rx = rx.clone();
                 let result = eframe::run_native(
-                    "GamePause",
+                    "GamePause for Local AI",
                     native_options(),
                     Box::new(move |cc| {
                         design::fonts(&cc.egui_ctx);
@@ -458,7 +458,35 @@ fn hero(s: &Shared) -> Hero {
         },
     }
 }
-/// One line per enabled provider: name, short outcome, dot tone.
+/// Whether the provider's program was seen by the last process scan. Other
+/// AI apps are checked only when a game starts, so they count as present.
+fn app_running(s: &Shared, kind: crate::provider::Kind) -> bool {
+    match kind {
+        crate::provider::Kind::LMStudio => s.lm_running,
+        crate::provider::Kind::Ollama => s.ollama_running,
+        crate::provider::Kind::Process => true,
+    }
+}
+/// The status card names only AI apps this PC has: installed or running, or
+/// holding work from the current session. Someone who uses one app is not
+/// shown a line for the other.
+fn listed(s: &Shared, provider: &crate::config::Provider) -> bool {
+    use crate::provider::Kind;
+    match provider.kind() {
+        Kind::LMStudio => !s.lm_missing,
+        Kind::Ollama => {
+            s.ollama_installed
+                || s.ollama_running
+                || s.provider_statuses.iter().any(|report| {
+                    report.kind == Kind::Ollama
+                        && report.id == provider.id()
+                        && report.note != crate::ollama_session::NOT_RUNNING
+                })
+        }
+        Kind::Process => true,
+    }
+}
+/// One line per listed provider: name, short outcome, dot tone.
 fn provider_status(s: &Shared) -> Vec<(String, &'static str, Tone)> {
     use crate::control::Activity;
     use crate::coordinator::State;
@@ -470,7 +498,7 @@ fn provider_status(s: &Shared) -> Vec<(String, &'static str, Tone)> {
     s.config
         .providers
         .iter()
-        .filter(|p| p.enabled())
+        .filter(|p| p.enabled() && listed(s, p))
         .map(|p| {
             let report = s
                 .provider_statuses
@@ -479,9 +507,6 @@ fn provider_status(s: &Shared) -> Vec<(String, &'static str, Tone)> {
             let state = report.map(|r| r.state);
             let absent = report.is_some_and(|r| r.note == crate::ollama_session::NOT_RUNNING);
             let (text, tone) = match (state, activity) {
-                _ if s.lm_missing && p.kind() == crate::provider::Kind::LMStudio => {
-                    ("Not installed", Tone::Neutral)
-                }
                 (Some(State::Paused | State::Restored), _) if absent => {
                     ("Not running", Tone::Neutral)
                 }
@@ -501,6 +526,8 @@ fn provider_status(s: &Shared) -> Vec<(String, &'static str, Tone)> {
                 (_, Activity::Unknown | Activity::DetectionUnavailable) => {
                     ("Waiting for game detection", Tone::Neutral)
                 }
+                // "Ready" claims the app is there to be paused.
+                _ if !app_running(s, p.kind()) => ("Not running", Tone::Neutral),
                 _ => ("Ready", Tone::Success),
             };
             (format!("{}:", p.kind().name()), text, tone)
@@ -766,6 +793,8 @@ impl Dashboard {
                             }
                             if !s.config.any_provider_enabled() {
                                 ui.colored_label(p.muted, "No AI provider is enabled");
+                            } else if provider_status(s).is_empty() {
+                                ui.colored_label(p.muted, "No AI app found to pause");
                             }
                             if s.freed_bytes > 0 && s.pending {
                                 ui.colored_label(
@@ -1993,7 +2022,7 @@ impl Dashboard {
                 ui.horizontal(|ui| {
                     ui.colored_label(
                         palette.muted,
-                        format!("GamePause {}", env!("CARGO_PKG_VERSION")),
+                        format!("GamePause for Local AI {}", env!("CARGO_PKG_VERSION")),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let size = vec2(126.0, 42.0);
@@ -2321,8 +2350,44 @@ mod tests {
         s.pending = false;
         s.provider_statuses.clear();
         assert_eq!(hero(&s).look, Look::Running);
+        // An app that is not running is not "Ready" to be paused.
+        assert_eq!(provider_status(&s)[0].1, "Not running");
         // Idle text never states which models are loaded.
+        s.lm_running = true;
         assert_eq!(provider_status(&s)[0].1, "Ready");
+        if let Some(crate::config::Provider::Ollama { enabled, .. }) = s.config.providers.get_mut(1)
+        {
+            *enabled = true;
+        }
+        // Ollama is not on this PC: no line for it at all.
+        assert_eq!(provider_status(&s).len(), 1);
+        s.ollama_installed = true;
+        let lines = provider_status(&s);
+        assert_eq!(
+            (lines[1].0.as_str(), lines[1].1),
+            ("Ollama:", "Not running")
+        );
+        s.ollama_installed = false;
+        s.ollama_running = true;
+        assert_eq!(provider_status(&s)[1].1, "Ready");
+        // Found absent at a game start: still nothing to show.
+        s.ollama_running = false;
+        s.provider_statuses.push(Report {
+            id: s.config.providers[1].id().into(),
+            kind: Kind::Ollama,
+            guarantee: Guarantee::SupportedFields,
+            state: State::Paused,
+            pending: true,
+            error: String::new(),
+            retry_seconds: None,
+            note: crate::ollama_session::NOT_RUNNING.into(),
+        });
+        assert_eq!(provider_status(&s).len(), 1);
+        // LM Studio without its CLI is not listed either.
+        s.lm_missing = true;
+        assert!(provider_status(&s).is_empty());
+        s.lm_missing = false;
+        s.config = fixture().config;
         s.provider_statuses = fixture().provider_statuses;
         s.provider_statuses[0].state = State::Restored;
         assert_eq!(provider_status(&s)[0].1, "Models restored");

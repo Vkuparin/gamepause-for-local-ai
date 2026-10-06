@@ -200,6 +200,19 @@ pub fn error(message: &str) {
         );
     }
 }
+/// A plain result box for a one-shot command run without a console.
+pub fn info(message: &str) {
+    let text = wide(message);
+    let title = wide("GamePause for Local AI");
+    unsafe {
+        MessageBoxW(
+            null_mut(),
+            text.as_ptr(),
+            title.as_ptr(),
+            MB_OK | MB_ICONINFORMATION,
+        );
+    }
+}
 pub fn startup_enabled() -> bool {
     RegKey::predef(HKEY_CURRENT_USER)
         .open_subkey(STARTUP_KEY)
@@ -1159,6 +1172,9 @@ mod tests {
             doctor_report: None,
             doctor_pending: false,
             lm_missing: false,
+            lm_running: false,
+            ollama_running: false,
+            ollama_installed: false,
             freed_bytes: 0,
             ask_prompt: vec![],
             suggestion: None,
@@ -1282,6 +1298,9 @@ mod tests {
             doctor_report: None,
             doctor_pending: false,
             lm_missing: false,
+            lm_running: false,
+            ollama_running: false,
+            ollama_installed: false,
             freed_bytes: 0,
             ask_prompt: vec![],
             suggestion: None,

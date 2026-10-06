@@ -1,4 +1,4 @@
-use gamepause_lmstudio::config::{self, Config, write_json};
+use gamepause::config::{self, Config, write_json};
 use serde_json::json;
 use std::{
     os::windows::process::CommandExt,
@@ -47,7 +47,7 @@ fn enabled_ollama_is_left_alone_in_observation() {
 }
 #[test]
 fn observation_watcher_uses_background_detection_without_touching_pending_recovery() {
-    use gamepause_lmstudio::{
+    use gamepause::{
         lmstudio::Snapshot,
         recovery::{Binding, Intent, Journal},
     };
@@ -125,30 +125,6 @@ fn verify_with_existing_lock_is_an_error_not_silent_success() {
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8_lossy(&output.stderr).contains("already running"));
-}
-#[test]
-fn status_distinguishes_live_lock_from_stale_cached_file() {
-    let f = Fixture::new();
-    write_json(
-        &f.0.join("status.json"),
-        &json!({"message":"AI available","active_games":[],"recovery_pending":false,
-            "provider_outcomes":[{"kind":"ollama","id":"ollama-main","state":"failed",
-                "guarantee":"supported_fields","pending":true,"error":"fixture\nerror","retry_seconds":3}]}),
-    )
-    .unwrap();
-    let lock = config::lock(&f.0).unwrap();
-    let output = f.run(&["--status"]);
-    assert!(output.status.success());
-    let text = String::from_utf8_lossy(&output.stdout);
-    assert!(text.contains("active_games=[]"));
-    assert!(text.contains("provider_evidence=cached_status"));
-    assert!(text.contains("provider.ollama.pending=yes"));
-    assert!(text.contains("provider.ollama.error=fixture\\nerror"));
-    drop(lock);
-    assert_eq!(
-        String::from_utf8_lossy(&f.run(&["--status"]).stdout).trim(),
-        "status=absent"
-    );
 }
 #[test]
 fn doctor_reports_missing_cli_and_unwritable_data_directory() {

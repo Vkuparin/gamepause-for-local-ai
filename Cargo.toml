@@ -1,10 +1,10 @@
 [package]
-name = "gamepause-lmstudio"
-version = "2.0.1"
+name = "gamepause"
+version = "2.1.0"
 edition = "2024"
 license = "MIT"
 description = "A native Windows tray app that pauses local AI for games and restores it afterward, for LM Studio, Ollama and other local AI servers."
-repository = "https://github.com/Vkuparin/gamepause-lmstudio"
+repository = "https://github.com/Vkuparin/gamepause-for-local-ai"
 
 [dependencies]
 anyhow = "1"

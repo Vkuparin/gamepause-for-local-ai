@@ -8,8 +8,8 @@ fn main() {
     let folder =
         std::env::temp_dir().join(format!("gamepause-resilience-probe-{}", std::process::id()));
     std::fs::create_dir_all(&folder).unwrap();
-    gamepause_lmstudio::app::install_panic_hook(&folder);
-    gamepause_lmstudio::discovery::Discovery::default()
+    gamepause::app::install_panic_hook(&folder);
+    gamepause::discovery::Discovery::default()
         .resilience_probe()
         .unwrap();
     assert!(

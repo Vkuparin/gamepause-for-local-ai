@@ -16,7 +16,7 @@ use std::time::SystemTime;
 use std::{
     fs::{self, OpenOptions},
     io::Write,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, Mutex, mpsc},
     time::{Duration, Instant},
 };
@@ -110,6 +110,12 @@ pub struct Shared {
     pub doctor_pending: bool,
     /// LM Studio is enabled but its CLI was not found; shown as not installed.
     pub lm_missing: bool,
+    /// LM Studio and Ollama processes seen by the last accepted scan. The
+    /// services are not contacted while idle, so this is all "running" means.
+    pub lm_running: bool,
+    pub ollama_running: bool,
+    /// Ollama's program file was found on this PC, running or not.
+    pub ollama_installed: bool,
     /// Approximate model memory released by the current pause; 0 if unknown.
     pub freed_bytes: u64,
     /// Running games whose rule is "ask" and that have not been answered.
@@ -263,8 +269,6 @@ struct Options {
     doctor: bool,
     restore: bool,
     verify: bool,
-    status: bool,
-    games: bool,
     duration: f64,
     version: bool,
     help: bool,
@@ -285,8 +289,6 @@ fn options() -> Result<Options> {
             "--doctor" => options.doctor = true,
             "--restore" => options.restore = true,
             "--verify" => options.verify = true,
-            "--status" => options.status = true,
-            "--games" => options.games = true,
             "--duration" => {
                 options.duration = args.next().context("--duration needs seconds")?.parse()?
             }
@@ -300,15 +302,13 @@ fn options() -> Result<Options> {
         options.discover,
         options.restore,
         options.verify,
-        options.status,
-        options.games,
     ]
     .into_iter()
     .filter(|v| *v)
     .count()
         > 1
     {
-        bail!("Choose only one of doctor/discover/restore/verify/status/games");
+        bail!("Choose only one of doctor/discover/restore/verify");
     }
     if options.active && options.observe {
         bail!("Choose active or observe, not both");
@@ -319,122 +319,6 @@ fn options() -> Result<Options> {
     Ok(options)
 }
 
-// ── P2-3: stable, parseable CLI output formatters (pure, mock-free) ──────────
-// The acceptance test asserts EXACT stdout shape, so these take a fixed Value
-// and return the exact lines. Kept pure so they are unit-testable with a mock
-// status/inventory — no backend, no data dir required to exercise the shape.
-/// One `key=value` line per status field, in a fixed order. A missing or null
-/// field renders as `-` so the output stays parseable regardless of whether the
-/// app has been running long enough to fill it in. Booleans render as yes/no.
-fn format_status(status: &Value) -> String {
-    let field = |key: &str| match status.get(key) {
-        Some(Value::Null) | None => "-".to_string(),
-        Some(Value::String(s)) => escape_field(s),
-        Some(Value::Bool(b)) => bool_word(*b),
-        Some(other) => other.to_string(),
-    };
-    let lines = [
-        ("version", field("version")),
-        ("mode", field("mode")),
-        ("automation_enabled", field("automation_enabled")),
-        ("message", field("message")),
-        ("active_games", field("active_games")),
-        ("installed_locations", field("installed_locations")),
-        ("detection_disabled", field("detection_disabled")),
-        ("manual_pause", field("manual_pause")),
-        ("last_error", field("last_error")),
-        ("recovery_pending", field("recovery_pending")),
-    ];
-    let mut output = lines.map(|(k, v)| format!("{k}={v}")).join("\n");
-    if let Some(providers) = status["provider_outcomes"].as_array() {
-        output.push_str("\nprovider_evidence=cached_status");
-        for provider in providers {
-            // Keys come from known provider kinds, never from arbitrary IDs.
-            let Some(kind @ ("lmstudio" | "ollama" | "process")) = provider["kind"].as_str() else {
-                continue;
-            };
-            for key in [
-                "id",
-                "state",
-                "guarantee",
-                "pending",
-                "error",
-                "retry_seconds",
-            ] {
-                let value = match provider.get(key) {
-                    Some(Value::Null) | None => "-".into(),
-                    Some(Value::String(value)) => escape_field(value),
-                    Some(Value::Bool(value)) => bool_word(*value),
-                    Some(value) => value.to_string(),
-                };
-                output.push_str(&format!("\nprovider.{kind}.{key}={value}"));
-            }
-        }
-    }
-    output
-}
-/// `name<TAB>launcher<TAB>path` per installed location, in inventory order.
-/// Empty inventory renders as `none` so the command never prints an empty
-/// body (stable, non-ambiguous for scripting).
-fn format_games(inventory: &Value) -> String {
-    let Some(items) = inventory.as_array() else {
-        return "none".into();
-    };
-    if items.is_empty() {
-        return "none".into();
-    }
-    items
-        .iter()
-        .map(|g| {
-            format!(
-                "{}\t{}\t{}",
-                escape_field(g["name"].as_str().unwrap_or("")),
-                escape_field(g["launcher"].as_str().unwrap_or("")),
-                escape_field(g["path"].as_str().unwrap_or(""))
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-fn escape_field(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('\t', "\\t")
-        .replace('\r', "\\r")
-        .replace('\n', "\\n")
-}
-fn bool_word(b: bool) -> String {
-    if b { "yes".into() } else { "no".into() }
-}
-/// Read `status.json` and format it for stdout. A missing file (no running
-/// instance) yields the stable `status=absent` line rather than an error, so a
-/// script can distinguish "not running" from a real failure. A corrupt file is
-/// surfaced as an error — that is a real problem, not an empty state.
-fn status_output(folder: &Path) -> Result<String> {
-    match fs::read(folder.join("status.json")) {
-        Ok(bytes) => {
-            let status: Value =
-                serde_json::from_slice(&bytes).context("status.json is not valid JSON")?;
-            Ok(format_status(&status))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok("status=absent".into()),
-        Err(e) => Err(e.into()),
-    }
-}
-/// Read `inventory.json` and format it for stdout. A missing file (discovery
-/// has not completed) yields the stable `games=absent` line. A corrupt file is
-/// surfaced as an error.
-fn games_output(folder: &Path) -> Result<String> {
-    match fs::read(folder.join("inventory.json")) {
-        Ok(bytes) => {
-            let inventory: Value =
-                serde_json::from_slice(&bytes).context("inventory.json is not valid JSON")?;
-            Ok(format_games(&inventory))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok("games=absent".into()),
-        Err(e) => Err(e.into()),
-    }
-}
 pub fn main(console: bool) -> Result<()> {
     let args = options()?;
     if args.version {
@@ -443,7 +327,7 @@ pub fn main(console: bool) -> Result<()> {
     }
     if args.help {
         println!(
-            "GamePause: pauses local AI for games\n--headless --active --observe --duration SECONDS\n--doctor --discover --restore --verify --status --games --data-dir PATH\nDefault: automatic pausing with a native dashboard. --background starts in the tray. --observe is a diagnostic override. --verify unloads/reloads the models LM Studio and Ollama have loaded, using durable recovery; close games and the GUI first. --doctor never starts/stops the server or unloads models. --status/--games print stable, parseable one-line-per-item output for scripting. Ollama is used when it is running and ignored when it is not; turn it off in Advanced settings or its enabled config field. Tested with Ollama 0.35.1. Local GGUF completion models are restored with their identity, context and the keep-alive time left at pause; other local models are unloaded without reload; full load options and conversations are not preserved."
+            "GamePause for Local AI: pauses local AI for games\n--background --data-dir PATH --restore\nDevelopment and diagnostics: --headless --active --observe --duration SECONDS --doctor --discover --verify\nDefault: automatic pausing with a native dashboard. --background starts in the tray. --observe is a diagnostic override. --verify unloads/reloads the models LM Studio and Ollama have loaded, using durable recovery; close games and the GUI first. --doctor never starts/stops the server or unloads models. --restore retries a pending restore when GamePause is not running and reports the result. Ollama is used when it is running and ignored when it is not; turn it off in Advanced settings or its enabled config field. Tested with Ollama 0.35.1. Local GGUF completion models are restored with their identity, context and the keep-alive time left at pause; other local models are unloaded without reload; full load options and conversations are not preserved."
         );
         return Ok(());
     }
@@ -472,36 +356,6 @@ pub fn main(console: bool) -> Result<()> {
     fs::create_dir_all(&folder)?;
     let folder = fs::canonicalize(folder)?;
     install_panic_hook(&folder);
-    // P2-3: read-only, scriptable output. These read the JSON a running
-    // instance has already written — no backend, no lock, no LM Studio
-    // required. They run BEFORE the lock guard precisely so they work while a
-    // GUI instance holds it (the main use case: `gamepause --status` from a
-    // script next to a live app). Output is one line per field/item.
-    if args.status {
-        let running = match config::lock(&folder) {
-            Ok(_) => false,
-            Err(e)
-                if e.downcast_ref::<std::io::Error>()
-                    .is_some_and(|e| e.raw_os_error() == Some(32)) =>
-            {
-                true
-            }
-            Err(e) => return Err(e),
-        };
-        println!(
-            "{}",
-            if running {
-                status_output(&folder)?
-            } else {
-                "status=absent".into()
-            }
-        );
-        return Ok(());
-    }
-    if args.games {
-        println!("{}", games_output(&folder)?);
-        return Ok(());
-    }
     let _lock = match config::lock(&folder) {
         Ok(lock) => lock,
         Err(e) => {
@@ -571,9 +425,13 @@ pub fn main(console: bool) -> Result<()> {
             }
         } else {
             engine.restore(&mut cancelled)?;
-            println!("{}", engine.message);
             if engine.pending() {
                 bail!("Restoration deferred; recovery pending");
+            }
+            println!("{}", engine.message);
+            // The windowed program has no console to print to.
+            if !console {
+                tray::info(&engine.message);
             }
         }
         power_registration.close()?;
@@ -607,6 +465,9 @@ pub fn main(console: bool) -> Result<()> {
         doctor_report: None,
         doctor_pending: false,
         lm_missing: false,
+        lm_running: false,
+        ollama_running: false,
+        ollama_installed: ollama_installed(),
         freed_bytes: 0,
         ask_prompt: vec![],
         suggestion: None,
@@ -1354,6 +1215,21 @@ pub(crate) fn confirmed_restore<B: Backend>(
     engine.attempt(result, now);
     feedback
 }
+/// Whether Ollama's program file is in its per-user install folder or on
+/// `PATH`. Looked up with each inventory refresh, never on the scan path, and
+/// used only to decide whether the status card mentions Ollama.
+fn ollama_installed() -> bool {
+    std::env::var_os("LOCALAPPDATA")
+        .map(|root| PathBuf::from(root).join(r"Programs\Ollama"))
+        .into_iter()
+        .chain(
+            std::env::var_os("PATH")
+                .iter()
+                .flat_map(std::env::split_paths)
+                .collect::<Vec<_>>(),
+        )
+        .any(|folder| folder.join("ollama.exe").is_file())
+}
 fn recovery_scanner(config: &Config) -> Result<Scanner> {
     let mut guard = config.clone();
     guard.excluded_paths.clear();
@@ -1428,6 +1304,7 @@ struct DetectionFrame {
     inaccessible: usize,
     candidate: u64,
     lm_running: bool,
+    ollama_running: bool,
     running_apps: Vec<RunningApp>,
 }
 /// Scans a fullscreen program must lead before it is suggested.
@@ -1542,6 +1419,7 @@ impl NativeDetection {
             inaccessible: self.scanner.inaccessible,
             candidate: self.candidate,
             lm_running: self.scanner.lmstudio_running(),
+            ollama_running: self.scanner.ollama_running(),
             running_apps: if crate::dashboard::needs_running_apps() {
                 self.scanner.running_apps()
             } else {
@@ -1565,6 +1443,8 @@ fn publish_detection(state: &SharedState, result: &std::result::Result<Detection
                 shared.detection_ok = frame.evidence.is_some();
                 shared.active_games = frame.all.clone();
                 shared.running_apps = frame.running_apps.clone();
+                shared.lm_running = frame.lm_running;
+                shared.ollama_running = frame.ollama_running;
                 if !shared.detection_ok {
                     shared.restore_offer = None;
                     shared.coexistence = false;
@@ -1876,6 +1756,7 @@ fn run(
                     force_requested = true;
                 } else {
                     let changed = games != updated;
+                    let ollama = ollama_installed();
                     inventory_ready = true;
                     steam_roots = roots;
                     games = updated;
@@ -1897,6 +1778,7 @@ fn run(
                             .accept_inventory(accepted_generation, changed, &error_text);
                         shared.revision += 1;
                         shared.discovery_ready = true;
+                        shared.ollama_installed = ollama;
                     }
                 }
             }
@@ -2189,31 +2071,6 @@ fn local_timestamp() -> String {
 mod tests {
     use super::*;
     #[test]
-    fn provider_cli_status_preserves_prefix_and_escapes_cached_evidence() {
-        let baseline = json!({"version":"0.3.5","message":"AI recovery pending"});
-        let mut status = baseline.clone();
-        status["provider_outcomes"] = json!([
-            {"kind":"lmstudio","id":"lmstudio-main","state":"restored","guarantee":"captured_configuration","pending":false,"error":"","retry_seconds":null},
-            {"kind":"ollama","id":"ollama-main","state":"failed","guarantee":"supported_fields","pending":true,"error":"failure\nwith\tfields\\path","retry_seconds":10},
-            {"kind":"process","id":"apps-main","state":"paused","guarantee":"process_relaunch","pending":true,"error":"","retry_seconds":null},
-            {"kind":"unexpected\nkey","id":"unsupported"}]);
-        let output = format_status(&status);
-        assert!(output.starts_with(&format!(
-            "{}\nprovider_evidence=cached_status\n",
-            format_status(&baseline)
-        )));
-        assert!(output.contains("provider.lmstudio.pending=no"));
-        assert!(output.contains("provider.ollama.pending=yes"));
-        assert!(output.contains("provider.ollama.error=failure\\nwith\\tfields\\\\path"));
-        assert!(output.contains("provider.process.state=paused"));
-        assert!(
-            output.find("provider.ollama.").unwrap() < output.find("provider.process.").unwrap(),
-            "process lines follow the earlier providers"
-        );
-        assert!(!output.contains("unsupported"));
-        assert_eq!(output.lines().count(), 29);
-    }
-    #[test]
     fn log_lines_start_with_a_readable_local_time() {
         let stamp = local_timestamp();
         let bytes = stamp.as_bytes();
@@ -2352,6 +2209,7 @@ mod tests {
             inaccessible: 0,
             candidate: 0,
             lm_running: true,
+            ollama_running: false,
             running_apps: vec![],
         };
         state.lock().unwrap().activity = Activity::Restoring;
@@ -2415,6 +2273,7 @@ mod tests {
                     inaccessible: 0,
                     candidate: 0,
                     lm_running: false,
+                    ollama_running: false,
                     running_apps: vec![],
                 })
             },
@@ -3203,109 +3062,6 @@ mod tests {
         std::panic::set_hook(previous);
         let _ = fs::remove_file(folder.join("gamepause.log"));
     }
-
-    // ── P2-3 acceptance: --status / --games print stable, parseable output ──
-    // The test writes a *mock* status/inventory into a temp data dir and asserts
-    // the EXACT stdout shape (status_output / games_output are the same helpers
-    // main() prints), so the shape a script sees is the shape asserted here.
-    #[test]
-    fn status_output_is_exact_and_parseable() {
-        let folder =
-            std::env::temp_dir().join(format!("gamepause-cli-status-{}", std::process::id()));
-        let _ = fs::create_dir_all(&folder);
-        // A realistic status.json: booleans, numbers, a missing field (we do
-        // not write "last_error") to prove the absent-field contract.
-        write_json(
-            &folder.join("status.json"),
-            &json!({
-                "version": "0.3.0",
-                "mode": "active",
-                "automation_enabled": true,
-                "message": "Waiting for a game to launch",
-                "active_games": 1,
-                "installed_locations": 3,
-                "detection_disabled": false,
-                "manual_pause": false,
-                "recovery_pending": false
-            }),
-        )
-        .unwrap();
-
-        let out = status_output(&folder).unwrap();
-        let expected = [
-            "version=0.3.0",
-            "mode=active",
-            "automation_enabled=yes",
-            "message=Waiting for a game to launch",
-            "active_games=1",
-            "installed_locations=3",
-            "detection_disabled=no",
-            "manual_pause=no",
-            "last_error=-",
-            "recovery_pending=no",
-        ]
-        .join("\n");
-        assert_eq!(
-            out, expected,
-            "exact --status shape must be stable and parseable"
-        );
-
-        // Absent file (no running instance) is a stable single line, not an error.
-        let empty = std::env::temp_dir().join(format!("gamepause-cli-none-{}", std::process::id()));
-        let _ = fs::create_dir_all(&empty);
-        assert_eq!(status_output(&empty).unwrap(), "status=absent");
-
-        // A corrupt file is a real failure, not silently empty.
-        let corrupt =
-            std::env::temp_dir().join(format!("gamepause-cli-bad-{}", std::process::id()));
-        let _ = fs::create_dir_all(&corrupt);
-        fs::write(corrupt.join("status.json"), b"{not json").unwrap();
-        assert!(
-            status_output(&corrupt).is_err(),
-            "corrupt status.json must be an error"
-        );
-        let _ = fs::remove_dir_all(&corrupt);
-
-        let _ = fs::remove_dir_all(&folder);
-        let _ = fs::remove_dir_all(&empty);
-    }
-
-    #[test]
-    fn games_output_is_exact_and_parseable() {
-        let folder =
-            std::env::temp_dir().join(format!("gamepause-cli-games-{}", std::process::id()));
-        let _ = fs::create_dir_all(&folder);
-        write_json(
-            &folder.join("inventory.json"),
-            &json!([
-                {"launcher":"steam","identity":"1234","name":"Elden Ring","path":"C:\\Program Files (x86)\\Steam\\steamapps\\common\\Elden Ring"},
-                {"launcher":"gog","identity":"gog-xyz","name":"Baldur's Gate 3","path":"C:\\Games\\BG3"}
-            ]),
-        )
-        .unwrap();
-
-        let out = games_output(&folder).unwrap();
-        let expected = [
-            "Elden Ring\tsteam\tC:\\Program Files (x86)\\Steam\\steamapps\\common\\Elden Ring",
-            "Baldur's Gate 3\tgog\tC:\\Games\\BG3",
-        ]
-        .join("\n");
-        assert_eq!(
-            out,
-            expected.replace('\\', "\\\\"),
-            "exact --games shape: name<TAB>launcher<TAB>path per line, inventory order"
-        );
-
-        // Empty inventory (discovery ran, found nothing) is a stable single line.
-        let none =
-            std::env::temp_dir().join(format!("gamepause-cli-gamenes-{}", std::process::id()));
-        let _ = fs::create_dir_all(&none);
-        write_json(&none.join("inventory.json"), &json!([])).unwrap();
-        assert_eq!(games_output(&none).unwrap(), "none");
-        let _ = fs::remove_dir_all(&none);
-
-        let _ = fs::remove_dir_all(&folder);
-    }
     #[test]
     fn recovery_guard_uses_remembered_paths_even_after_exclusion_and_removal() {
         let mut config = Config::default();
@@ -3637,14 +3393,6 @@ mod tests {
         request_verify(&state, &tx);
         assert!(rx.try_recv().is_err());
     }
-    #[test]
-    fn line_protocol_escapes_record_delimiters() {
-        assert_eq!(
-            escape_field("name\tvalue\nnext\rline"),
-            "name\\tvalue\\nnext\\rline"
-        );
-    }
-
     #[test]
     fn ask_rule_withholds_the_trigger_until_answered_and_excludes_ignore() {
         let game = crate::gameplay::fixtures::game(42, 10);

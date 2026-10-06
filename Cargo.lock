@@ -1114,8 +1114,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "gamepause-lmstudio"
-version = "2.0.1"
+name = "gamepause"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "eframe",

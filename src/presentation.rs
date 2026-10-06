@@ -237,6 +237,10 @@ pub fn summarize(shared: &Shared) -> Summary {
 }
 fn provider_lines(shared: &Shared, fallback: &str) -> String {
     use crate::{coordinator::State, provider::Kind};
+    // Process evidence is only as good as the last scan.
+    let detected = shared.discovery_ready
+        && shared.detection_ok
+        && matches!(shared.activity, Activity::Watching | Activity::Observation);
     let lines = shared
         .config
         .providers
@@ -252,6 +256,12 @@ fn provider_lines(shared: &Shared, fallback: &str) -> String {
                 .find(|report| report.id == provider.id() && report.kind == provider.kind())
             else {
                 return match provider.kind() {
+                    Kind::LMStudio if detected && !shared.lm_running => {
+                        "LM Studio: not running; nothing to pause.".into()
+                    }
+                    Kind::Ollama if detected && !shared.ollama_running => {
+                        "Ollama: not running; nothing to pause.".into()
+                    }
                     Kind::LMStudio => format!("{}: {fallback}", provider.kind().name()),
                     Kind::Ollama => "Ollama: AI state unknown until capture.".into(),
                     Kind::Process => "Other AI apps: left running until a game starts.".into(),
