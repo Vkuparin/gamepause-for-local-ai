@@ -7,14 +7,13 @@ The complete starting configuration is [config.example.json](../config.example.j
 |---|---|---|
 | `mode` | `active` | Advanced diagnostic mode; ordinary users use the automatic-pausing switch |
 | `automation_enabled` | `true` | Automatically pause for games; existing recovery still completes when off |
-| `settings_version` | `3` | Configuration format/migration marker; do not edit |
+| `settings_version` | `4` | Configuration format/migration marker; do not edit |
 | `ignored_games` | `[]` | Installation/executable paths disabled through the dashboard |
 | `poll_seconds` | `2` | Process check interval, minimum 0.5 seconds |
 | `discovery_seconds` | `30` | Local inventory refresh, minimum 10 seconds |
 | `restore_delay_seconds` | `30` | Grace period after the last detected game exits; 0 disables delay |
 | `retry_seconds` | `30` | Independent provider retry backoff, minimum 5 seconds |
 | `providers` | LM Studio and Ollama enabled | Typed provider entries; see below |
-| `ollama_default_applied` | `true` | Internal marker: Ollama's on-by-default has been applied to this file. Leave it as written |
 | `advanced_settings_visible` | `false` | Show noncore settings/tools in dashboard and tray |
 | `notifications_enabled` | `true` | Windows completion/failure notifications |
 | `sound_enabled` | `true` | One sound source per event; independent of visuals |
@@ -33,7 +32,7 @@ Other switches: `--background` (quiet tray startup), `--headless`, `--duration N
 
 Each entry has a stable `id`, a `kind` (`lmstudio` or `ollama`) and an `enabled` boolean. IDs, kinds and normalized endpoints must be unique. Endpoints accept only `localhost` or `127.0.0.1` with a valid port. Remote control is refused.
 
-LM Studio stores `endpoint` (default `127.0.0.1:1234`), `lms_path` (empty for autodetection) and `stop_server_during_gaming` (default `true`) inside `connection`. Ollama stores `endpoint` (default `127.0.0.1:11434`) directly on its entry and is enabled by default. When nothing answers at that address, GamePause treats Ollama as not running and does nothing with it. Set `enabled` to `false` to turn it off; read the [restore subset and limits](USAGE.md#background-ai-applications). A settings file saved before Ollama became a regular provider has no `ollama_default_applied` field: GamePause enables its Ollama entry once at startup and writes the marker, so a later `false` is kept. GamePause does not start Ollama or download models.
+LM Studio stores `endpoint` (default `127.0.0.1:1234`), `lms_path` (empty for autodetection) and `stop_server_during_gaming` (default `true`) inside `connection`. Ollama stores `endpoint` (default `127.0.0.1:11434`) directly on its entry and is enabled by default. When nothing answers at that address, GamePause treats Ollama as not running and does nothing with it. Set `enabled` to `false` to turn it off; read the [restore subset and limits](USAGE.md#background-ai-applications). Version-3 settings, where Ollama was off by default, get the Ollama entry enabled once when they migrate to version 4; a `false` saved afterwards is kept. GamePause does not start Ollama or download models.
 
 Unfinished recovery blocks disabling/removing its provider or changing its ID/endpoint. Complete that provider's recovery first. A completed provider can be edited while another remains pending. Legacy flat LM fields are accepted only through guarded migration; new version-3 files must use provider entries. See [migration and downgrade](USAGE.md#settings-migration).
 

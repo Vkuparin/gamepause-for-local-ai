@@ -2,7 +2,8 @@
 
 ## Unreleased
 
-- Make Ollama a regular provider, enabled by default and tested against a live Ollama 0.35.1 installation; other versions are unverified. If Ollama is not running, GamePause reports **Not running** and does nothing. Settings saved by earlier builds are switched on once; turning Ollama off afterwards is kept. The opt-in dialog and experimental labels are gone.
+- Make Ollama a regular provider, enabled by default and tested against a live Ollama 0.35.1 installation; other versions are unverified. If Ollama is not running, GamePause reports **Not running** and does nothing. The opt-in dialog and experimental labels are gone.
+- Settings move to version 4. Version-3 files migrate on startup with a `config.v3.backup.json` copy; their Ollama entry is switched on once, and turning it off afterwards is kept. Older builds cannot read version-4 settings.
 - Accept local GGUF models that advertise `completion` together with other capabilities such as tools, thinking or vision. The earlier completion-only rule refused common models and unloaded nothing.
 - Freeze the keep-alive timer while paused: models come back with the time they had left when the game started, and indefinitely loaded models come back indefinite. Earlier journals keep the previous rule.
 - Unload every local Ollama model for gaming. Models outside the restore subset, such as embedding models, are unloaded without reload and named in the provider status.

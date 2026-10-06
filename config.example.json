@@ -32,8 +32,7 @@
   "extra_games": [],
   "excluded_executables": [],
   "excluded_paths": [],
-  "settings_version": 3,
+  "settings_version": 4,
   "automation_enabled": true,
-  "ignored_games": [],
-  "ollama_default_applied": true
+  "ignored_games": []
 }

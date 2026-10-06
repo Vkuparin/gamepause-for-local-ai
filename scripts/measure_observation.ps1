@@ -24,7 +24,7 @@ foreach ($taskRepeat in 1..$Repeats) {
             $taskCommon.stop_server_during_gaming = $true
         } else {
             $taskExe = (Resolve-Path -LiteralPath $Candidate).Path
-            $taskCommon.settings_version = 3
+            $taskCommon.settings_version = 4
             $taskCommon.providers = @(
                 @{kind='lmstudio';id='lmstudio-main';enabled=($taskVariant -ne 'candidate-none');connection=@{endpoint='127.0.0.1:61991';lms_path=(Join-Path $taskFolder 'absent-fixture-lms.exe');stop_server_during_gaming=$true}},
                 @{kind='ollama';id='ollama-main';enabled=($taskVariant -eq 'candidate-two');endpoint='127.0.0.1:61992'}
