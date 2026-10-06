@@ -12,6 +12,8 @@ AppSupportURL=https://github.com/Vkuparin/gamepause-for-local-ai/issues
 AppUpdatesURL=https://github.com/Vkuparin/gamepause-for-local-ai/releases
 DefaultDirName={localappdata}\Programs\GamePause
 DefaultGroupName=GamePause for Local AI
+; The group was renamed in 2.1.0; do not reuse the old name on upgrade.
+UsePreviousGroup=no
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
@@ -34,6 +36,11 @@ Name: "desktopicon"; Description: "Create a desktop shortcut that opens the dash
 
 [Files]
 Source: "..\dist\GamePause\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+[InstallDelete]
+; Shortcuts created under the pre-2.1.0 name.
+Type: filesandordirs; Name: "{userprograms}\GamePause for LM Studio"
+Type: files; Name: "{userdesktop}\GamePause.lnk"
 
 [Icons]
 Name: "{group}\GamePause for Local AI"; Filename: "{app}\GamePause.exe"; Comment: "Open the GamePause dashboard"
