@@ -38,15 +38,14 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const LOAD_TIMEOUT: Duration = Duration::from_secs(300);
 /// Only a generate request that keeps the model resident is a load; reads and
 /// unloads (`keep_alive: 0`) are acknowledged at once.
-fn request_timeout(path: &str, body: Option<&serde_json::Value>) -> Duration {
-    match body {
-        Some(body) if path == "/api/generate" && body["keep_alive"] != 0 => LOAD_TIMEOUT,
-        _ => REQUEST_TIMEOUT,
-    }
+fn is_load(path: &str, body: Option<&serde_json::Value>) -> bool {
+    body.is_some_and(|body| path == "/api/generate" && body["keep_alive"] != 0)
 }
 pub struct Http {
     endpoint: String,
     agent: ureq::Agent,
+    /// Limits for an ordinary request and for a model load.
+    timeouts: (Duration, Duration),
 }
 impl Http {
     pub fn new(endpoint: &str) -> Result<Self> {
@@ -57,6 +56,7 @@ impl Http {
                 .redirects(0)
                 .timeout(REQUEST_TIMEOUT)
                 .build(),
+            timeouts: (REQUEST_TIMEOUT, LOAD_TIMEOUT),
         })
     }
 }
@@ -70,7 +70,11 @@ impl Transport for Http {
             bail!("Unsupported Ollama request route");
         }
         let url = format!("http://{}{path}", self.endpoint);
-        let timeout = request_timeout(path, body.as_ref());
+        let timeout = if is_load(path, body.as_ref()) {
+            self.timeouts.1
+        } else {
+            self.timeouts.0
+        };
         let response = match body {
             Some(body) => self.agent.post(&url).timeout(timeout).send_json(body),
             None => self.agent.get(&url).timeout(timeout).call(),
@@ -1395,20 +1399,52 @@ pub(crate) mod tests {
         let finite =
             json!({"model":"m:latest", "prompt":"", "stream":false, "keep_alive":"240000000000ns"});
         let indefinite = json!({"model":"m:latest", "prompt":"", "stream":false, "keep_alive":-1});
-        assert_eq!(
-            request_timeout("/api/generate", Some(&finite)),
-            LOAD_TIMEOUT
+        assert!(is_load("/api/generate", Some(&finite)));
+        assert!(is_load("/api/generate", Some(&indefinite)));
+        assert!(!is_load("/api/generate", Some(&unload)));
+        assert!(!is_load("/api/show", Some(&finite)));
+        assert!(!is_load("/api/ps", None));
+        assert!(LOAD_TIMEOUT >= Duration::from_secs(300) && REQUEST_TIMEOUT < LOAD_TIMEOUT);
+    }
+    #[test]
+    fn a_slow_model_load_is_waited_for_while_other_requests_stay_short() {
+        // The service answers after 700 ms; ordinary requests allow 250 ms
+        // here and a load allows three seconds.
+        let slow = |expected: &'static str| {
+            http_server(1, move |path, _| {
+                assert_eq!(path, expected);
+                std::thread::sleep(Duration::from_millis(700));
+                (200, br#"{"models":[]}"#.to_vec())
+            })
+        };
+        let client = |endpoint: &str| {
+            let mut transport = Http::new(endpoint).unwrap();
+            transport.timeouts = (Duration::from_millis(250), Duration::from_secs(3));
+            transport
+        };
+        let (endpoint, thread) = slow("/api/ps");
+        assert!(client(&endpoint).request("/api/ps", None).is_err());
+        // The fixture may fail to answer the abandoned request.
+        let _ = thread.join();
+        let unload = json!({"model":"m:latest", "prompt":"", "stream":false, "keep_alive":0});
+        let (endpoint, thread) = slow("/api/generate");
+        assert!(
+            client(&endpoint)
+                .request("/api/generate", Some(unload))
+                .is_err(),
+            "an unload is acknowledged at once and keeps the short limit"
         );
-        assert_eq!(
-            request_timeout("/api/generate", Some(&indefinite)),
-            LOAD_TIMEOUT
+        let _ = thread.join();
+        let load = json!({"model":"m:latest", "prompt":"", "stream":false, "keep_alive":-1});
+        let (endpoint, thread) = slow("/api/generate");
+        let started = Instant::now();
+        assert!(
+            client(&endpoint)
+                .request("/api/generate", Some(load))
+                .is_ok()
         );
-        assert_eq!(
-            request_timeout("/api/generate", Some(&unload)),
-            REQUEST_TIMEOUT
-        );
-        assert_eq!(request_timeout("/api/show", Some(&finite)), REQUEST_TIMEOUT);
-        assert_eq!(request_timeout("/api/ps", None), REQUEST_TIMEOUT);
+        assert!(started.elapsed() >= Duration::from_millis(650));
+        thread.join().unwrap();
     }
     #[test]
     fn bounded_http_refuses_redirects_oversize_remote_routes_and_unknown_operations() {

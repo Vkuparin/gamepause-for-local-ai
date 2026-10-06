@@ -993,7 +993,13 @@ impl Dashboard {
             ui.add_space(2.0);
             let mut entries = rows(s, page, &self.query);
             sort_rows(&mut entries, self.sort, page == Page::Running);
-            let height = (ui.available_height() - 178.0).clamp(140.0, 520.0);
+            // The details card is one line until a row is selected.
+            let details = if self.selected.is_some() {
+                178.0
+            } else {
+                108.0
+            };
+            let height = (ui.available_height() - details).clamp(140.0, 520.0);
             let wide = ui.available_width() > 740.0;
             let mut selected = self.selected.clone();
             let mut sort = self.sort;
