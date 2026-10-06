@@ -836,7 +836,8 @@ impl Dashboard {
                             } else if provider_status(s).is_empty() {
                                 ui.colored_label(p.muted, "No AI app found to pause");
                             }
-                            if s.freed_bytes > 0 && s.pending {
+                            // Shown while AI is held paused, not once it is coming back.
+                            if s.freed_bytes > 0 && s.pending && h.look == Look::Paused {
                                 // Lines up with the hint below, under the provider names.
                                 ui.horizontal(|ui| {
                                     ui.add_space(27.0);

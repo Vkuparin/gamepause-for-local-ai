@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.2.0 — unreleased
+## 2.2.0 — 2026-10-07
 
 - A closed LM Studio is no longer started when a game launches. GamePause used to ask LM Studio's command-line tool what was loaded, and that tool starts LM Studio in the background when it is not running. LM Studio is now left alone while it is closed and owes no restore.
 - Opening GamePause from the tray, the shortcut or the resume prompt now brings back a minimized window. A fullscreen game minimizes the dashboard, and a minimized dashboard used to ignore the request, so nothing appeared.
@@ -12,6 +12,9 @@
 - Scoop bucket in this repository: `scoop bucket add gamepause https://github.com/Vkuparin/gamepause-for-local-ai`, then `scoop install gamepause`.
 - README: how GamePause fits always-on assistants such as Hermes Agent and OpenClaw.
 - Diagnostics no longer probe AI apps with default settings when the data folder path is not a folder.
+- The memory-freed line is shown only while AI is held paused, not during the restore.
+
+Checked on one Windows 11 PC with a real game: LM Studio (one 27B model) and Ollama 0.40.0 (one small model) paused and restored, and the dashboard opening over the fullscreen game. Not yet tested: sleep and wake, uninstalling, a real Ollama reload slower than ten seconds, real llama.cpp or KoboldCpp, the Scoop manifest, and Windows 10.
 
 ## 2.1.0 — 2026-10-07
 
