@@ -8,7 +8,7 @@
 
 GamePause is a small native Windows tray app. When a game starts, it saves what LM Studio and Ollama have loaded, unloads it, and puts everything back after you stop playing. There is no model list to maintain and nothing to configure first.
 
-![GamePause for Local AI dashboard, dark theme: LM Studio and Ollama paused while a game runs](docs/images/dashboard-dark.png)
+![A real session: AI running, paused when a game starts, restored after it closes](docs/images/pause-cycle.gif)
 
 **[Download the latest release](https://github.com/Vkuparin/gamepause-for-local-ai/releases/latest)** (installer or portable ZIP) · [Changelog](CHANGELOG.md) · [Installation guide](docs/INSTALLATION.md)
 
@@ -35,7 +35,9 @@ While a game runs, the assistant's requests to the local model fail or wait, as 
 
 The status card always shows one of four color-coded states: **AI running** (blue), **AI paused** (orange), **Loading** (yellow) and **AI needs attention** (red). Below it are one line for each AI app you have installed or running, the game that triggered the pause, and roughly how much memory was freed.
 
-![GamePause for Local AI dashboard, light theme: AI running and watching for games](docs/images/dashboard-light.png)
+| Dark | Light |
+|---|---|
+| ![GamePause for Local AI dashboard, dark theme: LM Studio and Ollama paused while a game runs](docs/images/dashboard-dark.png) | ![GamePause for Local AI dashboard, light theme: AI running and watching for games](docs/images/dashboard-light.png) |
 
 Light, dark and Windows high-contrast themes are supported, and the dashboard follows your Windows setting by default. **Advanced** holds the connection settings, detection options, the shortcut, read-only diagnostics and a round-trip test that pauses and restores your live models on request.
 
