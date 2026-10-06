@@ -62,7 +62,7 @@ The installer and executables are unsigned, so Windows may show a publisher warn
 | AI app | Version | Notes |
 |---|---|---|
 | LM Studio | 0.4.25 | Full restore uses LM Studio's internal protocol, so a newer version can need a GamePause update. |
-| Ollama | 0.35.1 | One local GGUF model. Embedding, vision and multi-model sessions have automated coverage only. |
+| Ollama | 0.35.1, 0.40.0 | One local GGUF model per run. Embedding, vision and multi-model sessions have automated coverage only. |
 | llama.cpp, KoboldCpp | none yet | Stop and restart was tested with stand-in programs. |
 
 Using another version? **Advanced > Diagnostics** shows what GamePause can see, and a [report](https://github.com/Vkuparin/gamepause-for-local-ai/issues) with that output helps extend this table.

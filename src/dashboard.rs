@@ -1635,7 +1635,7 @@ impl Dashboard {
                     SettingsPage::Ollama=> {
                         ui.heading("Ollama");
                         ui.label("Works when Ollama is running; nothing happens when it is not. Local models are unloaded for gaming. GGUF completion models come back with their context and the keep-alive time they had left; other local models, such as embedding models, stay unloaded. Full load options, parallelism, conversations and KV cache are not preserved.");
-                        ui.label("Ollama itself keeps running. GamePause does not download models or fight later client reloads. Tested with Ollama 0.35.1.");
+                        ui.label("Ollama itself keeps running. GamePause does not download models or fight later client reloads. Tested with Ollama 0.35.1 and 0.40.0.");
                         let editable=!s.provider_pending(crate::provider::Kind::Ollama);
                         ui.add_enabled_ui(editable,|ui| {
                             if let Some(crate::config::Provider::Ollama{enabled,endpoint,..})=self.edit_config.providers.iter_mut().find(|p|p.kind()==crate::provider::Kind::Ollama) {

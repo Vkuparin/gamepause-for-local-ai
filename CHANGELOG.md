@@ -6,6 +6,7 @@
 - The status card lists only the AI apps this PC has: LM Studio when it is installed, Ollama when it is installed or running. An app you do not use no longer gets a line.
 - A listed app that is closed reads **Not running**. **Ready** used to appear for LM Studio and Ollama even when neither was running; it now means the program is running and will be paused when a game starts. This is read from the running-process list; the apps are still not contacted while idle.
 - `GamePauseCLI.exe` is no longer part of the download, and its `--status` and `--games` scripting commands are removed. Diagnostics and the round-trip test are in **Advanced**. `GamePause.exe --restore` retries a pending restore when GamePause is not running and reports the result in a message box.
+- Ollama 0.40.0 is tested alongside 0.35.1: a live pause and restore of one small model passed on both with this build. The longer reload limit from 2.0.1 is now also covered by an automated slow-server test; a real reload slower than ten seconds has still not been observed live.
 - README: a table of the LM Studio and Ollama versions GamePause was tested with.
 - Old planning and review documents moved to `docs/history` and are no longer packaged.
 - Releases are built and published by the tag workflow, with this changelog section as the release notes.
