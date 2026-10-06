@@ -61,6 +61,9 @@ pub struct Engine<B: Backend> {
     /// LM Studio is enabled but not installed and owes no recovery, so it
     /// takes no part in control until its CLI appears.
     pub lm_missing: bool,
+    /// Approximate model memory the current pause released; 0 when unknown,
+    /// including after a restart mid-pause.
+    pub freed_bytes: u64,
     /// Round-trip verification drives one provider at a time.
     verify_scope: Option<crate::provider::Kind>,
     provider_progress: Option<ProviderObserver>,
@@ -120,6 +123,7 @@ impl<B: Backend> Engine<B> {
             gameplay: GameplayControl::default(),
             provider_statuses: vec![],
             lm_missing: false,
+            freed_bytes: 0,
             verify_scope: None,
             provider_progress: None,
             coordinator_memory: None,
@@ -297,13 +301,38 @@ impl<B: Backend> Engine<B> {
             })
         })
     }
-    fn paused_message(&self) -> &'static str {
+    fn paused_message(&self) -> String {
         match (self.manual_pause, self.nothing_held()) {
-            (true, true) => "No AI models were loaded; Resume AI releases the hold",
-            (true, false) => "AI paused by you; choose Resume AI to release the hold",
-            (false, true) => "Game running; no AI models were loaded, so nothing was paused",
-            (false, false) => "AI paused for gaming",
+            (true, true) => "No AI models were loaded; Resume AI releases the hold".into(),
+            (true, false) => "AI paused by you; choose Resume AI to release the hold".into(),
+            (false, true) => "Game running; no AI models were loaded, so nothing was paused".into(),
+            (false, false) if self.freed_bytes > 0 => format!(
+                "AI paused for gaming; about {} freed",
+                crate::presentation::size(self.freed_bytes)
+            ),
+            (false, false) => "AI paused for gaming".into(),
         }
+    }
+    /// Sizes the adapters saw at this session's capture, counted only for
+    /// providers whose journal entry actually holds models.
+    fn captured_bytes(&mut self) -> u64 {
+        let Some(journal) = &self.recovery else {
+            return 0;
+        };
+        let (mut lm, mut ollama) = (false, false);
+        for entry in &journal.providers {
+            match &entry.payload {
+                crate::recovery::Payload::LMStudio(snapshot) => lm |= !snapshot.models.is_empty(),
+                crate::recovery::Payload::Ollama(snapshot) => ollama |= snapshot.units() > 0,
+            }
+        }
+        let lm = if lm { self.backend.captured_bytes() } else { 0 };
+        let ollama = if ollama {
+            self.ollama_runtime.captured_bytes()
+        } else {
+            0
+        };
+        lm.saturating_add(ollama)
     }
     fn providers_paused(&self) -> bool {
         let config = self.control_config();
@@ -694,10 +723,14 @@ impl<B: Backend> Engine<B> {
             } else {
                 Activity::Paused
             });
-            self.message = self.paused_message().into();
+            self.message = self.paused_message();
             return Ok(());
         }
+        let fresh = !self.pending();
         self.pause_units(cancelled, only_lm)?;
+        if fresh {
+            self.freed_bytes = self.captured_bytes();
+        }
         // A pause that found nothing loaded is not a success to announce.
         if !self.nothing_held() {
             self.pause_completions += 1;
@@ -707,7 +740,7 @@ impl<B: Backend> Engine<B> {
         } else {
             Activity::Paused
         });
-        self.message = self.paused_message().into();
+        self.message = self.paused_message();
         Ok(())
     }
     fn pause_units(&mut self, cancelled: &mut dyn FnMut() -> bool, only_lm: bool) -> Result<()> {
@@ -901,6 +934,7 @@ impl<B: Backend> Engine<B> {
             return Ok(());
         }
         let nothing_held = self.nothing_held();
+        self.freed_bytes = 0;
         self.state = None;
         self.recovery = None;
         self.binding = None;

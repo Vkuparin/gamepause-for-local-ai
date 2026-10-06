@@ -179,6 +179,22 @@ pub fn parse_resident_inventory(reader: impl Read) -> Result<ResidentInventory> 
     Ok(ResidentInventory(inventory))
 }
 
+/// Memory the resident models occupy, as the service reports it. Presentation
+/// only: an unreadable body is simply an unknown amount.
+pub fn resident_bytes(body: &[u8]) -> u64 {
+    #[derive(Deserialize)]
+    struct Sized {
+        size_vram: Option<u64>,
+        size: Option<u64>,
+    }
+    serde_json::from_slice::<Envelope<Sized>>(body).map_or(0, |wire| {
+        wire.models
+            .iter()
+            .filter_map(|model| model.size_vram.filter(|n| *n > 0).or(model.size))
+            .fold(0, u64::saturating_add)
+    })
+}
+
 pub fn parse_catalog(reader: impl Read) -> Result<Catalog> {
     let wire: Envelope<WireCatalogEntry> = decode(reader)?;
     if wire.error.is_some() {
@@ -1035,5 +1051,17 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn resident_bytes_prefer_reported_memory_and_tolerate_missing_or_bad_bodies() {
+        let body = json!({"models":[
+            {"name":"a:latest", "size":10, "size_vram":7},
+            {"name":"b:latest", "size":5, "size_vram":0},
+            {"name":"c:latest"}
+        ]});
+        assert_eq!(resident_bytes(body.to_string().as_bytes()), 12);
+        assert_eq!(resident_bytes(b"not json"), 0);
+        assert_eq!(resident_bytes(br#"{"models":[]}"#), 0);
     }
 }

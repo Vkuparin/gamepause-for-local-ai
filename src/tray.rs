@@ -670,6 +670,7 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> L
                                 restore: snapshot.restore_completions,
                                 activity: snapshot.activity,
                                 pending: snapshot.pending,
+                                freed: snapshot.freed_bytes,
                                 failure: failure.then_some(snapshot.message.as_str()),
                             },
                             snapshot.config.notifications_enabled,
@@ -1004,6 +1005,7 @@ mod tests {
             doctor_report: None,
             doctor_pending: false,
             lm_missing: false,
+            freed_bytes: 0,
             power: Default::default(),
         }));
         {
@@ -1115,6 +1117,7 @@ mod tests {
             doctor_report: None,
             doctor_pending: false,
             lm_missing: false,
+            freed_bytes: 0,
             power: Default::default(),
         }));
         let (tx, _rx) = mpsc::channel();

@@ -759,6 +759,15 @@ impl Dashboard {
                             if !s.config.any_provider_enabled() {
                                 ui.colored_label(p.muted, "No AI provider is enabled");
                             }
+                            if s.freed_bytes > 0 && s.pending {
+                                ui.colored_label(
+                                    p.muted,
+                                    format!(
+                                        "About {} freed for your game",
+                                        crate::presentation::size(s.freed_bytes)
+                                    ),
+                                );
+                            }
                             ui.horizontal(|ui| {
                                 ui.add_space(27.0);
                                 ui.add(

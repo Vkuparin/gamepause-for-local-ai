@@ -69,6 +69,11 @@ pub trait Backend {
     fn installed(&mut self) -> bool {
         true
     }
+    /// Model sizes reported at the latest capture, for "memory freed" text.
+    /// LM Studio reports each model's file size, an approximation of its use.
+    fn captured_bytes(&mut self) -> u64 {
+        0
+    }
 }
 
 /// Bridge existing LM transports and mocks to the neutral operation interface.
@@ -108,6 +113,9 @@ impl<B: Backend + ?Sized> Backend for &mut B {
     }
     fn installed(&mut self) -> bool {
         (**self).installed()
+    }
+    fn captured_bytes(&mut self) -> u64 {
+        (**self).captured_bytes()
     }
 }
 /// Bridge existing LM transports and mocks to the neutral operation interface.
@@ -308,6 +316,7 @@ pub struct LMStudio {
     claims: crate::ownership::SharedClaims,
     log_folder: Option<PathBuf>,
     cli_version: std::sync::OnceLock<String>,
+    captured_bytes: u64,
 }
 impl LMStudio {
     pub fn new(config: Config) -> Result<Self> {
@@ -345,6 +354,7 @@ impl LMStudio {
             lms,
             log_folder: None,
             cli_version: std::sync::OnceLock::new(),
+            captured_bytes: 0,
         })
     }
     pub fn set_log_folder(&mut self, folder: PathBuf) {
@@ -869,6 +879,10 @@ impl Backend for LMStudio {
     fn snapshot(&mut self) -> Result<Snapshot> {
         self.claim_control(None)?;
         let loaded = self.loaded()?;
+        self.captured_bytes = loaded
+            .iter()
+            .filter_map(|model| model["sizeBytes"].as_u64())
+            .fold(0, u64::saturating_add);
         let mut server = self.cli(&["server", "status", "--json"])?;
         if loaded.iter().any(|m| {
             m["status"].as_str().is_some_and(|s| s != "idle")
@@ -887,6 +901,9 @@ impl Backend for LMStudio {
         capture_with_server(self, temporary, port, |backend| {
             backend.capture_snapshot(loaded, server)
         })
+    }
+    fn captured_bytes(&mut self) -> u64 {
+        self.captured_bytes
     }
     fn stop_server(&mut self) -> Result<()> {
         self.claim_control(None)?;
@@ -1098,6 +1115,7 @@ mod tests {
             lms: PathBuf::new(),
             log_folder: None,
             cli_version: std::sync::OnceLock::new(),
+            captured_bytes: 0,
         };
         let model = Model {
             identifier: "fixture".into(),
@@ -1157,6 +1175,7 @@ mod tests {
             lms: PathBuf::new(),
             log_folder: None,
             cli_version: std::sync::OnceLock::new(),
+            captured_bytes: 0,
         };
         assert!(backend.claim_control(None).is_err());
         claims
@@ -1180,6 +1199,7 @@ mod tests {
             lms: PathBuf::new(),
             log_folder: None,
             cli_version: std::sync::OnceLock::new(),
+            captured_bytes: 0,
         };
         backend.select_control_port(4321).unwrap();
         assert_eq!(backend.config.lm_endpoint(), "127.0.0.1:4321");
@@ -1476,6 +1496,7 @@ mod tests {
             lms: PathBuf::new(),
             log_folder: None,
             cli_version: std::sync::OnceLock::new(),
+            captured_bytes: 0,
         };
         let folder =
             std::env::temp_dir().join(format!("gamepause-operation-log-{}", std::process::id()));
@@ -1569,6 +1590,7 @@ mod tests {
                 lms: PathBuf::new(),
                 log_folder: Some(folder.clone()),
                 cli_version: std::sync::OnceLock::new(),
+                captured_bytes: 0,
             };
             backend.cli_version.set("fixture".into()).unwrap();
             assert_eq!(backend.raw_config("llm", "instance").is_ok(), valid);

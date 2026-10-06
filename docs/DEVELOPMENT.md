@@ -97,6 +97,8 @@ A session with every restoration already verified can clear with every provider 
 
 LM Studio has the matching rule at engine level. `lmstudio::Backend::installed` reports whether the CLI can be found; when it cannot and no LM recovery is owed, `Engine::control_config` leaves LM Studio out of control exactly as if it were disabled, and `lm_missing` reaches shared state for the **Not installed** row. A closed LM Studio no longer sets `Activity::Unavailable` while idle. `Engine::nothing_held` recognises a session whose journal holds no model and no stopped server: it changes the status wording and skips the pause/restore completion counters that drive success notifications.
 
+The memory-freed figure is presentation only and never persisted. `LMStudio::snapshot` sums `sizeBytes` from its capture inventory and the Ollama adapter sums `size_vram` (falling back to `size`) from its capture read; `Engine::captured_bytes` adds them for providers whose journal entry holds models, once per fresh pause, and clears the figure when recovery clears.
+
 Round-trip verification runs the LM phase when LM Studio is enabled and installed, then `verify_ollama` when Ollama is enabled. `verify_scope` restricts the pause and restore drivers to the provider under test, so each phase has its own journal session.
 
 A connection refused on the first capture read is typed as `Unreachable` and produces an `absent` snapshot with no models: Ollama is not installed or not running. Such a session sends Ollama no further request, completes pause and restore from the journal alone, and reports `NOT_RUNNING` through the provider note, which the dashboard shows as **Not running**. Timeouts, HTTP errors and a service lost after models were captured remain failures with retained recovery.

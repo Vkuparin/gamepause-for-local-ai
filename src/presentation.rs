@@ -40,6 +40,15 @@ impl Status {
     }
 }
 /// "AI RUNNING" means GamePause is not holding AI paused. Idle residency is not polled.
+/// "18.4 GB" / "84 MB": one decimal for gigabytes, whole megabytes below.
+pub fn size(bytes: u64) -> String {
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    if bytes as f64 >= GB {
+        format!("{:.1} GB", bytes as f64 / GB)
+    } else {
+        format!("{} MB", (bytes as f64 / (1024.0 * 1024.0)).round().max(1.0))
+    }
+}
 pub fn status(s: &Shared) -> Status {
     use Activity::*;
     let activity = if s.verifying { Verifying } else { s.activity };
@@ -517,5 +526,13 @@ mod tests {
         shared.activity = Activity::Paused;
         shared.detection_ok = false;
         assert_eq!(status(&shared).tray_lines()[1], status(&shared).hint);
+    }
+
+    #[test]
+    fn sizes_read_as_gigabytes_with_one_decimal_or_whole_megabytes() {
+        assert_eq!(size(18_448_625_171), "17.2 GB");
+        assert_eq!(size(84_106_624), "80 MB");
+        assert_eq!(size(1), "1 MB");
+        assert_eq!(size(1024 * 1024 * 1024), "1.0 GB");
     }
 }

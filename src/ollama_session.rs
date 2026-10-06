@@ -294,6 +294,8 @@ pub struct Adapter<T, C = SystemClock> {
     capture_policy: Policy,
     /// Process-local acknowledgement times of frozen loads, by model name.
     loaded_at: BTreeMap<String, Duration>,
+    /// Memory the latest capture found resident; presentation only.
+    pub captured_bytes: u64,
 }
 impl<T: Transport, C: Clock> Adapter<T, C> {
     pub fn new(transport: T, clock: C, binding: Binding) -> Result<Self> {
@@ -319,6 +321,7 @@ impl<T: Transport, C: Clock> Adapter<T, C> {
             retry_restore: Cell::new(false),
             capture_policy: Policy::FrozenRemaining,
             loaded_at: BTreeMap::new(),
+            captured_bytes: 0,
         })
     }
     fn guard(&self, binding: &Binding) -> Result<()> {
@@ -398,7 +401,12 @@ impl<T: Transport, C: Clock> Runtime for Adapter<T, C> {
         self.started_monotonic = self.clock.monotonic();
         let policy = self.capture_policy;
         self.loaded_at.clear();
-        let inventory = match self.inventory() {
+        self.captured_bytes = 0;
+        let inventory = match self.transport.request("/api/ps", None).and_then(|body| {
+            let inventory = contract::parse_resident_inventory(body.as_slice())?;
+            self.captured_bytes = contract::resident_bytes(&body);
+            Ok(inventory)
+        }) {
             Ok(inventory) => inventory,
             // No service means nothing to pause, not a failed pause.
             Err(error) if error.downcast_ref::<Unreachable>().is_some() => {

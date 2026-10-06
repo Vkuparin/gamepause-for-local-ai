@@ -350,6 +350,11 @@ impl<'a, B: Backend> Providers<'a, B> {
     }
 }
 impl OllamaRuntime {
+    pub fn captured_bytes(&self) -> u64 {
+        self.adapter
+            .as_ref()
+            .map_or(0, |adapter| adapter.captured_bytes)
+    }
     fn configure(&mut self, config: &Config) {
         let configured = config
             .providers

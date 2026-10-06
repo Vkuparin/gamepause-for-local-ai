@@ -86,6 +86,8 @@ pub struct Shared {
     pub doctor_pending: bool,
     /// LM Studio is enabled but its CLI was not found; shown as not installed.
     pub lm_missing: bool,
+    /// Approximate model memory released by the current pause; 0 if unknown.
+    pub freed_bytes: u64,
     pub power: Arc<crate::power::Signal>,
 }
 
@@ -584,6 +586,7 @@ pub fn main(console: bool) -> Result<()> {
         doctor_report: None,
         doctor_pending: false,
         lm_missing: false,
+        freed_bytes: 0,
         power: Default::default(),
     }));
     let (tx, rx) = mpsc::channel();
@@ -681,6 +684,11 @@ impl Backend for OptionalBackend {
     }
     fn installed(&mut self) -> bool {
         self.get().is_ok()
+    }
+    fn captured_bytes(&mut self) -> u64 {
+        self.backend
+            .as_mut()
+            .map_or(0, |backend| backend.captured_bytes())
     }
 }
 #[cfg(test)]
@@ -1897,6 +1905,7 @@ fn run(
                 shared.restore_completions = engine.restore_completions;
                 shared.provider_statuses = engine.provider_statuses.clone();
                 shared.lm_missing = engine.lm_missing;
+                shared.freed_bytes = engine.freed_bytes;
                 shared.pending = engine.pending();
                 shared.active_mode = engine.config.mode == "active";
                 shared.config = engine.config.clone();

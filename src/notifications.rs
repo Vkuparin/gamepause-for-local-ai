@@ -38,6 +38,8 @@ pub struct Input<'a> {
     pub activity: Activity,
     pub pending: bool,
     pub failure: Option<&'a str>,
+    /// Approximate bytes released by the pause being announced; 0 if unknown.
+    pub freed: u64,
 }
 #[derive(Clone, Default)]
 pub struct Queue {
@@ -92,7 +94,14 @@ impl Queue {
                     Some((
                         Event {
                             kind: Kind::Paused,
-                            text: "AI paused: captured-model unload verified.".into(),
+                            text: if input.freed > 0 {
+                                format!(
+                                    "AI paused: about {} freed.",
+                                    crate::presentation::size(input.freed)
+                                )
+                            } else {
+                                "AI paused: captured-model unload verified.".into()
+                            },
                         },
                         now.saturating_add(SUCCESS_DELAY),
                     ))
@@ -163,6 +172,7 @@ mod tests {
             activity: Activity::Paused,
             pending: true,
             failure: None,
+            freed: 0,
         }
     }
     fn restored() -> Input<'static> {
@@ -172,6 +182,7 @@ mod tests {
             activity: Activity::Watching,
             pending: false,
             failure: None,
+            freed: 0,
         }
     }
     #[test]
@@ -257,6 +268,7 @@ mod tests {
                 } else {
                     "LM Studio recovery retry countdown changed"
                 }),
+                freed: 0,
             };
             let delivery = queue.poll(Duration::from_secs(time), input, true, false);
             if time == 1 {
@@ -310,5 +322,17 @@ mod tests {
             queue.poll(Duration::from_secs(6), restored(), true, false),
             Some(Delivery::Toast { sound: false, .. })
         ));
+    }
+
+    #[test]
+    fn pause_notification_names_the_freed_memory_when_it_is_known() {
+        let input = || Input {
+            freed: 18_448_625_171,
+            ..paused()
+        };
+        let mut queue = Queue::default();
+        assert!(queue.poll(Duration::ZERO, input(), true, false).is_none());
+        let delivered = queue.poll(Duration::from_secs(3), input(), true, false);
+        assert!(format!("{delivered:?}").contains("AI paused: about 17.2 GB freed."));
     }
 }
