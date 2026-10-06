@@ -797,13 +797,17 @@ impl Dashboard {
                                 ui.colored_label(p.muted, "No AI app found to pause");
                             }
                             if s.freed_bytes > 0 && s.pending {
-                                ui.colored_label(
-                                    p.muted,
-                                    format!(
-                                        "About {} freed for your game",
-                                        crate::presentation::size(s.freed_bytes)
-                                    ),
-                                );
+                                // Lines up with the hint below, under the provider names.
+                                ui.horizontal(|ui| {
+                                    ui.add_space(27.0);
+                                    ui.colored_label(
+                                        p.muted,
+                                        format!(
+                                            "About {} freed for your game",
+                                            crate::presentation::size(s.freed_bytes)
+                                        ),
+                                    );
+                                });
                             }
                             ui.horizontal(|ui| {
                                 ui.add_space(27.0);
