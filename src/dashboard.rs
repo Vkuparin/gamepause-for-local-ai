@@ -35,6 +35,9 @@ struct Bridge {
     shared: SharedState,
     fingerprint: String,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// The open dashboard window, or 0. Used only by the tray UI thread to
+    /// bring a minimized window back; never handed to a worker.
+    window: isize,
 }
 enum UiRequest {
     Show,
@@ -56,7 +59,33 @@ pub fn is_dialog_message(_: &windows_sys::Win32::UI::WindowsAndMessaging::MSG) -
 pub fn theme_changed() {
     dispatch(UiRequest::Theme);
 }
+/// A minimized window draws no frames, and requests are read while drawing:
+/// without this, Show, Resume and Stop would wait until someone restored it.
+/// A fullscreen game minimizes the dashboard, so that is the usual case.
+fn wake_window(command: i32) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IsIconic, ShowWindowAsync};
+    let window = BRIDGE
+        .lock()
+        .ok()
+        .and_then(|bridge| bridge.as_ref().map(|b| b.window))
+        .unwrap_or(0) as HWND;
+    // No lock is held here, and the call does not wait for the UI thread.
+    if !window.is_null() && unsafe { IsIconic(window) } != 0 {
+        unsafe {
+            ShowWindowAsync(window, command);
+        }
+    }
+}
 fn dispatch(request: UiRequest) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SW_RESTORE, SW_SHOWNOACTIVATE};
+    let wake = match request {
+        UiRequest::Show | UiRequest::Resume | UiRequest::Verify => Some(SW_RESTORE),
+        UiRequest::Stop => Some(SW_SHOWNOACTIVATE),
+        UiRequest::Theme => None,
+    };
+    if let Some(command) = wake {
+        wake_window(command);
+    }
     let ctx = BRIDGE
         .lock()
         .ok()
@@ -73,6 +102,7 @@ fn dispatch(request: UiRequest) {
 }
 pub fn close() {
     UI_STOP.store(true, Ordering::Relaxed);
+    wake_window(windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNOACTIVATE);
     let bridge = BRIDGE.lock().ok().and_then(|mut b| b.take());
     if let Some(mut bridge) = bridge {
         let _ = bridge.tx.send(UiRequest::Stop);
@@ -80,7 +110,15 @@ pub fn close() {
             ctx.request_repaint();
         }
         if let Some(thread) = bridge.thread.take() {
-            let _ = thread.join();
+            // Quit must not hang on a renderer that draws no frame. The
+            // process is exiting; a thread that has not stopped is left to it.
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !thread.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            if thread.is_finished() {
+                let _ = thread.join();
+            }
         }
     }
     RUNNING_REQUESTED.store(false, Ordering::Relaxed);
@@ -154,6 +192,7 @@ pub fn show(shared: SharedState, tx: Sender<Action>, folder: PathBuf) {
         shared: shared.clone(),
         fingerprint: String::new(),
         thread: None,
+        window: 0,
     });
     let thread = std::thread::Builder::new()
         .name("gamepause-ui".into())
@@ -201,6 +240,7 @@ pub fn show(shared: SharedState, tx: Sender<Action>, folder: PathBuf) {
                     && let Some(b) = b.as_mut()
                 {
                     b.ctx = None;
+                    b.window = 0;
                 }
                 UI_VISIBLE.store(false, Ordering::Relaxed);
                 RUNNING_REQUESTED.store(false, Ordering::Relaxed);
@@ -2213,8 +2253,15 @@ fn native_window(frame: &eframe::Frame) -> Option<HWND> {
 }
 impl eframe::App for Dashboard {
     fn update(&mut self, ctx: &Context, frame: &mut eframe::Frame) {
-        if let Some(owner) = native_window(frame) {
+        if let Some(owner) = native_window(frame)
+            && owner != self.owner
+        {
             self.owner = owner;
+            if let Ok(mut bridge) = BRIDGE.lock()
+                && let Some(bridge) = bridge.as_mut()
+            {
+                bridge.window = owner as isize;
+            }
         }
         let Ok(s) = self.shared.lock().map(|s| s.clone()) else {
             return;

@@ -3,6 +3,7 @@
 ## 2.2.0 — unreleased
 
 - A closed LM Studio is no longer started when a game launches. GamePause used to ask LM Studio's command-line tool what was loaded, and that tool starts LM Studio in the background when it is not running. LM Studio is now left alone while it is closed and owes no restore.
+- Opening GamePause from the tray, the shortcut or the resume prompt now brings back a minimized window. A fullscreen game minimizes the dashboard, and a minimized dashboard used to ignore the request, so nothing appeared.
 - **Ask** games: the prompt has **Always pause** and **Never pause**, which remember the answer by setting the game's rule to On or Off.
 - Xbox game folders are looked for every five minutes on fixed local disks, instead of every 30 seconds on every drive letter, so network and sleeping drives are no longer touched.
 - A command that starts another program no longer makes GamePause wait for that program: the first LM Studio command after LM Studio was closed used to time out after 25 seconds.
