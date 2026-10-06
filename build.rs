@@ -5,8 +5,8 @@ fn main() {
         winresource::WindowsResource::new()
             .set_icon("assets/gamepause.ico")
             .set_manifest_file("assets/GamePause.manifest")
-            .set("ProductName", "GamePause for LM Studio")
-            .set("FileDescription", "GamePause for LM Studio")
+            .set("ProductName", "GamePause for Local AI")
+            .set("FileDescription", "GamePause for Local AI")
             .set("CompanyName", "GamePause contributors")
             .set(
                 "LegalCopyright",

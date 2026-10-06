@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.2.1 — 2026-10-07
+
+- Task Manager and the program file's properties now show **GamePause for Local AI**. They still showed the old name, GamePause for LM Studio.
+
+Nothing else changed since 2.2.0, and what was not yet tested there is still untested.
+
 ## 2.2.0 — 2026-10-07
 
 - A closed LM Studio is no longer started when a game launches. GamePause used to ask LM Studio's command-line tool what was loaded, and that tool starts LM Studio in the background when it is not running. LM Studio is now left alone while it is closed and owes no restore.
