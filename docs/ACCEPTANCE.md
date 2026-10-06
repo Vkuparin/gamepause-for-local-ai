@@ -1,5 +1,15 @@
 # Candidate acceptance
 
+## v2.0.1 owner publication request - 2026-10-06
+
+The owner instructed "push and publish 2.0.1 release according to the process" after receiving the stabilization fixes, their check results and the list of unverified behavior. This authorizes pushing and publishing v2.0.1. The owner did not supply a test report for this build, so this record is a publication request, not a statement that the owner ran it.
+
+Automated checks passed: 298 library tests and 10 CLI integration tests (6 ignored), formatting, Clippy, the release resilience probe and the release build. The package verifier ran in the release workflow.
+
+Exercised on one Windows 11 PC: the isolated dashboard review fixture and the interactive tray menu test, both with fictional or observation-only state; a tray menu capture from an instance with a private data directory and LM Studio and Ollama disabled; and a four-minute side-by-side run of 2.0.0 and 2.0.1 in headless observation mode with private data directories (4.95 s and 3.19 s of CPU time).
+
+Not exercised for v2.0.1: any live Ollama or LM Studio session, so the longer Ollama load timeout has fixture coverage only; the corrected tray icon color on a real tray; the notification rules across a real sleep and wake; the Advanced draft, Escape prompt and Ignore executable change beyond unit tests and rendered fixtures; the process provider with real llama.cpp or KoboldCpp; real games, Windows 10, install/upgrade/uninstall, startup, multi-monitor and screen-reader behavior. Executables and installer are unsigned. Published SHA256SUMS.txt and BUILD-INFO.json identify the packaged artifacts; the release acceptance asset records this request separately from the build-time review marker.
+
 ## v2.0.0 owner publication request - 2026-10-06
 
 The owner set the goal "keep on implementing the 2.0.0 features, and after you are done, push to publish and release according to the process." This authorizes committing and publishing v2.0.0. The owner did not supply a test report for this build, so this record is a publication request, not a statement that the owner ran it.
