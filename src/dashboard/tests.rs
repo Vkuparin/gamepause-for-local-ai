@@ -1,4 +1,7 @@
-use super::{activity::read_worker_log, bridge::dispatch, native::native_options, *};
+use super::{
+    activity::read_worker_log, bridge::dispatch, dialogs::confirmed_resume, native::native_options,
+    *,
+};
 use crate::{
     control::Activity,
     coordinator::{Report, State},
