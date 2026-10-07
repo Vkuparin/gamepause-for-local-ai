@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::{
     coordinator::{Coordinator, State, Step, Store},
