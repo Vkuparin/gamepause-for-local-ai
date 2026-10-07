@@ -1,3 +1,4 @@
+use super::detection::{DetectionFrame, evidence_from};
 use super::*;
 #[test]
 fn log_lines_start_with_a_readable_local_time() {
