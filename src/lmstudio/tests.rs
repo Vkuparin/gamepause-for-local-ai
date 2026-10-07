@@ -548,3 +548,57 @@ fn stopped_server_without_port_and_cli_banner_are_normalized() {
         "CLI commit: 69d945a"
     );
 }
+
+#[test]
+fn restore_refuses_another_resident_copy_and_changed_idle_ttl() {
+    let mut model = Model {
+        identifier: "saved".into(),
+        model_key: "qwen/chat@q4".into(),
+        base_key: "qwen/chat".into(),
+        namespace: "llm".into(),
+        ttl_ms: Some(60000),
+        load_config: json!({"fields":[]}),
+        native_config: json!({}),
+        stage: "unloaded".into(),
+    };
+    let other_copy =
+        json!({"identifier":"autoload", "modelKey":"qwen/chat", "selectedVariant":"qwen/chat@q4"});
+    let error =
+        identity::prevent_duplicate_restore(&model, std::slice::from_ref(&other_copy)).unwrap_err();
+    assert!(
+        error
+            .downcast_ref::<crate::provider::ManualRetryRequired>()
+            .is_some()
+    );
+    assert!(error.to_string().contains("second copy was not loaded"));
+    // Even a different selected variant of the same catalog model blocks duplication.
+    let changed_variant =
+        json!({"identifier":"autoload", "modelKey":"qwen/chat", "selectedVariant":"qwen/chat@q8"});
+    assert!(identity::prevent_duplicate_restore(&model, &[changed_variant]).is_err());
+    let saved = json!({"identifier":"saved", "modelKey":"qwen/chat"});
+    assert!(identity::prevent_duplicate_restore(&model, &[saved]).is_ok());
+    assert!(
+        identity::prevent_duplicate_restore(
+            &model,
+            &[json!({"identifier":"other", "modelKey":"another/model"})]
+        )
+        .is_ok()
+    );
+    assert!(
+        identity::prevent_duplicate_restore(&model, &[other_copy.clone(), other_copy]).is_err()
+    );
+    assert!(identity::verify_ttl(&model, &json!({"ttlMs":60000})).is_ok());
+    for value in [json!({"ttlMs":30000}), json!({"ttlMs":null}), json!({})] {
+        let error = identity::verify_ttl(&model, &value).unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::provider::ManualRetryRequired>()
+                .is_some()
+        );
+        assert!(error.to_string().contains("saved 60000 ms"));
+    }
+    assert!(identity::verify_ttl(&model, &json!({"ttlMs":"60000"})).is_err());
+    model.ttl_ms = None;
+    assert!(identity::verify_ttl(&model, &json!({})).is_ok());
+    assert!(identity::verify_ttl(&model, &json!({"ttlMs":null})).is_ok());
+}

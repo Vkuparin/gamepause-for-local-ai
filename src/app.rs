@@ -564,6 +564,15 @@ fn run(
     duration: f64,
     console: bool,
 ) -> Result<()> {
+    log(
+        &folder,
+        &format!(
+            "Watcher started; mode={}; recovery_pending={}; data directory={}",
+            engine.config.mode,
+            engine.pending(),
+            folder.display()
+        ),
+    );
     let power = state
         .lock()
         .map_err(|_| anyhow::anyhow!("Shared state unavailable"))?
@@ -619,7 +628,7 @@ fn run(
         steam_roots: vec![],
         guarded: engine.pending(),
         ready: false,
-        ask_approved: false,
+        ask_approved: vec![],
     };
     let mut native_detection = NativeDetection::new(&engine.config)?;
     let detection_state = state.clone();
@@ -669,7 +678,7 @@ fn run(
     let mut last_status = Value::Null;
     let mut inventory_pending = false;
     let mut force_requested = false;
-    let mut ask_approved = false;
+    let mut ask_approved = Vec::new();
     let mut generation = 0u64;
     let mut minimum_inventory_generation = 0u64;
     let mut queued = None;
@@ -685,6 +694,7 @@ fn run(
         }
         let power_state = power.snapshot();
         if power_state.generation != power_generation {
+            ask_approved.clear();
             power_generation = power_state.generation;
             accepted_power.store(power_generation, std::sync::atomic::Ordering::Release);
             engine.resume_detected();
@@ -717,7 +727,13 @@ fn run(
                 break;
             }
             // Honoured wherever it sits in the queue, tracked or not.
-            ask_approved |= action.answers_ask();
+            if let Some(games) = action.ask_answer() {
+                for game in games {
+                    if !detection::approved_ask(game, &ask_approved) {
+                        ask_approved.push(game.clone());
+                    }
+                }
+            }
             if let Action::Tracked { id, action } = &action
                 && matches!(action.as_ref(), Action::Refresh)
                 && let Ok(mut shared) = state.lock()
@@ -817,19 +833,19 @@ fn run(
                 steam_roots: steam_roots.clone(),
                 guarded: guarded_scan,
                 ready: inventory_ready && errors.is_empty(),
-                ask_approved,
+                ask_approved: ask_approved.clone(),
             };
             let frame = fresh_detection(&detection, detection_input.clone())?;
-            // An answer lasts while an "ask" game runs; the next launch asks again.
-            if frame.asking.is_empty() {
-                ask_approved = false;
+            // Answers apply only to the live instances named by the UI click.
+            if frame.evidence.is_some() {
+                ask_approved.retain(|game| {
+                    engine.config.asks(&game.path) && detection::approved_ask(game, &frame.all)
+                });
+            } else {
+                ask_approved.clear();
             }
             let suggestion = frame.suggestion.clone();
-            let ask_prompt = if ask_approved {
-                vec![]
-            } else {
-                frame.asking.clone()
-            };
+            let ask_prompt = frame.asking.clone();
             let new_candidate = frame.candidate != last_candidate;
             last_candidate = frame.candidate;
             force_requested |= new_candidate;
@@ -1014,6 +1030,7 @@ fn run(
                 }
             }
             Err(err) => {
+                ask_approved.clear();
                 engine.gameplay.revoke();
                 engine.activity = Activity::DetectionUnavailable;
                 if let Ok(mut shared) = state.lock() {
@@ -1066,7 +1083,31 @@ pub fn install_panic_hook(folder: &std::path::Path) {
         previous(info);
     }));
 }
+static LOG_ERROR: Mutex<Option<(PathBuf, String)>> = Mutex::new(None);
+pub(crate) fn log_error(folder: &std::path::Path) -> Option<String> {
+    LOG_ERROR.lock().ok().and_then(|error| {
+        error
+            .as_ref()
+            .filter(|(path, _)| path == folder)
+            .map(|(_, error)| error.clone())
+    })
+}
 pub fn log(folder: &std::path::Path, message: &str) {
+    let result = write_log(folder, message);
+    if let Ok(mut error) = LOG_ERROR.lock() {
+        match result {
+            Err(failure) => {
+                *error = Some((
+                    folder.to_path_buf(),
+                    format!("Worker log could not be written: {failure}"),
+                ))
+            }
+            Ok(()) if error.as_ref().is_some_and(|(path, _)| path == folder) => *error = None,
+            Ok(()) => (),
+        }
+    }
+}
+fn write_log(folder: &std::path::Path, message: &str) -> std::io::Result<()> {
     let file = folder.join("gamepause.log");
     if fs::metadata(&file).is_ok_and(|m| m.len() > 1_000_000) {
         for i in (1..3).rev() {
@@ -1077,9 +1118,14 @@ pub fn log(folder: &std::path::Path, message: &str) {
         }
         let _ = fs::rename(&file, folder.join("gamepause.log.1"));
     }
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(file) {
-        let _ = writeln!(file, "{} {message}", local_timestamp());
-    }
+    let mut file = OpenOptions::new().create(true).append(true).open(file)?;
+    writeln!(
+        file,
+        "{} GamePause {} (PID {}) {message}",
+        local_timestamp(),
+        env!("CARGO_PKG_VERSION"),
+        std::process::id()
+    )
 }
 /// Local wall-clock time for log lines, as `2026-10-06 21:44:07`.
 fn local_timestamp() -> String {

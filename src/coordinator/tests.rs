@@ -88,6 +88,7 @@ struct Fake {
     disk: Arc<Mutex<Disk>>,
     current: BTreeMap<String, [bool; 2]>,
     failures: BTreeSet<(String, Phase)>,
+    manual_failure: bool,
     after_change: bool,
     busy: bool,
     offline: BTreeSet<String>,
@@ -231,6 +232,9 @@ impl Runtime for Fake {
         drop(disk);
         self.events.push((binding.id.clone(), work.phase));
         let failing = self.failures.contains(&(binding.id.clone(), work.phase));
+        if failing && self.manual_failure {
+            return Err(ManualRetryRequired("fixture resident conflict".into()).into());
+        }
         if failing && !self.after_change {
             bail!("injected provider failure");
         }
@@ -305,6 +309,7 @@ fn harness() -> Harness {
         disk: disk.clone(),
         current: [("lm".into(), [true; 2]), ("other".into(), [true; 2])].into(),
         failures: BTreeSet::new(),
+        manual_failure: false,
         after_change: false,
         busy: false,
         offline: BTreeSet::new(),
@@ -785,4 +790,50 @@ fn duplicate_routes_and_reassigned_pending_binding_are_refused_without_writes() 
         .is_err()
     );
     assert_eq!(c.store.0.lock().unwrap().writes, writes);
+}
+
+#[test]
+fn resident_conflict_waits_for_manual_retry_and_preserves_other_provider_progress() {
+    let mut c = harness();
+    pump(&mut c, Intent::Pause, 0);
+    c.runtime.manual_failure = true;
+    c.runtime.failures.insert(("lm".into(), Phase::Restore));
+    pump(&mut c, Intent::Restore, 1);
+    assert!(
+        c.journal()
+            .unwrap()
+            .providers
+            .iter()
+            .any(|p| p.binding.id == "other" && p.restore_complete)
+    );
+    assert_eq!(
+        c.journal().unwrap().providers[0].payload.original(),
+        "fixture original raw config"
+    );
+    let calls = c.runtime.events.len();
+    pump(&mut c, Intent::Restore, 1000);
+    assert_eq!(c.runtime.events.len(), calls);
+    let (mut runtime, store, mut memory) = c.into_parts();
+    assert_eq!(memory.next_retry_at(), None);
+    assert!(!memory.ready(Intent::Restore, Duration::from_secs(1000)));
+    let mut c = Coordinator::resume(
+        runtime.clone(),
+        store.clone(),
+        bindings(),
+        memory,
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    pump(&mut c, Intent::Restore, 2000);
+    assert_eq!(c.runtime.events.len(), calls);
+    let (_, _, saved_memory) = c.into_parts();
+    memory = saved_memory;
+    memory.request_retry();
+    assert!(memory.ready(Intent::Restore, Duration::from_secs(2000)));
+    runtime.failures.clear();
+    let mut c =
+        Coordinator::resume(runtime, store, bindings(), memory, Duration::from_secs(10)).unwrap();
+    pump(&mut c, Intent::Restore, 2000);
+    assert!(c.journal().is_none());
+    assert_eq!(c.runtime.current["lm"], [true; 2]);
 }

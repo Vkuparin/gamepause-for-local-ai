@@ -59,7 +59,7 @@ pub(super) fn apply_action_detected(
     match action {
         Action::Tracked { .. } => unreachable!(),
         // Consumed by the watcher loop, which owns the answer's lifetime.
-        Action::PauseForGame => (),
+        Action::PauseForGame { .. } => (),
         Action::RemoveCustom { path, name } => {
             let updated = remove_custom(&engine.config, &path, &name)?;
             return Ok(save_settings(updated, engine, folder, scanner, state));
@@ -370,7 +370,7 @@ fn apply_tracked(
         | Action::Disable => "Settings saved.".into(),
         Action::Resume => "Manual hold released; normal recovery guards and delay apply.".into(),
         Action::Doctor => "Read-only diagnostics finished; see Advanced provider details.".into(),
-        Action::PauseForGame => "Pausing AI for this game.".into(),
+        Action::PauseForGame { .. } => "Pausing AI for this game.".into(),
         _ => "Command completed.".into(),
     };
     let gameplay = matches!(

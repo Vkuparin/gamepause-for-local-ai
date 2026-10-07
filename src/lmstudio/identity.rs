@@ -45,6 +45,38 @@ pub(super) fn identity_matches(model: &Model, info: &Value) -> bool {
         .iter()
         .any(|field| info[*field].as_str() == Some(model.model_key.as_str()))
 }
+pub(super) fn prevent_duplicate_restore(model: &Model, loaded: &[Value]) -> Result<()> {
+    resident_keys(loaded)?;
+    if let Some(existing) = loaded.iter().find(|info| {
+        info["identifier"] != model.identifier
+            && (identity_matches(model, info) || info["modelKey"] == model.base_key)
+    }) {
+        return Err(crate::provider::ManualRetryRequired(format!(
+            "{} is already loaded as {}; saved instance {} is missing. A second copy was not loaded. Finish current work and unload the conflicting instance in LM Studio, then choose Resume AI. Recovery retained",
+            model.base_key, existing["identifier"].as_str().unwrap_or("unknown"), model.identifier,
+        )).into());
+    }
+    Ok(())
+}
+pub(super) fn verify_ttl(model: &Model, info: &Value) -> Result<()> {
+    let actual = match info.get("ttlMs") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_u64()
+                .context("Invalid LM Studio idle TTL; recovery retained")?,
+        ),
+    };
+    if actual != model.ttl_ms {
+        let display =
+            |ttl: Option<u64>| ttl.map_or_else(|| "disabled".into(), |ms| format!("{ms} ms"));
+        return Err(crate::provider::ManualRetryRequired(format!(
+            "Idle TTL mismatch for {}: saved {}, observed {}. Automatic retry paused. Finish current work and unload this instance in LM Studio, then choose Resume AI to restore its saved settings. Recovery retained",
+            model.identifier, display(model.ttl_ms), display(actual),
+        )).into());
+    }
+    Ok(())
+}
 pub fn compare_fields(expected: &Value, actual: &Value) -> Result<()> {
     let saved = expected["fields"]
         .as_array()

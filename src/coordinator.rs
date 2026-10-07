@@ -3,7 +3,7 @@
 use crate::{
     config::normalized_endpoint,
     discovery::Game,
-    provider::{Guarantee, InferenceBusy, Kind},
+    provider::{Guarantee, InferenceBusy, Kind, ManualRetryRequired},
     recovery::{Binding, Entry, Intent, Journal, Session},
 };
 use anyhow::{Context, Result, bail};
@@ -91,6 +91,7 @@ pub struct Status {
     pub state: State,
     pub error: String,
     pub retry_at: Duration,
+    pub manual_retry: bool,
     /// Kept after the journal clears so a finished restore still reports it.
     pub note: String,
 }
@@ -100,6 +101,7 @@ impl Default for Status {
             state: State::Uncaptured,
             error: String::new(),
             retry_at: Duration::ZERO,
+            manual_retry: false,
             note: String::new(),
         }
     }
@@ -146,7 +148,9 @@ impl<P> Continuation<P> {
     pub fn next_retry_at(&self) -> Option<Duration> {
         self.status
             .values()
-            .filter(|status| matches!(status.state, State::Failed | State::Deferred))
+            .filter(|status| {
+                matches!(status.state, State::Failed | State::Deferred) && !status.manual_retry
+            })
             .map(|status| status.retry_at)
             .min()
     }
@@ -158,7 +162,7 @@ impl<P> Continuation<P> {
                 .is_some_and(|journal| journal.session.intent != intent)
             || !self.continuing.is_empty()
             || self.status.values().any(|status| match status.state {
-                State::Failed | State::Deferred => now >= status.retry_at,
+                State::Failed | State::Deferred => !status.manual_retry && now >= status.retry_at,
                 State::Paused | State::Restored => false,
                 _ => true,
             })
@@ -167,6 +171,7 @@ impl<P> Continuation<P> {
         for status in self.status.values_mut() {
             if matches!(status.state, State::Failed | State::Deferred) {
                 status.retry_at = Duration::ZERO;
+                status.manual_retry = false;
             }
         }
     }
@@ -297,7 +302,7 @@ impl<R: Runtime, S: Store<R::Payload>> Coordinator<R, S> {
                     state: status.state,
                     pending: entry.is_some_and(|entry| !entry.restore_complete),
                     error: status.error.clone(),
-                    retry_seconds: (!remaining.is_zero()).then(|| {
+                    retry_seconds: (!status.manual_retry && !remaining.is_zero()).then(|| {
                         remaining
                             .as_secs()
                             .saturating_add(u64::from(remaining.subsec_nanos() > 0))
@@ -356,8 +361,9 @@ impl<R: Runtime, S: Store<R::Payload>> Coordinator<R, S> {
     fn failed(&mut self, id: &str, error: anyhow::Error, now: Duration) {
         if self.continuing.contains(id)
             && let Some(status) = self.status.get_mut(id)
-            && now < status.retry_at
+            && (status.manual_retry || now < status.retry_at)
         {
+            status.manual_retry |= error.downcast_ref::<ManualRetryRequired>().is_some();
             status.error.push_str(&format!("; {error:#}"));
             self.continuing.remove(id);
             return;
@@ -373,6 +379,7 @@ impl<R: Runtime, S: Store<R::Payload>> Coordinator<R, S> {
                 },
                 error: format!("{error:#}"),
                 retry_at: now.saturating_add(self.retry),
+                manual_retry: error.downcast_ref::<ManualRetryRequired>().is_some(),
                 note: String::new(),
             },
         );
@@ -551,7 +558,7 @@ impl<R: Runtime, S: Store<R::Payload>> Coordinator<R, S> {
             if let Some(status) = self.status.get(&binding.id)
                 && matches!(status.state, State::Failed | State::Deferred)
             {
-                if now < status.retry_at {
+                if status.manual_retry || now < status.retry_at {
                     if !self.continuing.contains(&binding.id)
                         || !entry
                             .as_ref()

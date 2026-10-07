@@ -104,6 +104,17 @@ impl LMStudio {
                 bail!("Saved model variant is no longer selected; recovery retained");
             }
         }
+        let loaded = self.cli(&["ps", "--json"])?;
+        let loaded = loaded.as_array().context("Unexpected lms inventory")?;
+        super::identity::prevent_duplicate_restore(model, loaded)?;
+        if loaded
+            .iter()
+            .any(|info| info["identifier"] == model.identifier)
+        {
+            // Another client may have loaded it since restore's first inventory.
+            // The caller performs the full verification without another load.
+            return Ok(());
+        }
         let mut ws = self.socket(&model.namespace)?;
         ws.get_mut()
             .set_read_timeout(Some(Duration::from_secs(180)))?;

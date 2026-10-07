@@ -415,9 +415,7 @@ impl LMStudio {
         if !identity_matches(model, info) {
             bail!("Model identity/quantization mismatch; recovery retained");
         }
-        if info["ttlMs"].as_u64() != model.ttl_ms {
-            bail!("Idle TTL mismatch; recovery retained");
-        }
+        identity::verify_ttl(model, info)?;
         let actual = self.raw_config(&model.namespace, &model.identifier)?;
         compare_fields(&model.load_config, &actual)?;
         let native = self.native()?;
@@ -527,15 +525,14 @@ impl Backend for LMStudio {
     }
     fn restore(&mut self, model: &Model) -> Result<()> {
         self.claim_control(None)?;
-        if let Some(info) = self
-            .loaded()?
-            .iter()
-            .find(|m| m["identifier"] == model.identifier)
-        {
+        let loaded = self.loaded()?;
+        resident_keys(&loaded)?;
+        if let Some(info) = loaded.iter().find(|m| m["identifier"] == model.identifier) {
             return self.logged(&format!("restore-verify:{}", model.identifier), || {
                 self.verify(model, info)
             });
         }
+        identity::prevent_duplicate_restore(model, &loaded)?;
         self.load_model(model)?;
         let loaded = self.loaded()?;
         let info = loaded

@@ -103,6 +103,18 @@ impl Dashboard {
             }
         });
         ui.colored_label(p.muted,"Recent observed status changes while this dashboard is open. Detailed worker logs remain in the data folder.");
+        ui.colored_label(
+            p.muted,
+            format!(
+                "Running GamePause {} (PID {}). Logs: {}",
+                env!("CARGO_PKG_VERSION"),
+                std::process::id(),
+                self.folder.display()
+            ),
+        );
+        if let Some(error) = crate::app::log_error(&self.folder) {
+            ui.colored_label(p.error, error);
+        }
         p.card().show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.strong("Current state");

@@ -330,7 +330,9 @@ impl Dashboard {
                                         .show(ui, palette)
                                         .clicked()
                                     {
-                                        self.action(Action::PauseForGame, "Pause AI for this game");
+                                        self.action(Action::PauseForGame {
+                                            games: s.active_games.iter().filter(|game| s.config.asks(&game.path)).cloned().collect(),
+                                        }, "Pause AI for this game");
                                     }
                                     // The remembered answers are the game's ordinary rule.
                                     let asking = asking_paths(s);

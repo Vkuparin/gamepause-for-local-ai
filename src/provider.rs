@@ -12,6 +12,17 @@ impl std::fmt::Display for InferenceBusy {
 }
 impl std::error::Error for InferenceBusy {}
 
+/// A conflict that needs an explicit retry after the user resolves it.
+/// Process-local scheduling only; original recovery evidence is untouched.
+#[derive(Debug)]
+pub struct ManualRetryRequired(pub String);
+impl std::fmt::Display for ManualRetryRequired {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+impl std::error::Error for ManualRetryRequired {}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {

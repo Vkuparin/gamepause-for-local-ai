@@ -27,6 +27,7 @@ pub(super) struct Bridge {
     pub(super) tx: Sender<UiRequest>,
     pub(super) ctx: Option<Context>,
     pub(super) shared: SharedState,
+    pub(super) folder: PathBuf,
     pub(super) fingerprint: String,
     pub(super) thread: Option<std::thread::JoinHandle<()>>,
     /// The open dashboard window, or 0. Used only by the tray UI thread to
@@ -119,13 +120,30 @@ pub fn refresh() {
     let shared = BRIDGE
         .lock()
         .ok()
-        .and_then(|b| b.as_ref().map(|b| b.shared.clone()));
-    let Some(shared) = shared else { return };
+        .and_then(|b| b.as_ref().map(|b| (b.shared.clone(), b.folder.clone())));
+    let Some((shared, folder)) = shared else {
+        return;
+    };
     let Ok(s) = shared.lock().map(|s| s.clone()) else {
         return;
     };
-    let summary = crate::presentation::summarize(&s);
-    let fingerprint = format!(
+    let fingerprint = fingerprint(&s) + &format!("|{:?}", crate::app::log_error(&folder));
+    let ctx = BRIDGE.lock().ok().and_then(|mut b| {
+        b.as_mut().and_then(|b| {
+            if b.fingerprint == fingerprint {
+                return None;
+            }
+            b.fingerprint = fingerprint;
+            b.ctx.clone()
+        })
+    });
+    if let Some(ctx) = ctx {
+        ctx.request_repaint();
+    }
+}
+pub(super) fn fingerprint(s: &crate::app::Shared) -> String {
+    let summary = crate::presentation::summarize(s);
+    format!(
         "{}|{}|{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{}|{:?}",
         summary.games,
         summary.ai_text(),
@@ -142,19 +160,20 @@ pub fn refresh() {
         s.verifying,
         s.discovery_ready,
         s.games
-    );
-    let ctx = BRIDGE.lock().ok().and_then(|mut b| {
-        b.as_mut().and_then(|b| {
-            if b.fingerprint == fingerprint {
-                return None;
-            }
-            b.fingerprint = fingerprint;
-            b.ctx.clone()
-        })
-    });
-    if let Some(ctx) = ctx {
-        ctx.request_repaint();
-    }
+    ) + &format!(
+        "|{:?}|{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        s.suggestion,
+        s.ask_prompt,
+        s.freed_bytes,
+        s.lm_missing,
+        s.lm_running,
+        s.ollama_running,
+        s.ollama_installed,
+        s.pending,
+        s.manual_pause,
+        s.coexistence,
+        s.active_mode
+    )
 }
 pub fn show(shared: SharedState, tx: Sender<Action>, folder: PathBuf) {
     if BRIDGE.lock().is_ok_and(|b| {
@@ -177,6 +196,7 @@ pub fn show(shared: SharedState, tx: Sender<Action>, folder: PathBuf) {
         tx: ui_tx,
         ctx: None,
         shared: shared.clone(),
+        folder: folder.clone(),
         fingerprint: String::new(),
         thread: None,
         window: 0,

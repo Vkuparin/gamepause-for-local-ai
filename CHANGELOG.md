@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.5.1 - 2026-10-07
+
+- LM Studio recovery refuses to load a second copy when the saved instance is missing but the same model is already resident under another identifier. Conflicting copies and idle TTL mismatches retain recovery and stop automatic retries until **Resume AI**. Independent healthy models and providers can still finish recovery.
+- Other apps are stopped one process at a time behind saved checkpoints. GamePause checks creation time, executable path and start details before stopping; new or changed instances without a matching saved relaunch command are left running. Inaccessible or incomplete process inventories hold recovery. Drive-root working folders are preserved, including older saved captures.
+- An **Ask** answer applies only to the game instances shown in the prompt. Another Ask game or a relaunched instance needs a new answer.
+- Executable-icon work uses bounded queues and uploads, and evicts one old cache entry at a time. Gameplay suggestions, Ask prompts and provider visibility changes now request dashboard updates.
+- Worker logs identify the build version and process ID. Activity shows the running build, process ID, data folder and log-write failures.
+
+Validated with automated mock-provider, process, recovery and UI-state tests. The reported restart/Hermes scenario was investigated through existing logs, without controlling live models. The new behavior has not been live-tested with LM Studio, Ollama, real llama.cpp or KoboldCpp; sleep/wake and Windows 10 remain untested. Settings and recovery formats are unchanged.
+
 ## 2.5.0 — 2026-10-07
 
 - No change in behavior. The source was reorganized into smaller files, and a test that failed by chance about once in thirty runs was fixed.

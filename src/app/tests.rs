@@ -16,21 +16,27 @@ fn log_lines_start_with_a_readable_local_time() {
 }
 #[test]
 fn ask_answer_counts_whether_or_not_it_is_tracked() {
-    assert!(Action::PauseForGame.answers_ask());
+    assert!(
+        Action::PauseForGame { games: vec![] }
+            .ask_answer()
+            .is_some()
+    );
     assert!(
         Action::Tracked {
             id: 7,
-            action: Box::new(Action::PauseForGame)
+            action: Box::new(Action::PauseForGame { games: vec![] })
         }
-        .answers_ask()
+        .ask_answer()
+        .is_some()
     );
-    assert!(!Action::Pause.answers_ask());
+    assert!(!Action::Pause.ask_answer().is_some());
     assert!(
         !Action::Tracked {
             id: 8,
             action: Box::new(Action::Refresh)
         }
-        .answers_ask()
+        .ask_answer()
+        .is_some()
     );
 }
 #[test]
@@ -97,7 +103,7 @@ fn manual_control_uses_background_guard_failure_instead_of_a_successful_fallback
         steam_roots: vec![],
         guarded: true,
         ready: true,
-        ask_approved: false,
+        ask_approved: vec![],
     };
     let worker = BackgroundDetection::start(
         input,
@@ -186,7 +192,7 @@ fn power_change_during_fresh_detection_cannot_authorize_control() {
         steam_roots: vec![],
         guarded: true,
         ready: true,
-        ask_approved: false,
+        ask_approved: vec![],
     };
     let worker = BackgroundDetection::start(
         input.clone(),
@@ -264,7 +270,7 @@ fn native_background_detection_scans_during_a_blocked_control_operation() {
         steam_roots: vec![],
         guarded: false,
         ready: true,
-        ask_approved: false,
+        ask_approved: vec![],
     };
     let mut native = NativeDetection::new(&config).unwrap();
     let (published, frames) = mpsc::channel();
@@ -1329,14 +1335,14 @@ fn ask_rule_withholds_the_trigger_until_answered_and_excludes_ignore() {
     assert!(config.asks(&game.path) && !config.asks(&other.path));
     let scanner = Scanner::new(config.clone()).unwrap();
     let all = vec![game.clone(), other.clone()];
-    let unanswered = evidence_from(all.clone(), &scanner, &config, false);
+    let unanswered = evidence_from(all.clone(), &scanner, &config, &[]);
     assert_eq!(unanswered.triggers, vec![other.clone()]);
     assert_eq!(unanswered.all.len(), 2);
-    let answered = evidence_from(all.clone(), &scanner, &config, true);
+    let answered = evidence_from(all.clone(), &scanner, &config, std::slice::from_ref(&game));
     assert_eq!(answered.triggers.len(), 2);
     // An answer never overrides a game the user ignores.
     config.ignored_games.push(other.path.clone());
-    let ignored = evidence_from(all, &scanner, &config, true);
+    let ignored = evidence_from(all, &scanner, &config, std::slice::from_ref(&game));
     assert_eq!(ignored.triggers, vec![game]);
     // The setting round-trips and defaults to empty for existing files.
     let saved = serde_json::to_string(&config).unwrap();
@@ -1347,4 +1353,52 @@ fn ask_rule_withholds_the_trigger_until_answered_and_excludes_ignore() {
             .ask_games
             .is_empty()
     );
+}
+
+#[test]
+fn ask_answer_never_authorizes_another_instance_or_a_stale_click() {
+    let original = crate::gameplay::fixtures::game(42, 10);
+    let other = crate::gameplay::fixtures::game(43, 10);
+    let mut relaunched = original.clone();
+    relaunched.created_at += 1;
+    let config = Config {
+        ask_games: vec![original.path.clone(), other.path.clone()],
+        ..Default::default()
+    };
+    let scanner = Scanner::new(config.clone()).unwrap();
+    let answer = Action::Tracked {
+        id: 7,
+        action: Box::new(Action::PauseForGame {
+            games: vec![original.clone()],
+        }),
+    };
+    let approved = answer.ask_answer().unwrap();
+    let evidence = evidence_from(
+        vec![original.clone(), other.clone()],
+        &scanner,
+        &config,
+        approved,
+    );
+    assert_eq!(evidence.triggers, vec![original]);
+    let evidence = evidence_from(vec![relaunched, other], &scanner, &config, approved);
+    assert!(evidence.triggers.is_empty());
+    assert_eq!(evidence.all.len(), 2);
+}
+
+#[test]
+fn worker_log_identifies_the_build_and_surfaces_write_failures() {
+    let folder = std::env::temp_dir().join(format!("gamepause-log-health-{}", std::process::id()));
+    fs::create_dir_all(folder.join("gamepause.log")).unwrap();
+    log(&folder, "fixture failed write");
+    assert!(log_error(&folder).unwrap().contains("could not be written"));
+    fs::remove_dir(folder.join("gamepause.log")).unwrap();
+    log(&folder, "fixture recovered write");
+    assert!(log_error(&folder).is_none());
+    let text = fs::read_to_string(folder.join("gamepause.log")).unwrap();
+    assert!(text.contains(&format!(
+        "GamePause {} (PID {}) fixture recovered write",
+        env!("CARGO_PKG_VERSION"),
+        std::process::id()
+    )));
+    fs::remove_dir_all(folder).unwrap();
 }

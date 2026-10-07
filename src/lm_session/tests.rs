@@ -44,6 +44,7 @@ struct Mock {
     stop_ack_only: bool,
     fail_load: Option<(String, bool)>,
     fail_verify: Option<String>,
+    manual_conflict: bool,
     events: Vec<String>,
     path: PathBuf,
 }
@@ -73,6 +74,7 @@ impl Mock {
             stop_ack_only: false,
             fail_load: None,
             fail_verify: None,
+            manual_conflict: false,
             events: Vec::new(),
             path,
         }
@@ -141,6 +143,9 @@ impl Backend for Mock {
             .as_ref()
             .filter(|(id, _)| id == &model.identifier)
             .map(|(_, after)| *after);
+        if failure == Some(false) && self.manual_conflict {
+            return Err(crate::provider::ManualRetryRequired("fixture TTL conflict".into()).into());
+        }
         if failure == Some(false) {
             bail!("fixture load failure: {}", model.identifier);
         }
@@ -510,4 +515,50 @@ fn externally_added_model_cannot_produce_a_completed_pause_or_replace_capture() 
             .values()
             .any(|status| status.error.contains("protection is incomplete"))
     );
+}
+
+#[test]
+fn manual_model_conflict_finishes_healthy_models_then_stops_all_automatic_work() {
+    let fixture = Fixture::new();
+    let mut c = harness(Mock::new(true, fixture.path()), None);
+    pump(&mut c, Intent::Pause);
+    c.runtime.backend.fail_load = Some(("llm".into(), false));
+    c.runtime.backend.manual_conflict = true;
+    for _ in 0..24 {
+        c.advance(Intent::Restore, &[], Duration::ZERO, &mut || false)
+            .unwrap();
+    }
+    assert!(c.runtime.backend.current.contains_key("embedding"));
+    assert!(!c.runtime.backend.current.contains_key("llm"));
+    assert!(c.statuses().values().next().unwrap().manual_retry);
+    let before = fs::read(fixture.path()).unwrap();
+    let calls = c.runtime.backend.events.len();
+    for _ in 0..24 {
+        c.advance(Intent::Restore, &[], Duration::from_secs(1000), &mut || {
+            false
+        })
+        .unwrap();
+    }
+    assert_eq!(c.runtime.backend.events.len(), calls);
+    assert_eq!(fs::read(fixture.path()).unwrap(), before);
+    let snapshot = c.journal().unwrap().providers[0].payload.lm().unwrap();
+    assert_eq!(
+        snapshot.models[0].load_config,
+        c.runtime.backend.original.models[0].load_config
+    );
+    assert_eq!(snapshot.models[0].ttl_ms, Some(60000));
+    let binding = c.runtime.binding().unwrap();
+    let (mut runtime, store, mut memory) = c.into_parts();
+    runtime.backend.fail_load = None;
+    memory.request_retry();
+    let mut c = Coordinator::resume(
+        runtime,
+        store,
+        vec![binding],
+        memory,
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    pump(&mut c, Intent::Restore);
+    assert!(c.journal().is_none());
 }

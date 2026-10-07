@@ -6,7 +6,7 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     ptr::null_mut,
-    sync::mpsc::{self, Receiver, Sender},
+    sync::mpsc::{self, Receiver, SyncSender, TrySendError},
 };
 use windows_sys::Win32::{
     Graphics::Gdi::*,
@@ -14,6 +14,8 @@ use windows_sys::Win32::{
 };
 
 const MAX_ICONS: usize = 512;
+const MAX_PENDING: usize = 32;
+const MAX_UPLOADS: usize = 8;
 const MAX_ENTRIES: usize = 2000;
 const MAX_FOLDERS: usize = 48;
 /// Helpers that ship beside games and would otherwise win on file size.
@@ -48,12 +50,17 @@ enum Slot {
     Missing { hinted: bool },
     Ready(TextureHandle),
 }
+struct Cached {
+    slot: Slot,
+    used: u64,
+}
 
 /// UI-thread cache. Dropping it closes the request channel and ends the loader.
 #[derive(Default)]
 pub struct Cache {
-    slots: HashMap<(String, u32), Slot>,
-    link: Option<(Sender<Request>, Receiver<Loaded>)>,
+    slots: HashMap<(String, u32), Cached>,
+    link: Option<(SyncSender<Request>, Receiver<Loaded>)>,
+    used: u64,
 }
 impl Cache {
     /// `path` is a game folder or executable. `hint` is its running executable, when known.
@@ -65,46 +72,86 @@ impl Cache {
         size: u32,
     ) -> Option<TextureHandle> {
         let key = (canonical(path), size);
-        match self.slots.get(&key) {
+        self.used = self.used.saturating_add(1);
+        if let Some(cached) = self.slots.get_mut(&key) {
+            cached.used = self.used;
+        }
+        match self.slots.get(&key).map(|cached| &cached.slot) {
             Some(Slot::Ready(texture)) => return Some(texture.clone()),
             Some(Slot::Pending { .. }) => return None,
             // A game found running later can supply the executable a folder search missed.
             Some(Slot::Missing { hinted }) if *hinted || hint.is_none() => return None,
             _ => (),
         }
-        if self.slots.len() >= MAX_ICONS {
-            self.slots
-                .retain(|_, slot| matches!(slot, Slot::Pending { .. }));
+        if self
+            .slots
+            .values()
+            .filter(|cached| matches!(cached.slot, Slot::Pending { .. }))
+            .count()
+            >= MAX_PENDING
+        {
+            return None;
+        }
+        if !self.slots.contains_key(&key) && !self.make_room() {
+            return None;
         }
         let hinted = hint.is_some();
         if self.link.is_none() {
             self.link = spawn(ctx.clone());
         }
-        let sent = self.link.as_ref().is_some_and(|(tx, _)| {
-            tx.send(Request {
+        let sent = if let Some((tx, _)) = &self.link {
+            match tx.try_send(Request {
                 key: key.clone(),
                 path: path.into(),
                 hint: hint.map(Into::into),
-            })
-            .is_ok()
-        });
+            }) {
+                Ok(()) => true,
+                Err(TrySendError::Full(_)) => return None,
+                Err(TrySendError::Disconnected(_)) => false,
+            }
+        } else {
+            false
+        };
         self.slots.insert(
             key,
-            if sent {
-                Slot::Pending { hinted }
-            } else {
-                Slot::Missing { hinted: true }
+            Cached {
+                used: self.used,
+                slot: if sent {
+                    Slot::Pending { hinted }
+                } else {
+                    Slot::Missing { hinted: true }
+                },
             },
         );
         None
     }
+    fn make_room(&mut self) -> bool {
+        if self.slots.len() < MAX_ICONS {
+            return true;
+        }
+        let oldest = self
+            .slots
+            .iter()
+            .filter(|(_, cached)| !matches!(cached.slot, Slot::Pending { .. }))
+            .min_by_key(|(_, cached)| cached.used)
+            .map(|(key, _)| key.clone());
+        if let Some(key) = oldest {
+            self.slots.remove(&key);
+            true
+        } else {
+            false
+        }
+    }
     pub fn poll(&mut self, ctx: &Context) {
         let Some((_, rx)) = &self.link else { return };
-        while let Ok(loaded) = rx.try_recv() {
-            let hinted = matches!(
-                self.slots.get(&loaded.key),
-                Some(Slot::Pending { hinted: true })
-            );
+        for _ in 0..MAX_UPLOADS {
+            let Ok(loaded) = rx.try_recv() else { return };
+            let Some(cached) = self.slots.get_mut(&loaded.key) else {
+                continue;
+            };
+            let Slot::Pending { hinted } = cached.slot else {
+                continue;
+            };
             let slot = match loaded.image {
                 Some(image) => Slot::Ready(ctx.load_texture(
                     format!("game-icon-{}-{}", loaded.key.1, loaded.key.0),
@@ -113,25 +160,29 @@ impl Cache {
                 )),
                 None => Slot::Missing { hinted },
             };
-            self.slots.insert(loaded.key, slot);
+            cached.slot = slot;
         }
+        ctx.request_repaint();
     }
     #[cfg(test)]
     pub fn preload(&mut self, ctx: &Context, path: &str, size: u32, image: ColorImage) {
         self.slots.insert(
             (canonical(path), size),
-            Slot::Ready(ctx.load_texture(
-                format!("fixture-{size}-{path}"),
-                image,
-                TextureOptions::LINEAR,
-            )),
+            Cached {
+                used: self.used,
+                slot: Slot::Ready(ctx.load_texture(
+                    format!("fixture-{size}-{path}"),
+                    image,
+                    TextureOptions::LINEAR,
+                )),
+            },
         );
     }
 }
 
-fn spawn(ctx: Context) -> Option<(Sender<Request>, Receiver<Loaded>)> {
-    let (tx, requests) = mpsc::channel::<Request>();
-    let (results, rx) = mpsc::channel();
+fn spawn(ctx: Context) -> Option<(SyncSender<Request>, Receiver<Loaded>)> {
+    let (tx, requests) = mpsc::sync_channel::<Request>(MAX_PENDING);
+    let (results, rx) = mpsc::sync_channel(MAX_PENDING);
     std::thread::Builder::new()
         .name("gamepause-icons".into())
         .spawn(move || {
@@ -279,6 +330,85 @@ unsafe fn pixels(icon: HICON, size: i32) -> Option<ColorImage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn slow_loader_has_a_bounded_queue_and_texture_upload_budget() {
+        let ctx = Context::default();
+        let (tx, requests) = mpsc::sync_channel(MAX_PENDING);
+        let (results, rx) = mpsc::sync_channel(MAX_PENDING);
+        let mut cache = Cache {
+            link: Some((tx, rx)),
+            ..Default::default()
+        };
+        for index in 0..MAX_PENDING * 3 {
+            cache.get(&ctx, &format!(r"D:\Fixture\{index}.exe"), None, 64);
+        }
+        assert_eq!(cache.slots.len(), MAX_PENDING);
+        for request in requests.try_iter() {
+            results
+                .send(Loaded {
+                    key: request.key,
+                    image: Some(ColorImage::filled([2, 2], eframe::egui::Color32::WHITE)),
+                })
+                .unwrap();
+        }
+        for pass in 1..=MAX_PENDING / MAX_UPLOADS {
+            cache.poll(&ctx);
+            assert_eq!(
+                cache
+                    .slots
+                    .values()
+                    .filter(|cached| matches!(cached.slot, Slot::Ready(_)))
+                    .count(),
+                pass * MAX_UPLOADS
+            );
+        }
+        cache.get(&ctx, r"D:\Fixture\deferred.exe", None, 64);
+        assert_eq!(
+            requests.try_iter().count(),
+            1,
+            "deferred requests remain eligible"
+        );
+    }
+    #[test]
+    fn cache_evicts_one_old_entry_and_keeps_recently_used_icons() {
+        let ctx = Context::default();
+        let (tx, requests) = mpsc::sync_channel(MAX_PENDING);
+        let (results, rx) = mpsc::sync_channel(MAX_PENDING);
+        let mut cache = Cache {
+            link: Some((tx, rx)),
+            ..Default::default()
+        };
+        let hot = r"D:\Fixture\hot.exe";
+        for index in 0..MAX_ICONS + 50 {
+            let path = if index == 0 {
+                hot.into()
+            } else {
+                format!(r"D:\Fixture\{index}.exe")
+            };
+            cache.get(&ctx, &path, None, 64);
+            let request = requests.try_recv().unwrap();
+            results
+                .send(Loaded {
+                    key: request.key,
+                    image: None,
+                })
+                .unwrap();
+            cache.poll(&ctx);
+            cache.get(&ctx, hot, None, 64);
+            assert!(
+                requests.try_recv().is_err(),
+                "cached hits must not repeat extraction"
+            );
+            assert!(cache.slots.len() <= MAX_ICONS);
+        }
+        assert_eq!(cache.slots.len(), MAX_ICONS);
+        assert!(cache.slots.contains_key(&(canonical(hot), 64)));
+        assert!(
+            !cache
+                .slots
+                .contains_key(&(canonical(r"D:\Fixture\1.exe"), 64))
+        );
+    }
     #[test]
     fn executable_search_prefers_shallow_large_games_and_stays_bounded() {
         let root = std::env::temp_dir().join(format!("gamepause-icons-{}", std::process::id()));

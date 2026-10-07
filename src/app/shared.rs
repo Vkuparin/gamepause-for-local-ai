@@ -24,7 +24,9 @@ pub enum Action {
     Pause,
     /// Answer to an "ask" game: pause for it as for any other game, and
     /// restore normally when it exits.
-    PauseForGame,
+    PauseForGame {
+        games: Vec<ActiveGame>,
+    },
     Resume,
     Restore,
     ConfirmedRestore {
@@ -49,10 +51,11 @@ pub enum Action {
 }
 impl Action {
     /// The user chose to pause for the running "ask" games.
-    pub(super) fn answers_ask(&self) -> bool {
+    pub(super) fn ask_answer(&self) -> Option<&[ActiveGame]> {
         match self {
-            Action::Tracked { action, .. } => action.answers_ask(),
-            action => matches!(action, Action::PauseForGame),
+            Action::Tracked { action, .. } => action.ask_answer(),
+            Action::PauseForGame { games } => Some(games),
+            _ => None,
         }
     }
     pub(super) fn changes_settings(&self) -> bool {

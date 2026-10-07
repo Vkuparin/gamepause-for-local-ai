@@ -148,7 +148,9 @@ impl<B: Backend> Engine<B> {
                                         snapshot.models.len()
                                     }
                                     crate::recovery::Payload::Ollama(snapshot) => snapshot.units(),
-                                    crate::recovery::Payload::Process(snapshot) => snapshot.units(),
+                                    crate::recovery::Payload::Process(snapshot) => {
+                                        snapshot.pause_units()
+                                    }
                                 })
                                 .sum::<usize>()
                         })

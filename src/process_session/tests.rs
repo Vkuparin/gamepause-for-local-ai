@@ -32,6 +32,8 @@ struct Fake {
     unreadable: bool,
     refuse_launch: bool,
     survives_stop: bool,
+    unknown_inventory: bool,
+    reuse_on_stop: bool,
     disk: Disk,
 }
 impl Fake {
@@ -40,6 +42,7 @@ impl Fake {
         self.processes.push((
             Found {
                 pid: self.next_pid,
+                created_at: self.next_pid as u64,
                 parent,
                 path: path.into(),
             },
@@ -53,6 +56,9 @@ impl Fake {
 }
 impl Os for Fake {
     fn running(&mut self, paths: &[String]) -> Result<Vec<Found>> {
+        if self.unknown_inventory {
+            bail!("fixture residency unknown");
+        }
         Ok(self
             .processes
             .iter()
@@ -60,19 +66,38 @@ impl Os for Fake {
             .map(|(found, _)| found.clone())
             .collect())
     }
-    fn launch_details(&mut self, pid: u32) -> Result<Launch> {
+    fn launch_details(&mut self, process: &Found) -> Result<Launch> {
         if self.unreadable {
             bail!("fixture access denied");
         }
         Ok(self
             .processes
             .iter()
-            .find(|(found, _)| found.pid == pid)
+            .find(|(found, _)| found == process)
             .unwrap()
             .1
             .clone())
     }
-    fn stop(&mut self, pid: u32) -> Result<()> {
+    fn stop(&mut self, process: &Found, expected: Option<&Launch>) -> Result<()> {
+        if self.reuse_on_stop {
+            self.processes
+                .iter_mut()
+                .find(|(live, _)| live.pid == process.pid)
+                .unwrap()
+                .0
+                .created_at += 1;
+        }
+        let Some((live, launch)) = self
+            .processes
+            .iter()
+            .find(|(live, _)| live.pid == process.pid)
+        else {
+            return Ok(());
+        };
+        if live != process || expected.is_some_and(|expected| !same_launch(expected, launch)) {
+            bail!("Process changed; left alone");
+        }
+        let pid = process.pid;
         let journal = self.disk.journal().expect("intent persisted before a stop");
         assert_eq!(journal.session.intent, Intent::Pause);
         assert!(
@@ -147,8 +172,15 @@ fn drive(c: &mut TestCoordinator, intent: Intent, now: u64) {
 }
 #[test]
 fn this_process_start_command_and_folder_are_readable() {
-    let launch = Windows.launch_details(std::process::id()).unwrap();
     let exe = std::env::current_exe().unwrap();
+    let found = Windows
+        .running(&[exe.to_string_lossy().to_string()])
+        .unwrap();
+    let me = found
+        .iter()
+        .find(|found| found.pid == std::process::id())
+        .unwrap();
+    let launch = Windows.launch_details(me).unwrap();
     let name = exe.file_stem().unwrap().to_string_lossy().to_string();
     assert!(
         launch.command_line.contains(&name),
@@ -159,11 +191,12 @@ fn this_process_start_command_and_folder_are_readable() {
         canonical(&launch.directory),
         canonical(&std::env::current_dir().unwrap().to_string_lossy())
     );
-    let me = Windows
-        .running(&[exe.to_string_lossy().to_string()])
-        .unwrap();
-    assert!(me.iter().any(|found| found.pid == std::process::id()));
-    assert!(Windows.launch_details(0).is_err());
+    let mut changed = me.clone();
+    changed.created_at += 1;
+    assert!(Windows.launch_details(&changed).is_err());
+    changed = me.clone();
+    changed.path = SERVER.into();
+    assert!(Windows.launch_details(&changed).is_err());
 }
 #[test]
 fn sealed_start_commands_round_trip_and_hide_their_text() {
@@ -341,5 +374,124 @@ fn nothing_running_is_an_empty_session_and_tampered_recovery_is_refused() {
             _ => bad.pause_complete = true,
         }
         assert!(bad.validate().is_err(), "{edit}");
+    }
+}
+
+#[test]
+fn extra_or_changed_instances_are_left_running_without_replacing_originals() {
+    for change_command in [false, true] {
+        let mut os = Fake::default();
+        os.add(SERVER, 0, &format!(r#""{SERVER}" --port 8080"#));
+        let mut c = fixture(os, vec![app(SERVER, true)]);
+        c.advance(Intent::Pause, &[], Duration::ZERO, &mut || false)
+            .unwrap();
+        let original = c.journal().unwrap().providers[0].payload.apps[0]
+            .sealed
+            .clone();
+        if change_command {
+            c.runtime.os.processes[0]
+                .1
+                .command_line
+                .push_str(" --new-argument");
+        } else {
+            // Even an identical command needs its own durable relaunch obligation.
+            c.runtime
+                .os
+                .add(SERVER, 0, &format!(r#""{SERVER}" --port 8080"#));
+        }
+        drive(&mut c, Intent::Pause, 0);
+        assert!(!c.pause_complete());
+        assert!(c.runtime.os.stopped.is_empty());
+        assert_eq!(
+            c.journal().unwrap().providers[0].payload.apps[0].sealed,
+            original
+        );
+        assert!(
+            c.statuses()["apps-main"]
+                .error
+                .contains("no saved relaunch command")
+        );
+    }
+}
+
+#[test]
+fn unreadable_start_details_and_reused_pids_fail_closed_after_capture() {
+    for reuse in [false, true] {
+        let mut os = Fake::default();
+        os.add(SERVER, 0, &format!(r#""{SERVER}""#));
+        let mut c = fixture(os, vec![app(SERVER, true)]);
+        c.advance(Intent::Pause, &[], Duration::ZERO, &mut || false)
+            .unwrap();
+        c.runtime.os.unreadable = !reuse;
+        c.runtime.os.reuse_on_stop = reuse;
+        drive(&mut c, Intent::Pause, 0);
+        assert!(!c.pause_complete());
+        assert!(c.runtime.os.stopped.is_empty());
+        assert_eq!(c.runtime.os.processes.len(), 1);
+        assert!(c.journal().is_some());
+    }
+}
+
+#[test]
+fn each_child_and_root_stop_has_its_own_checkpoint() {
+    let mut os = Fake::default();
+    let root = os.add(SERVER, 0, &format!(r#""{SERVER}""#));
+    let child = os.add(SERVER, root, &format!(r#""{SERVER}" --worker"#));
+    let leaf = os.add(SERVER, child, &format!(r#""{SERVER}" --worker-child"#));
+    let mut c = fixture(os, vec![app(SERVER, true)]);
+    c.advance(Intent::Pause, &[], Duration::ZERO, &mut || false)
+        .unwrap();
+    for pid in [leaf, child, root] {
+        let before = c.runtime.os.stopped.len();
+        c.advance(Intent::Pause, &[], Duration::ZERO, &mut || false)
+            .unwrap();
+        assert_eq!(c.runtime.os.stopped.len(), before + 1);
+        assert_eq!(c.runtime.os.stopped.last(), Some(&pid));
+        assert!(c.store.journal().is_some());
+    }
+    drive(&mut c, Intent::Pause, 0);
+    assert!(c.pause_complete());
+    drive(&mut c, Intent::Restore, 1);
+    assert!(c.journal().is_none());
+    assert_eq!(c.runtime.os.launched.len(), 1);
+}
+
+#[test]
+fn unknown_inventory_never_proves_pause_or_restore_completion() {
+    for intent in [Intent::Pause, Intent::Restore] {
+        let mut os = Fake::default();
+        os.add(SERVER, 0, &format!(r#""{SERVER}""#));
+        let mut c = fixture(os, vec![app(SERVER, true)]);
+        if intent == Intent::Restore {
+            drive(&mut c, Intent::Pause, 0);
+        } else {
+            c.advance(Intent::Pause, &[], Duration::ZERO, &mut || false)
+                .unwrap();
+        }
+        c.runtime.os.unknown_inventory = true;
+        drive(&mut c, intent, 1);
+        assert!(c.journal().is_some());
+        assert_eq!(c.statuses()["apps-main"].state, State::Failed);
+        assert!(c.runtime.os.launched.is_empty());
+    }
+    for error in [0, windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED] {
+        assert!(native::enumeration_finished(error).is_err());
+    }
+    native::enumeration_finished(windows_sys::Win32::Foundation::ERROR_NO_MORE_FILES).unwrap();
+}
+
+#[test]
+fn drive_root_working_directory_survives_new_and_legacy_captures() {
+    for directory in [r"D:\", "D:"] {
+        let mut os = Fake::default();
+        os.add(SERVER, 0, &format!(r#""{SERVER}""#));
+        os.processes[0].1.directory = directory.into();
+        let mut c = fixture(os, vec![app(SERVER, true)]);
+        drive(&mut c, Intent::Pause, 0);
+        let sealed = &c.journal().unwrap().providers[0].payload.apps[0].sealed;
+        assert_eq!(open(sealed).unwrap().directory, directory);
+        drive(&mut c, Intent::Restore, 1);
+        assert!(c.journal().is_none());
+        assert_eq!(c.runtime.os.launched[0].directory, r"D:\");
     }
 }

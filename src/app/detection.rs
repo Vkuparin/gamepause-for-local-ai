@@ -11,11 +11,19 @@ use crate::{
 };
 use anyhow::{Result, bail};
 use std::{sync::Arc, time::Duration};
+pub(super) fn approved_ask(game: &ActiveGame, approved: &[ActiveGame]) -> bool {
+    approved.iter().any(|allowed| {
+        allowed.pid == game.pid
+            && allowed.created_at == game.created_at
+            && crate::discovery::same_path(&allowed.executable, &game.executable)
+            && crate::discovery::same_path(&allowed.path, &game.path)
+    })
+}
 pub(super) fn evidence_from(
     all: Vec<ActiveGame>,
     trigger_scanner: &Scanner,
     config: &Config,
-    ask_approved: bool,
+    ask_approved: &[ActiveGame],
 ) -> GameEvidence {
     let triggers = all
         .iter()
@@ -26,7 +34,7 @@ pub(super) fn evidence_from(
                     .ignored_games
                     .iter()
                     .any(|path| crate::discovery::same_path(path, &game.path))
-                && (ask_approved || !config.asks(&game.path))
+                && (approved_ask(game, ask_approved) || !config.asks(&game.path))
         })
         .cloned()
         .collect();
@@ -42,7 +50,7 @@ pub(super) fn scan_evidence(
         return None;
     }
     let trigger_scanner = Scanner::new(config.clone()).ok()?;
-    let evidence = evidence_from(all, &trigger_scanner, config, false);
+    let evidence = evidence_from(all, &trigger_scanner, config, &[]);
     evidence.reliable().then_some(evidence)
 }
 pub(super) fn recovery_scanner(config: &Config) -> Result<Scanner> {
@@ -62,7 +70,7 @@ pub(super) struct DetectionInput {
     pub(super) guarded: bool,
     pub(super) ready: bool,
     /// The user answered the current "ask" games with Pause.
-    pub(super) ask_approved: bool,
+    pub(super) ask_approved: Vec<ActiveGame>,
 }
 #[derive(Clone)]
 pub(super) struct DetectionFrame {
@@ -152,7 +160,9 @@ impl NativeDetection {
         };
         let mut asking = scanned
             .iter()
-            .filter(|game| input.config.asks(&game.path))
+            .filter(|game| {
+                input.config.asks(&game.path) && !approved_ask(game, &input.ask_approved)
+            })
             .map(|game| game.game.clone())
             .collect::<Vec<_>>();
         asking.dedup();
@@ -164,7 +174,7 @@ impl NativeDetection {
                     .ignored_games
                     .iter()
                     .any(|path| crate::discovery::same_path(path, &game.path))
-                    && (input.ask_approved || !input.config.asks(&game.path))
+                    && (approved_ask(game, &input.ask_approved) || !input.config.asks(&game.path))
             })
             .collect();
         let evidence = (input.ready
@@ -175,7 +185,7 @@ impl NativeDetection {
                     all.clone(),
                     &self.scanner,
                     &input.config,
-                    input.ask_approved,
+                    &input.ask_approved,
                 )
             })
             .filter(GameEvidence::reliable);

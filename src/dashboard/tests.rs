@@ -15,6 +15,21 @@ use crate::{
     provider::{Guarantee, Kind},
 };
 use std::sync::Arc;
+#[test]
+fn idle_dashboard_repaints_when_a_suggestion_or_prompt_changes() {
+    let mut s = Shared::default();
+    let before = bridge::fingerprint(&s);
+    assert_eq!(before, bridge::fingerprint(&s));
+    s.suggestion = Some(r"D:\Fixture\unknown-game.exe".into());
+    assert_ne!(before, bridge::fingerprint(&s));
+    s.suggestion = None;
+    assert_eq!(before, bridge::fingerprint(&s));
+    s.ask_prompt.push("Fixture game".into());
+    assert_ne!(before, bridge::fingerprint(&s));
+    s.ask_prompt.clear();
+    s.freed_bytes = 1024;
+    assert_ne!(before, bridge::fingerprint(&s));
+}
 fn fixture() -> Shared {
     let mut s = Shared {
         activity: Activity::Paused,

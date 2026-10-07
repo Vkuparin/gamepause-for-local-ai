@@ -5,7 +5,10 @@ use super::{Found, Launch};
 use anyhow::{Context, Result, bail};
 use std::ffi::c_void;
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM, WAIT_OBJECT_0},
+    Foundation::{
+        CloseHandle, ERROR_NO_MORE_FILES, FILETIME, GetLastError, HANDLE, HWND,
+        INVALID_HANDLE_VALUE, LPARAM, WAIT_OBJECT_0,
+    },
     System::{
         Diagnostics::{
             Debug::ReadProcessMemory,
@@ -15,7 +18,7 @@ use windows_sys::Win32::{
             },
         },
         Threading::{
-            CREATE_NEW_CONSOLE, CreateProcessW, OpenProcess, PROCESS_INFORMATION,
+            CREATE_NEW_CONSOLE, CreateProcessW, GetProcessTimes, OpenProcess, PROCESS_INFORMATION,
             PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
             PROCESS_TERMINATE, PROCESS_VM_READ, QueryFullProcessImageNameW, STARTF_USESHOWWINDOW,
             STARTUPINFOW, TerminateProcess, WaitForSingleObject,
@@ -51,14 +54,42 @@ fn open(pid: u32, access: u32) -> Result<Handle> {
     }
     Ok(Handle(handle))
 }
-fn image(pid: u32) -> Option<String> {
-    let handle = open(pid, PROCESS_QUERY_LIMITED_INFORMATION).ok()?;
+fn image(handle: &Handle) -> Result<String> {
     let mut buffer = vec![0u16; 32_768];
     let mut length = buffer.len() as u32;
-    (unsafe { QueryFullProcessImageNameW(handle.0, 0, buffer.as_mut_ptr(), &mut length) } != 0)
-        .then(|| String::from_utf16_lossy(&buffer[..length as usize]))
+    if unsafe { QueryFullProcessImageNameW(handle.0, 0, buffer.as_mut_ptr(), &mut length) } == 0 {
+        bail!("Process executable unavailable; residency is unknown");
+    }
+    Ok(String::from_utf16_lossy(&buffer[..length as usize]))
+}
+fn created_at(handle: &Handle) -> Result<u64> {
+    let mut created: FILETIME = unsafe { std::mem::zeroed() };
+    let mut exit = created;
+    let mut kernel = created;
+    let mut user = created;
+    if unsafe { GetProcessTimes(handle.0, &mut created, &mut exit, &mut kernel, &mut user) } == 0 {
+        bail!("Process identity unavailable; residency is unknown");
+    }
+    Ok(((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64)
+}
+fn verify_identity(handle: &Handle, process: &Found) -> Result<()> {
+    if created_at(handle)? != process.created_at
+        || !crate::discovery::same_path(&image(handle)?, &process.path)
+    {
+        bail!("Process identity changed; it was left alone");
+    }
+    Ok(())
+}
+pub(super) fn enumeration_finished(error: u32) -> Result<()> {
+    if error != ERROR_NO_MORE_FILES {
+        bail!("Process enumeration incomplete; residency is unknown");
+    }
+    Ok(())
 }
 pub fn running(paths: &[String]) -> Result<Vec<Found>> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
     let wanted = paths
         .iter()
         .map(|path| crate::discovery::canonical(path))
@@ -84,18 +115,25 @@ pub fn running(paths: &[String]) -> Result<Vec<Found>> {
             .unwrap_or(entry.szExeFile.len());
         let name = String::from_utf16_lossy(&entry.szExeFile[..length]).to_ascii_lowercase();
         // Open only processes whose file name matches a configured app.
-        if names.contains(&name)
-            && let Some(path) = image(entry.th32ProcessID)
-            && wanted.contains(&crate::discovery::canonical(&path))
-        {
-            found.push(Found {
-                pid: entry.th32ProcessID,
-                parent: entry.th32ParentProcessID,
-                path,
-            });
+        if names.contains(&name) {
+            let handle = open(entry.th32ProcessID, PROCESS_QUERY_LIMITED_INFORMATION)
+                .context("Matching process unavailable; residency is unknown")?;
+            let path = image(&handle)?;
+            if wanted.contains(&crate::discovery::canonical(&path)) {
+                if found.len() >= super::MAX_PROCESSES {
+                    bail!("Too many matching processes; residency is unknown");
+                }
+                found.push(Found {
+                    pid: entry.th32ProcessID,
+                    created_at: created_at(&handle)?,
+                    parent: entry.th32ParentProcessID,
+                    path,
+                });
+            }
         }
         more = unsafe { Process32NextW(snapshot.0, &mut entry) } != 0;
     }
+    enumeration_finished(unsafe { GetLastError() })?;
     Ok(found)
 }
 fn read<T: Copy>(process: HANDLE, address: usize) -> Result<T> {
@@ -146,8 +184,12 @@ fn text(process: HANDLE, address: usize) -> Result<String> {
 }
 /// Command line and working directory from the 64-bit process parameters.
 #[cfg(target_pointer_width = "64")]
-pub fn launch_details(pid: u32) -> Result<Launch> {
-    let handle = open(pid, PROCESS_QUERY_INFORMATION | PROCESS_VM_READ)?;
+pub fn launch_details(process: &Found) -> Result<Launch> {
+    let handle = open(process.pid, PROCESS_QUERY_INFORMATION | PROCESS_VM_READ)?;
+    verify_identity(&handle, process)?;
+    launch_from_handle(&handle)
+}
+fn launch_from_handle(handle: &Handle) -> Result<Launch> {
     let mut basic = [0usize; 6];
     if unsafe {
         NtQueryInformationProcess(
@@ -168,9 +210,7 @@ pub fn launch_details(pid: u32) -> Result<Launch> {
     }
     Ok(Launch {
         command_line,
-        directory: text(handle.0, parameters + 0x38)?
-            .trim_end_matches('\\')
-            .to_string(),
+        directory: text(handle.0, parameters + 0x38)?,
     })
 }
 /// The process to close and how many of its windows were asked.
@@ -190,12 +230,29 @@ unsafe extern "system" fn close_window(window: HWND, closing: LPARAM) -> i32 {
     }
     1
 }
-pub fn stop(pid: u32) -> Result<()> {
-    let Ok(handle) = open(pid, PROCESS_SYNCHRONIZE | PROCESS_TERMINATE) else {
-        // Already gone, or not ours to stop; the absence check decides.
+pub fn stop(process: &Found, expected: Option<&Launch>) -> Result<()> {
+    let access = PROCESS_SYNCHRONIZE
+        | PROCESS_TERMINATE
+        | PROCESS_QUERY_LIMITED_INFORMATION
+        | if expected.is_some() {
+            PROCESS_QUERY_INFORMATION | PROCESS_VM_READ
+        } else {
+            0
+        };
+    let handle = open(process.pid, access)?;
+    verify_identity(&handle, process)?;
+    if let Some(expected) = expected
+        && !super::same_launch(&launch_from_handle(&handle)?, expected)
+    {
+        bail!("Process start details changed; it was left running");
+    }
+    if unsafe { WaitForSingleObject(handle.0, 0) } == WAIT_OBJECT_0 {
         return Ok(());
+    }
+    let mut closing = Closing {
+        pid: process.pid,
+        asked: 0,
     };
-    let mut closing = Closing { pid, asked: 0 };
     unsafe {
         EnumWindows(Some(close_window), &raw mut closing as LPARAM);
         // A console server owns no window (its console belongs to the

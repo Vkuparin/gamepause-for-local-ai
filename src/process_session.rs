@@ -19,10 +19,12 @@ use serde::{Deserialize, Serialize};
 /// Fixed route identity: this provider controls local processes, not a port.
 pub const ROUTE: &str = "local-processes";
 const MAX_APPS: usize = 64;
+const MAX_PROCESSES: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Found {
     pub pid: u32,
+    pub created_at: u64,
     pub parent: u32,
     pub path: String,
 }
@@ -37,9 +39,9 @@ pub struct Launch {
 pub trait Os {
     /// Every running process whose image is one of `paths`.
     fn running(&mut self, paths: &[String]) -> Result<Vec<Found>>;
-    fn launch_details(&mut self, pid: u32) -> Result<Launch>;
+    fn launch_details(&mut self, process: &Found) -> Result<Launch>;
     /// Ask the process to close, then end it. Returns once it has exited.
-    fn stop(&mut self, pid: u32) -> Result<()>;
+    fn stop(&mut self, process: &Found, expected: Option<&Launch>) -> Result<()>;
     fn launch(&mut self, launch: &Launch) -> Result<()>;
 }
 
@@ -79,6 +81,9 @@ impl Snapshot {
     }
     pub fn units(&self) -> usize {
         self.apps.len()
+    }
+    pub fn pause_units(&self) -> usize {
+        self.apps.len().saturating_add(MAX_PROCESSES)
     }
     pub fn validate(&self) -> Result<()> {
         if self.version != 1
@@ -156,12 +161,26 @@ fn roots<'a>(found: &'a [Found], path: &str) -> Vec<&'a Found> {
         .iter()
         .filter(same)
         .filter(|process| {
-            !found
-                .iter()
-                .filter(same)
-                .any(|other| other.pid == process.parent && other.pid != process.pid)
+            !found.iter().filter(same).any(|other| {
+                other.pid == process.parent
+                    && other.pid != process.pid
+                    && other.created_at <= process.created_at
+            })
         })
         .collect()
+}
+fn same_launch(a: &Launch, b: &Launch) -> bool {
+    a.command_line == b.command_line && crate::discovery::same_path(&a.directory, &b.directory)
+}
+// Older captures stripped the separator from a drive root. No other drive-relative
+// directory could be produced by that capture path.
+fn saved_launch(sealed: &str) -> Result<Launch> {
+    let mut launch = open(sealed)?;
+    let bytes = launch.directory.as_bytes();
+    if bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        launch.directory.push('\\');
+    }
+    Ok(launch)
 }
 impl<O: Os> Adapter<O> {
     pub fn new(os: O, binding: Binding, apps: Vec<ProcessApp>) -> Result<Self> {
@@ -212,7 +231,7 @@ impl<O: Os> Runtime for Adapter<O> {
             for process in roots(&found, &configured.path) {
                 // Never stop what could not be started again when asked to.
                 let sealed = if configured.relaunch {
-                    let launch = self.os.launch_details(process.pid).with_context(|| {
+                    let launch = self.os.launch_details(process).with_context(|| {
                         format!(
                             "Could not read how {} was started; it was left running",
                             configured.name
@@ -315,13 +334,60 @@ impl<O: Os> Runtime for Adapter<O> {
         let mut complete = false;
         match work.operation {
             Operation::Stop(index) => {
-                // Stop by path, not by the captured process: a re-pause after an
-                // interrupted restore must also stop what was relaunched.
-                let path = snapshot.apps[index].path.clone();
-                for process in self.os.running(std::slice::from_ref(&path))? {
-                    self.os.stop(process.pid)?;
+                let app = &snapshot.apps[index];
+                let found = self.os.running(std::slice::from_ref(&app.path))?;
+                if found.len() > MAX_PROCESSES {
+                    bail!("Too many process instances; pause held and recovery retained");
                 }
-                snapshot.apps[index].stage = Stage::Stopped;
+                let mut details = Vec::new();
+                if app.relaunch {
+                    // Re-pause may see recreated instances, but never stop an extra
+                    // root or a changed command with no original relaunch obligation.
+                    let mut saved = snapshot
+                        .apps
+                        .iter()
+                        .filter(|other| {
+                            other.relaunch && crate::discovery::same_path(&other.path, &app.path)
+                        })
+                        .map(|other| saved_launch(&other.sealed))
+                        .collect::<Result<Vec<_>>>()?;
+                    for process in &found {
+                        details.push(self.os.launch_details(process).context(
+                            "Process start details unavailable; pause held and recovery retained",
+                        )?);
+                    }
+                    let roots = roots(&found, &app.path);
+                    if !found.is_empty() && roots.is_empty() {
+                        bail!("Process parent identity is ambiguous; pause held");
+                    }
+                    for root in roots {
+                        let position = found.iter().position(|process| process == root).unwrap();
+                        let Some(saved_index) = saved
+                            .iter()
+                            .position(|launch| same_launch(launch, &details[position]))
+                        else {
+                            bail!(
+                                "A new or changed process has no saved relaunch command; it was left running"
+                            );
+                        };
+                        saved.swap_remove(saved_index);
+                    }
+                }
+                // Stop children before their root, one process per persisted unit.
+                if let Some(position) = found.iter().position(|process| {
+                    !found.iter().any(|child| {
+                        child.parent == process.pid
+                            && child.pid != process.pid
+                            && process.created_at <= child.created_at
+                    })
+                }) {
+                    self.os.stop(&found[position], details.get(position))?;
+                } else if !found.is_empty() {
+                    bail!("Process parent identity is ambiguous; pause held");
+                }
+                if found.len() <= 1 {
+                    snapshot.apps[index].stage = Stage::Stopped;
+                }
             }
             Operation::VerifyPause => {
                 if let Some(left) = self.running(&snapshot)?.first() {
@@ -342,7 +408,7 @@ impl<O: Os> Runtime for Adapter<O> {
                     .count();
                 let found = self.os.running(std::slice::from_ref(&app.path))?;
                 if roots(&found, &app.path).len() < wanted {
-                    let launch = open(&app.sealed).with_context(|| {
+                    let launch = saved_launch(&app.sealed).with_context(|| {
                         format!(
                             "{} was stopped and could not be restarted: its saved start command cannot be read on this Windows account",
                             app.name
@@ -390,11 +456,11 @@ impl Os for Windows {
     fn running(&mut self, paths: &[String]) -> Result<Vec<Found>> {
         native::running(paths)
     }
-    fn launch_details(&mut self, pid: u32) -> Result<Launch> {
-        native::launch_details(pid)
+    fn launch_details(&mut self, process: &Found) -> Result<Launch> {
+        native::launch_details(process)
     }
-    fn stop(&mut self, pid: u32) -> Result<()> {
-        native::stop(pid)
+    fn stop(&mut self, process: &Found, expected: Option<&Launch>) -> Result<()> {
+        native::stop(process, expected)
     }
     fn launch(&mut self, launch: &Launch) -> Result<()> {
         native::launch(launch)
