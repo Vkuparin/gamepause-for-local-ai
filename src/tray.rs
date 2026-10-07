@@ -1,3 +1,18 @@
+//! The notification-area icon, its menu and timer. The window callback, the
+//! menu-session lifetime and the timer order stay together in this file; the
+//! children hold the icon resources, notification delivery and shell commands.
+
+mod icons;
+mod notifications;
+mod shell;
+
+pub use icons::icon_tint;
+pub use notifications::{Severity, ToastSpec, beep_code, toast_spec};
+pub use shell::{
+    open_path, request_folder, request_startup, set_startup, shell_execute_failed, startup_command,
+    startup_enabled,
+};
+
 use crate::{
     app::{Action, SharedState},
     control::{Activity, CoreCommand},
@@ -6,6 +21,8 @@ use crate::{
     wide,
 };
 use anyhow::{Context, Result};
+use icons::{Icons, icon};
+use notifications::{NativeNotifications, notification_flags};
 use std::{
     cell::RefCell,
     path::{Path, PathBuf},
@@ -17,11 +34,7 @@ use std::{
 };
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
-    Graphics::{
-        Dwm::*,
-        Gdi::{CreateBitmap, DeleteObject},
-    },
-    System::Diagnostics::Debug::MessageBeep,
+    Graphics::Dwm::*,
     System::LibraryLoader::GetModuleHandleW,
     UI::{
         Input::KeyboardAndMouse::{MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey},
@@ -62,44 +75,12 @@ fn sync_hotkey(hwnd: HWND, shared: &crate::app::SharedState) {
     }
 }
 const SHOW_DASHBOARD: u32 = WM_APP + 2;
-const STARTUP_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 static WINDOW: AtomicIsize = AtomicIsize::new(0);
 static FINISHED: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 static MENU_TIMER_TICKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 #[cfg(test)]
 static MENU_OPENINGS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-/// The three state-colored tray icons, precomputed once so the timer path
-/// never calls GDI. `Idle` is the base glyph; `Paused` and `Attention` are
-/// tinted variants (P1-6).
-#[derive(Clone)]
-struct Icons {
-    idle: HICON,
-    paused: HICON,
-    attention: HICON,
-}
-impl Icons {
-    fn for_kind(&self, kind: StateKind) -> HICON {
-        match kind {
-            StateKind::Idle => self.idle,
-            StateKind::Paused => self.paused,
-            StateKind::Attention => self.attention,
-        }
-    }
-    unsafe fn destroy(&self) {
-        unsafe {
-            if !self.idle.is_null() {
-                DestroyIcon(self.idle);
-            }
-            if !self.paused.is_null() {
-                DestroyIcon(self.paused);
-            }
-            if !self.attention.is_null() {
-                DestroyIcon(self.attention);
-            }
-        }
-    }
-}
 #[derive(Clone)]
 struct UI {
     shared: SharedState,
@@ -213,116 +194,6 @@ pub fn info(message: &str) {
         );
     }
 }
-pub fn startup_enabled() -> bool {
-    RegKey::predef(HKEY_CURRENT_USER)
-        .open_subkey(STARTUP_KEY)
-        .and_then(|k| k.get_value::<String, _>("GamePause"))
-        .is_ok()
-}
-pub fn startup_command(executable: &Path, folder: &Path) -> String {
-    format!(
-        "\"{}\" --background --data-dir \"{}\"",
-        executable.display(),
-        folder.display()
-    )
-}
-pub fn set_startup(enabled: bool, folder: &Path) -> Result<()> {
-    let (root, _) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(STARTUP_KEY)?;
-    if enabled {
-        root.set_value(
-            "GamePause",
-            &startup_command(&std::env::current_exe()?, folder),
-        )?;
-    } else {
-        match root.delete_value("GamePause") {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
-    }
-    Ok(())
-}
-/// Pure: classify a `ShellExecuteW` return value (an `HINSTANCE`,
-/// `*mut c_void`). Per the Win32 docs a successful call returns a handle whose
-/// value is greater than 32; `0` and the range `1..=32` are documented failure
-/// codes (S_OK, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ...). This is the
-/// testable core of "open_path surfaces a visible error on failure" (P1-7).
-#[must_use]
-pub fn shell_execute_failed(return_value: *mut core::ffi::c_void) -> bool {
-    return_value as isize <= 32
-}
-
-/// Open a folder in the default file manager. A `ShellExecuteW` failure is
-/// surfaced as a visible error instead of being silently swallowed (P1-7).
-pub fn open_path(path: &Path) -> Result<()> {
-    let operation = wide("open");
-    let display = path.to_string_lossy();
-    let path_w = wide(&display);
-    let result = unsafe {
-        ShellExecuteW(
-            null_mut(),
-            operation.as_ptr(),
-            path_w.as_ptr(),
-            null(),
-            null(),
-            SW_SHOWNORMAL,
-        )
-    };
-    if shell_execute_failed(result) {
-        anyhow::bail!(
-            "Could not open this folder: {display} (shell code {})",
-            result as isize
-        );
-    }
-    Ok(())
-}
-pub fn request_startup(state: &SharedState, enabled: bool, folder: &Path) {
-    if !crate::ui_commands::allowed(state, Command::Startup) {
-        return;
-    }
-    use crate::commands::Outcome;
-    if startup_enabled() == enabled {
-        crate::app::local_result(
-            state,
-            Outcome::NoChange,
-            "Windows startup preference unchanged.",
-        );
-        return;
-    }
-    match set_startup(enabled, folder) {
-        Ok(()) => crate::app::local_result(
-            state,
-            Outcome::Completed,
-            if enabled {
-                "Start with Windows enabled."
-            } else {
-                "Start with Windows disabled."
-            },
-        ),
-        Err(error) => crate::app::local_result(
-            state,
-            Outcome::Failed,
-            format!("Could not save Windows startup preference: {error:#}"),
-        ),
-    }
-}
-pub fn request_folder(state: &SharedState, folder: &Path) {
-    if !crate::ui_commands::allowed(state, Command::OpenFolder) {
-        return;
-    }
-    match open_path(folder) {
-        Ok(()) => crate::app::local_result(
-            state,
-            crate::commands::Outcome::Completed,
-            "Logs and status folder opened.",
-        ),
-        Err(error) => crate::app::local_result(
-            state,
-            crate::commands::Outcome::Failed,
-            format!("Could not open logs folder: {error:#}"),
-        ),
-    }
-}
 
 /// The tray carries quick controls only. Tools and settings stay in the dashboard.
 fn command_items(state: &crate::app::Shared) -> Vec<(usize, String, u32)> {
@@ -361,17 +232,6 @@ fn command_items(state: &crate::app::Shared) -> Vec<(usize, String, u32)> {
         (Command::Quit as usize, "Quit".into(), 0),
     ]
 }
-/// The tray glyph's solid fill color per state. Pure + unit-testable: this is
-/// the "state -> icon variant" mapping P1-6 wants asserted without Win32.
-/// Bytes are in bitmap order, blue-green-red: `Idle` is blue, `Paused` is
-/// orange and `Attention` is a warning red that pops against the dark tray.
-pub fn icon_tint(kind: StateKind) -> [u8; 3] {
-    match kind {
-        StateKind::Idle => [220, 168, 72],
-        StateKind::Paused => [56, 132, 255],
-        StateKind::Attention => [62, 62, 230],
-    }
-}
 /// Read the OS app-color preference. `true` = dark mode. The key/value is the
 /// documented `HKCU\...\Themes\Personalize\AppsUseLightTheme` DWORD; a missing
 /// value or read error is treated as "light" (the Windows default) so the app
@@ -409,37 +269,6 @@ pub(crate) unsafe fn apply_theme_mode(hwnd: HWND, dark: bool) {
             &use_dark as *const u32 as *const core::ffi::c_void,
             size_of::<u32>() as u32,
         );
-    }
-}
-/// Draw the pause-bar glyph in `color` and return an HICON. The bars stay
-/// white so the state is carried by the background tint alone.
-unsafe fn icon(color: [u8; 3]) -> HICON {
-    let mut pixels = vec![0u8; 32 * 32 * 4];
-    for y in 0..32 {
-        for x in 0..32 {
-            let offset = (y * 32 + x) * 4;
-            if (4..28).contains(&x) && (4..28).contains(&y) {
-                pixels[offset..offset + 4].copy_from_slice(&[color[0], color[1], color[2], 255]);
-            }
-            if (9..23).contains(&y) && ((10..14).contains(&x) || (18..22).contains(&x)) {
-                pixels[offset..offset + 4].copy_from_slice(&[255, 255, 255, 255]);
-            }
-        }
-    }
-    unsafe {
-        let color = CreateBitmap(32, 32, 1, 32, pixels.as_ptr().cast());
-        let mask = CreateBitmap(32, 32, 1, 1, [0u8; 128].as_ptr().cast());
-        let info = ICONINFO {
-            fIcon: 1,
-            xHotspot: 0,
-            yHotspot: 0,
-            hbmMask: mask,
-            hbmColor: color,
-        };
-        let result = CreateIconIndirect(&info);
-        DeleteObject(color);
-        DeleteObject(mask);
-        result
     }
 }
 unsafe fn notification(hwnd: HWND, operation: u32, ui: &UI) {
@@ -505,52 +334,6 @@ fn activity_kind(activity: Activity) -> StateKind {
         _ => StateKind::Idle,
     }
 }
-/// Toast severity. Pure data so the mapping is unit-testable (P1-5 acceptance).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Severity {
-    /// Pause-success or restore-success — the "good" system sound.
-    Success,
-    /// Any failure — the warning system sound.
-    Error,
-}
-/// Titles and severity for typed completion/failure events. The bounded queue
-/// supplies factual completion text or the current failure message.
-pub struct ToastSpec {
-    pub title: &'static str,
-    pub severity: Severity,
-}
-pub fn toast_spec(kind: StateKind) -> ToastSpec {
-    match kind {
-        StateKind::Attention => ToastSpec {
-            title: "GamePause needs attention",
-            severity: Severity::Error,
-        },
-        StateKind::Paused => ToastSpec {
-            title: "GamePause",
-            severity: Severity::Success,
-        },
-        StateKind::Idle => ToastSpec {
-            title: "GamePause",
-            severity: Severity::Success,
-        },
-    }
-}
-/// Sound-only mode uses this system sound. Visual notifications use Windows sound.
-pub fn beep_code(kind: StateKind) -> u32 {
-    match kind {
-        StateKind::Attention => MB_ICONASTERISK,
-        // Pause-success and restore-success are both "good" → the OK sound.
-        StateKind::Idle | StateKind::Paused => MB_OK,
-    }
-}
-fn notification_flags(kind: StateKind, sound: bool) -> u32 {
-    (if kind == StateKind::Attention {
-        NIIF_ERROR
-    } else {
-        NIIF_INFO
-    }) | NIIF_RESPECT_QUIET_TIME
-        | if sound { 0 } else { NIIF_NOSOUND }
-}
 unsafe fn state_toast(hwnd: HWND, message: &str, kind: StateKind, sound: bool) -> bool {
     unsafe {
         let spec = toast_spec(kind);
@@ -566,24 +349,6 @@ unsafe fn state_toast(hwnd: HWND, message: &str, kind: StateKind, sound: bool) -
         let info: Vec<_> = message.encode_utf16().take(255).collect();
         data.szInfo[..info.len()].copy_from_slice(&info);
         Shell_NotifyIconW(NIM_MODIFY, &data) != 0
-    }
-}
-struct NativeNotifications {
-    hwnd: HWND,
-}
-fn notification_kind(kind: crate::notifications::Kind) -> StateKind {
-    match kind {
-        crate::notifications::Kind::Paused => StateKind::Paused,
-        crate::notifications::Kind::Restored | crate::notifications::Kind::Ask => StateKind::Idle,
-        crate::notifications::Kind::Failure => StateKind::Attention,
-    }
-}
-impl crate::notifications::Sink for NativeNotifications {
-    fn toast(&mut self, event: &crate::notifications::Event, sound: bool) -> bool {
-        unsafe { state_toast(self.hwnd, &event.text, notification_kind(event.kind), sound) }
-    }
-    fn sound(&mut self, event: &crate::notifications::Event) -> bool {
-        unsafe { MessageBeep(beep_code(notification_kind(event.kind))) != 0 }
     }
 }
 unsafe fn menu(hwnd: HWND, ui: &UI) {
@@ -970,469 +735,6 @@ pub fn run(shared: SharedState, tx: Sender<Action>, folder: PathBuf, show: bool)
 fn bail_message() -> Result<()> {
     Err(std::io::Error::last_os_error()).context("Windows message loop failed")
 }
+
 #[cfg(test)]
-mod tests {
-    #[test]
-    fn manual_hold_has_one_resume_action_and_no_restore_or_duplicate_resume() {
-        let state = crate::app::Shared {
-            active_mode: true,
-            discovery_ready: true,
-            detection_ok: true,
-            manual_pause: true,
-            pending: true,
-            activity: Activity::ManualHold,
-            ..Default::default()
-        };
-        let items = command_items(&state);
-        assert_eq!(items.iter().filter(|item| item.1 == "Resume AI").count(), 1);
-        assert!(!items.iter().any(|item| item.1.contains("Restore")));
-        assert_eq!(
-            items
-                .iter()
-                .find(|item| item.0 == Command::Pause as usize)
-                .unwrap()
-                .2,
-            MF_GRAYED
-        );
-        assert_eq!(
-            items
-                .iter()
-                .find(|item| item.0 == Command::Resume as usize)
-                .unwrap()
-                .2,
-            0
-        );
-    }
-
-    #[test]
-    fn menu_is_the_same_quick_controls_with_or_without_advanced() {
-        let mut state = crate::app::Shared::default();
-        let basic = crate::dashboard::shared_command_ids(false);
-        for advanced in [false, true] {
-            state.config.advanced_settings_visible = advanced;
-            let items = super::command_items(&state);
-            let ids = items
-                .iter()
-                .filter_map(|item| crate::ui_commands::Command::from_id(item.0 as i32))
-                .collect::<Vec<_>>();
-            assert_eq!(
-                ids,
-                [
-                    crate::ui_commands::Command::Automation,
-                    crate::ui_commands::Command::Pause,
-                    crate::ui_commands::Command::Resume,
-                    crate::ui_commands::Command::OpenDashboard,
-                    crate::ui_commands::Command::Quit,
-                ]
-            );
-            // Every tray action has a dashboard counterpart that needs no Advanced toggle.
-            assert!(ids.iter().all(|command| {
-                *command == crate::ui_commands::Command::OpenDashboard
-                    || basic.contains(&(*command as i32))
-            }));
-            // No informational rows hide among the commands.
-            assert!(
-                items
-                    .iter()
-                    .all(|item| item.0 != 0 || item.2 == MF_SEPARATOR)
-            );
-        }
-    }
-    use super::*;
-    #[test]
-    fn tray_uses_confirmed_activity_not_pending_recovery() {
-        assert_eq!(activity_kind(Activity::Paused), StateKind::Paused);
-        assert_eq!(activity_kind(Activity::ManualHold), StateKind::Paused);
-        assert_eq!(activity_kind(Activity::Countdown), StateKind::Paused);
-        assert_eq!(activity_kind(Activity::Recovery), StateKind::Attention);
-        assert_eq!(
-            activity_kind(Activity::PartialFailure),
-            StateKind::Attention
-        );
-        assert_eq!(activity_kind(Activity::Unloading), StateKind::Idle);
-        assert_eq!(activity_kind(Activity::Capturing), StateKind::Idle);
-        assert_eq!(activity_kind(Activity::Watching), StateKind::Idle);
-    }
-    #[test]
-    fn toast_spec_returns_right_title_and_severity_per_state() {
-        // Pause-success and restore-success → the "good" sound, plain title.
-        let paused = toast_spec(StateKind::Paused);
-        assert_eq!(paused.title, "GamePause");
-        assert_eq!(paused.severity, Severity::Success);
-        let idle = toast_spec(StateKind::Idle);
-        assert_eq!(idle.title, "GamePause");
-        assert_eq!(idle.severity, Severity::Success);
-        // Restore/pause-failure → error style, attention title.
-        let attention = toast_spec(StateKind::Attention);
-        assert_eq!(attention.title, "GamePause needs attention");
-        assert_eq!(attention.severity, Severity::Error);
-    }
-    #[test]
-    fn beep_code_maps_success_to_ok_and_failure_to_warning() {
-        assert_eq!(beep_code(StateKind::Idle), MB_OK);
-        assert_eq!(beep_code(StateKind::Paused), MB_OK);
-        assert_eq!(beep_code(StateKind::Attention), MB_ICONASTERISK);
-    }
-    #[test]
-    fn system_is_dark_reads_a_consistent_binary_preference() {
-        // The registry is the single source of truth; two reads agree.
-        let a = super::system_is_dark();
-        let b = super::system_is_dark();
-        assert_eq!(a, b, "two consecutive reads of the OS theme must agree");
-    }
-    #[test]
-    fn apply_theme_does_not_panic_on_null_hwnd() {
-        // DwmSetWindowAttribute on a null HWND is a documented no-op; the
-        // production call site is the same code path, so it must not panic.
-        unsafe { super::apply_theme(std::ptr::null_mut()) };
-    }
-    #[test]
-    fn only_real_or_lasting_problems_are_announced_as_failures() {
-        // A failed operation and saved AI found waiting are announced at once.
-        assert!(failure_due(Activity::PartialFailure, "Restore failed", 0));
-        assert!(failure_due(
-            Activity::Recovery,
-            "Saved AI is waiting to be restored; restoring in 30s",
-            0
-        ));
-        assert!(failure_due(
-            Activity::Watching,
-            "Needs attention — repeated monitoring failures: x",
-            0
-        ));
-        // Waking from sleep is a short hold, with or without saved AI.
-        let wake = "Power state changed; fresh game detection is required before AI control.";
-        assert!(!failure_due(Activity::DetectionUnavailable, wake, 1));
-        assert!(!failure_due(
-            Activity::Recovery,
-            "Windows resumed; saved AI recovery in 30s after fresh game detection.",
-            0
-        ));
-        // Detection that stays down is announced once it has lasted.
-        assert!(!failure_due(
-            Activity::DetectionUnavailable,
-            wake,
-            DETECTION_DOWN_TICKS - 1
-        ));
-        assert!(failure_due(
-            Activity::DetectionUnavailable,
-            wake,
-            DETECTION_DOWN_TICKS
-        ));
-        assert!(!failure_due(Activity::Unknown, "Starting GamePause", 0));
-        assert!(!failure_due(Activity::Paused, "AI paused for gaming", 0));
-    }
-    #[test]
-    fn icon_tint_maps_state_to_distinct_colors() {
-        // The three states must be visually distinct (P1-6 acceptance: the
-        // state→icon mapping is asserted without Win32).
-        let idle = icon_tint(StateKind::Idle);
-        let paused = icon_tint(StateKind::Paused);
-        let attention = icon_tint(StateKind::Attention);
-        assert_ne!(idle, paused, "idle and paused icons must differ");
-        assert_ne!(idle, attention, "idle and attention icons must differ");
-        assert_ne!(paused, attention, "paused and attention icons must differ");
-        // DIB pixels are BGR. The attention color is a warning red (low B/G,
-        // high R) so it pops against the dark tray and cannot pass for idle.
-        assert!(attention[2] > 180 && attention[1] < 120 && attention[0] < 120);
-        // Paused uses orange with a dominant red byte; idle is blue.
-        assert!(paused[2] > paused[0] && paused[2] > paused[1]);
-        assert!(idle[0] > idle[2]);
-    }
-    #[test]
-    fn timer_can_reenter_while_menu_context_is_alive() {
-        use crate::app::Shared;
-        use std::sync::{Arc, Mutex, mpsc};
-        let (tx, rx) = mpsc::channel();
-        let shared = Arc::new(Mutex::new(Shared {
-            commands: Default::default(),
-            activity: Activity::PartialFailure,
-            restore_offer: None,
-            coexistence: false,
-            restore_feedback: None,
-            detection_ok: false,
-            message: "Needs attention: simulated failure".into(),
-            disabled: false,
-            manual_pause: false,
-            pending: true,
-            active_mode: false,
-            config: crate::config::Config::default(),
-            games: vec![],
-            active_games: vec![],
-            running_apps: vec![],
-            discovery_errors: Default::default(),
-            settings_error: String::new(),
-            revision: 0,
-            discovery_ready: false,
-            verify_report: None,
-            verifying: false,
-            pause_completions: 0,
-            restore_completions: 0,
-            provider_statuses: vec![],
-            doctor_report: None,
-            doctor_pending: false,
-            lm_missing: false,
-            lm_running: false,
-            ollama_running: false,
-            ollama_installed: false,
-            freed_bytes: 0,
-            ask_prompt: vec![],
-            suggestion: None,
-            power: Default::default(),
-        }));
-        {
-            let mut state = shared.lock().unwrap();
-            state.config.notifications_enabled = false;
-            state.config.sound_enabled = false;
-        }
-        UI_STATE.with(|state| {
-            *state.borrow_mut() = Some(UI {
-                shared: shared.clone(),
-                tx,
-                folder: PathBuf::new(),
-                icons: Icons {
-                    idle: null_mut(),
-                    paused: null_mut(),
-                    attention: null_mut(),
-                },
-                taskbar_message: WM_APP + 9,
-                shown: None,
-                detection_down: 0,
-                notifications: crate::notifications::Queue::default(),
-                clock: std::time::Instant::now(),
-
-                menu_open: false,
-            })
-        });
-        let session = begin_menu().expect("first menu opens");
-        assert!(
-            begin_menu().is_none(),
-            "nested clicks cannot start another menu"
-        );
-        // TrackPopupMenu invokes this callback while its caller is still active.
-        unsafe {
-            window_proc(null_mut(), WM_TIMER, 1, 0);
-        }
-        // The nested timer could write the state it sent to the shell.
-        assert_eq!(
-            ui_snapshot().unwrap().shown,
-            Some((
-                StateKind::Attention,
-                "Needs attention: simulated failure".to_string()
-            ))
-        );
-        shared.lock().unwrap().message = "AI available".into();
-        shared.lock().unwrap().activity = Activity::Watching;
-        shared.lock().unwrap().pending = false;
-        unsafe {
-            window_proc(null_mut(), WM_TIMER, 1, 0);
-        }
-        assert_eq!(
-            ui_snapshot().unwrap().shown,
-            Some((StateKind::Idle, "AI available".to_string()))
-        );
-        drop(session);
-        assert!(begin_menu().is_some(), "menu opens again after dismissal");
-        shared.lock().unwrap().detection_ok = true;
-        assert_eq!(
-            unsafe { window_proc_inner(null_mut(), WM_POWERBROADCAST, 4, 0) },
-            1
-        );
-        assert!(shared.lock().unwrap().power.snapshot().suspended);
-        assert!(!shared.lock().unwrap().detection_ok);
-        assert!(matches!(rx.try_recv(), Ok(Action::PowerChanged)));
-        assert_eq!(
-            unsafe { window_proc_inner(null_mut(), WM_POWERBROADCAST, 18, 0) },
-            1
-        );
-        assert!(!shared.lock().unwrap().power.snapshot().suspended);
-        let generation = shared.lock().unwrap().power.snapshot().generation;
-        assert!(matches!(rx.try_recv(), Ok(Action::PowerChanged)));
-        unsafe {
-            window_proc_inner(null_mut(), WM_POWERBROADCAST, 7, 0);
-        }
-        assert_eq!(
-            shared.lock().unwrap().power.snapshot().generation,
-            generation
-        );
-        assert!(
-            rx.try_recv().is_err(),
-            "user-interaction resume must not reset grace a second time"
-        );
-        UI_STATE.with(|state| state.borrow_mut().take());
-    }
-    #[test]
-    #[ignore = "requires an interactive Windows desktop; opens only the test application's menus"]
-    fn native_popup_survives_repeated_timer_reentry() {
-        use crate::app::Shared;
-        use std::sync::{Arc, Mutex, mpsc};
-        use std::time::{Duration, Instant};
-        FINISHED.store(false, Ordering::Relaxed);
-        MENU_TIMER_TICKS.store(0, Ordering::Relaxed);
-        MENU_OPENINGS.store(0, Ordering::Relaxed);
-        let shared = Arc::new(Mutex::new(Shared {
-            commands: Default::default(),
-            activity: Activity::Observation,
-            restore_offer: None,
-            coexistence: false,
-            restore_feedback: None,
-            detection_ok: false,
-            message: "Tray regression test (observation only)".into(),
-            disabled: false,
-            manual_pause: false,
-            pending: false,
-            active_mode: false,
-            config: crate::config::Config::default(),
-            games: vec![],
-            active_games: vec![],
-            running_apps: vec![],
-            discovery_errors: Default::default(),
-            settings_error: String::new(),
-            revision: 0,
-            discovery_ready: false,
-            verify_report: None,
-            verifying: false,
-            pause_completions: 0,
-            restore_completions: 0,
-            provider_statuses: vec![],
-            doctor_report: None,
-            doctor_pending: false,
-            lm_missing: false,
-            lm_running: false,
-            ollama_running: false,
-            ollama_installed: false,
-            freed_bytes: 0,
-            ask_prompt: vec![],
-            suggestion: None,
-            power: Default::default(),
-        }));
-        let (tx, _rx) = mpsc::channel();
-        {
-            let mut state = shared.lock().unwrap();
-            state.config.notifications_enabled = false;
-            state.config.sound_enabled = false;
-        }
-        let driver_state = shared.clone();
-        let driver = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while WINDOW.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            let hwnd = WINDOW.load(Ordering::Relaxed) as HWND;
-            assert!(!hwnd.is_null(), "test window did not initialize");
-            unsafe {
-                SendMessageW(hwnd, WM_POWERBROADCAST, 4, 0);
-            }
-            assert!(driver_state.lock().unwrap().power.snapshot().suspended);
-            unsafe {
-                SendMessageW(hwnd, WM_POWERBROADCAST, 18, 0);
-            }
-            let resumed = driver_state.lock().unwrap().power.snapshot();
-            assert!(!resumed.suspended);
-            unsafe {
-                SendMessageW(hwnd, WM_POWERBROADCAST, 7, 0);
-            }
-            assert_eq!(driver_state.lock().unwrap().power.snapshot(), resumed);
-            let mut counts = Vec::new();
-            for iteration in 0..3 {
-                let before = MENU_TIMER_TICKS.load(Ordering::Relaxed);
-                unsafe {
-                    PostMessageW(hwnd, CALLBACK, 0, WM_RBUTTONUP as LPARAM);
-                }
-                driver_state
-                    .lock()
-                    .unwrap()
-                    .config
-                    .advanced_settings_visible = iteration % 2 == 0;
-                driver_state.lock().unwrap().config.appearance = if iteration % 2 == 0 {
-                    crate::config::Appearance::Dark
-                } else {
-                    crate::config::Appearance::Light
-                };
-                let deadline = Instant::now() + Duration::from_secs(10);
-                while MENU_TIMER_TICKS.load(Ordering::Relaxed) < before + 2
-                    && Instant::now() < deadline
-                {
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                counts.push(MENU_TIMER_TICKS.load(Ordering::Relaxed) - before);
-                unsafe {
-                    PostMessageW(hwnd, WM_CANCELMODE, 0, 0);
-                }
-                std::thread::sleep(Duration::from_millis(300));
-            }
-            request_exit();
-            counts
-        });
-        run(shared, tx, PathBuf::from("."), false).unwrap();
-        let counts = driver.join().unwrap();
-        assert_eq!(
-            MENU_OPENINGS.load(Ordering::Relaxed),
-            3,
-            "three distinct menus must open"
-        );
-        assert!(
-            counts.iter().all(|ticks| *ticks >= 2),
-            "each real popup must survive at least two timer callbacks: {counts:?}"
-        );
-        FINISHED.store(false, Ordering::Relaxed);
-    }
-    #[test]
-    fn startup_keeps_custom_folder() {
-        let command = startup_command(
-            Path::new(r"C:\Program Files\GamePause\GamePause.exe"),
-            Path::new(r"D:\AI Data\GamePause"),
-        );
-        assert_eq!(
-            command,
-            r#""C:\Program Files\GamePause\GamePause.exe" --background --data-dir "D:\AI Data\GamePause""#
-        );
-    }
-
-    #[test]
-    fn open_path_failure_is_classified_as_a_visible_error() {
-        // ShellExecuteW returns an HINSTANCE > 32 on success; 0 and 1..=32 are
-        // documented failure codes. The classifier is the testable core of
-        // "open_path surfaces a visible error on failure" (P1-7).
-        let v = |n: isize| n as *mut core::ffi::c_void;
-        assert!(
-            super::shell_execute_failed(v(0)),
-            "0 is the generic failure code"
-        );
-        assert!(
-            super::shell_execute_failed(v(2)),
-            "ERROR_FILE_NOT_FOUND (2)"
-        );
-        assert!(
-            super::shell_execute_failed(v(3)),
-            "ERROR_PATH_NOT_FOUND (3)"
-        );
-        assert!(
-            super::shell_execute_failed(v(32)),
-            "32 is still in the failure range"
-        );
-        assert!(
-            !super::shell_execute_failed(v(33)),
-            "33 is the first success value"
-        );
-        assert!(
-            !super::shell_execute_failed(v(0x0040_0000)),
-            "a real HINSTANCE (a pointer-sized handle) is a success"
-        );
-    }
-    #[test]
-    fn notifications_follow_completions_not_countdowns_or_retry_states() {
-        assert_eq!(
-            notification_flags(StateKind::Paused, false) & NIIF_NOSOUND,
-            NIIF_NOSOUND
-        );
-        assert_eq!(notification_flags(StateKind::Idle, true) & NIIF_NOSOUND, 0);
-        assert_ne!(
-            notification_flags(StateKind::Attention, true) & NIIF_ERROR,
-            0
-        );
-        for kind in [StateKind::Paused, StateKind::Idle, StateKind::Attention] {
-            assert_ne!(notification_flags(kind, true) & NIIF_RESPECT_QUIET_TIME, 0);
-        }
-    }
-}
+mod tests;
