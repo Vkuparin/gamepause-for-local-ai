@@ -1,4 +1,4 @@
-use super::*;
+use super::{bridge::dispatch, native::native_options, *};
 use crate::{
     control::Activity,
     coordinator::{Report, State},

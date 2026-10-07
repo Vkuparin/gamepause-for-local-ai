@@ -8,9 +8,16 @@ use crate::{
     config::Config,
     control::CoreCommand,
     discovery::canonical,
-    tray, wide,
+    tray,
 };
+mod bridge;
 mod game_rules;
+mod native;
+use bridge::{BRIDGE, RUNNING_REQUESTED, UI_VISIBLE, UiRequest};
+pub use bridge::{
+    close, needs_running_apps, refresh, request_resume, request_verify_modal, show, theme_changed,
+};
+use native::{app_icon, browse, caption, native_window};
 mod view_data;
 use game_rules::{add_game, answer_ask, asking_paths, exclude_executable, set_ask, set_ignored};
 pub use game_rules::{apply_rename, apply_save, render_verify_report};
@@ -22,317 +29,19 @@ use std::{
     collections::{HashSet, VecDeque},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::Ordering,
         mpsc::{self, Sender},
     },
     time::{Duration, Instant},
 };
 use std::{path::PathBuf, ptr::null_mut};
-use windows_sys::Win32::{Foundation::HWND, UI::Controls::Dialogs::*};
-use winit::platform::windows::EventLoopBuilderExtWindows;
+use windows_sys::Win32::Foundation::HWND;
 
-static RUNNING_REQUESTED: AtomicBool = AtomicBool::new(false);
-static UI_VISIBLE: AtomicBool = AtomicBool::new(false);
-static UI_STOP: AtomicBool = AtomicBool::new(false);
-static BRIDGE: Mutex<Option<Bridge>> = Mutex::new(None);
-struct Bridge {
-    tx: Sender<UiRequest>,
-    ctx: Option<Context>,
-    shared: SharedState,
-    fingerprint: String,
-    thread: Option<std::thread::JoinHandle<()>>,
-    /// The open dashboard window, or 0. Used only by the tray UI thread to
-    /// bring a minimized window back; never handed to a worker.
-    window: isize,
-}
-enum UiRequest {
-    Show,
-    Resume,
-    Verify,
-    Theme,
-    Stop,
-}
-
-pub fn needs_running_apps() -> bool {
-    RUNNING_REQUESTED.load(Ordering::Relaxed)
-}
 pub fn scale(value: i32, dpi: i32) -> i32 {
     value * dpi / 96
 }
 pub fn is_dialog_message(_: &windows_sys::Win32::UI::WindowsAndMessaging::MSG) -> bool {
     false
-}
-pub fn theme_changed() {
-    dispatch(UiRequest::Theme);
-}
-/// A minimized window draws no frames, and requests are read while drawing:
-/// without this, Show, Resume and Stop would wait until someone restored it.
-/// A fullscreen game minimizes the dashboard, so that is the usual case.
-fn wake_window(command: i32) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{IsIconic, ShowWindowAsync};
-    let window = BRIDGE
-        .lock()
-        .ok()
-        .and_then(|bridge| bridge.as_ref().map(|b| b.window))
-        .unwrap_or(0) as HWND;
-    // No lock is held here, and the call does not wait for the UI thread.
-    if !window.is_null() && unsafe { IsIconic(window) } != 0 {
-        unsafe {
-            ShowWindowAsync(window, command);
-        }
-    }
-}
-fn dispatch(request: UiRequest) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{SW_RESTORE, SW_SHOWNOACTIVATE};
-    let wake = match request {
-        UiRequest::Show | UiRequest::Resume | UiRequest::Verify => Some(SW_RESTORE),
-        UiRequest::Stop => Some(SW_SHOWNOACTIVATE),
-        UiRequest::Theme => None,
-    };
-    if let Some(command) = wake {
-        wake_window(command);
-    }
-    let ctx = BRIDGE
-        .lock()
-        .ok()
-        .and_then(|bridge| {
-            bridge.as_ref().map(|b| {
-                let _ = b.tx.send(request);
-                b.ctx.clone()
-            })
-        })
-        .flatten();
-    if let Some(ctx) = ctx {
-        ctx.request_repaint();
-    }
-}
-pub fn close() {
-    UI_STOP.store(true, Ordering::Relaxed);
-    wake_window(windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNOACTIVATE);
-    let bridge = BRIDGE.lock().ok().and_then(|mut b| b.take());
-    if let Some(mut bridge) = bridge {
-        let _ = bridge.tx.send(UiRequest::Stop);
-        if let Some(ctx) = bridge.ctx {
-            ctx.request_repaint();
-        }
-        if let Some(thread) = bridge.thread.take() {
-            // Quit must not hang on a renderer that draws no frame. The
-            // process is exiting; a thread that has not stopped is left to it.
-            let deadline = Instant::now() + Duration::from_secs(3);
-            while !thread.is_finished() && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            if thread.is_finished() {
-                let _ = thread.join();
-            }
-        }
-    }
-    RUNNING_REQUESTED.store(false, Ordering::Relaxed);
-    UI_VISIBLE.store(false, Ordering::Relaxed);
-}
-/// Called by the existing tray timer. Unchanged state does not redraw the GPU window.
-pub fn refresh() {
-    if !UI_VISIBLE.load(Ordering::Relaxed) {
-        return;
-    }
-    let shared = BRIDGE
-        .lock()
-        .ok()
-        .and_then(|b| b.as_ref().map(|b| b.shared.clone()));
-    let Some(shared) = shared else { return };
-    let Ok(s) = shared.lock().map(|s| s.clone()) else {
-        return;
-    };
-    let summary = crate::presentation::summarize(&s);
-    let fingerprint = format!(
-        "{}|{}|{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{}|{:?}",
-        summary.games,
-        summary.ai_text(),
-        s.revision,
-        s.commands.latest,
-        s.running_apps,
-        s.settings_error,
-        s.restore_offer,
-        s.verify_report,
-        s.doctor_report,
-        s.provider_statuses,
-        s.commands.settings_pending,
-        s.doctor_pending,
-        s.verifying,
-        s.discovery_ready,
-        s.games
-    );
-    let ctx = BRIDGE.lock().ok().and_then(|mut b| {
-        b.as_mut().and_then(|b| {
-            if b.fingerprint == fingerprint {
-                return None;
-            }
-            b.fingerprint = fingerprint;
-            b.ctx.clone()
-        })
-    });
-    if let Some(ctx) = ctx {
-        ctx.request_repaint();
-    }
-}
-pub fn show(shared: SharedState, tx: Sender<Action>, folder: PathBuf) {
-    if BRIDGE.lock().is_ok_and(|b| {
-        b.as_ref()
-            .is_some_and(|b| b.thread.as_ref().is_some_and(|t| t.is_finished()))
-    }) {
-        close();
-    }
-    if BRIDGE.lock().is_ok_and(|b| b.is_some()) {
-        dispatch(UiRequest::Show);
-        return;
-    }
-    let (ui_tx, rx) = mpsc::channel();
-    UI_STOP.store(false, Ordering::Relaxed);
-    let rx = Arc::new(Mutex::new(rx));
-    let Ok(mut bridge) = BRIDGE.lock() else {
-        return;
-    };
-    *bridge = Some(Bridge {
-        tx: ui_tx,
-        ctx: None,
-        shared: shared.clone(),
-        fingerprint: String::new(),
-        thread: None,
-        window: 0,
-    });
-    let thread = std::thread::Builder::new()
-        .name("gamepause-ui".into())
-        .spawn(move || {
-            let mut initial = Some(UiRequest::Show);
-            loop {
-                let request = initial
-                    .take()
-                    .or_else(|| rx.lock().ok().and_then(|rx| rx.recv().ok()));
-                let Some(request) = request else { break };
-                if matches!(request, UiRequest::Stop) {
-                    break;
-                }
-                if matches!(request, UiRequest::Theme) {
-                    continue;
-                }
-                let error_state = shared.clone();
-                let app_shared = shared.clone();
-                let app_tx = tx.clone();
-                let app_folder = folder.clone();
-                let app_rx = rx.clone();
-                let result = eframe::run_native(
-                    "GamePause for Local AI",
-                    native_options(),
-                    Box::new(move |cc| {
-                        design::fonts(&cc.egui_ctx);
-                        if let Ok(mut b) = BRIDGE.lock()
-                            && let Some(b) = b.as_mut()
-                        {
-                            b.ctx = Some(cc.egui_ctx.clone());
-                        }
-                        let mut app = Dashboard::new(app_shared, app_tx, app_folder, app_rx);
-                        let s = app.shared.lock().map(|s| s.clone()).unwrap_or_default();
-                        match request {
-                            UiRequest::Resume => app.resume(&s),
-                            UiRequest::Verify if crate::ui_commands::verify_available(&s) => {
-                                app.modal = Some(Modal::Verify)
-                            }
-                            _ => (),
-                        }
-                        Ok(Box::new(app))
-                    }),
-                );
-                if let Ok(mut b) = BRIDGE.lock()
-                    && let Some(b) = b.as_mut()
-                {
-                    b.ctx = None;
-                    b.window = 0;
-                }
-                UI_VISIBLE.store(false, Ordering::Relaxed);
-                RUNNING_REQUESTED.store(false, Ordering::Relaxed);
-                if let Err(error) = result {
-                    crate::app::local_result(
-                        &error_state,
-                        Outcome::Failed,
-                        format!("Could not open dashboard: {error}"),
-                    );
-                    crate::app::log(&folder, &format!("Dashboard renderer failed: {error}"));
-                }
-                if UI_STOP.load(Ordering::Relaxed) {
-                    break;
-                }
-                // The same thread reuses eframe's thread-local Windows event loop.
-                // A closed dashboard has no window or renderer and blocks on the mailbox.
-            }
-        });
-    match thread {
-        Ok(thread) => {
-            if let Some(b) = bridge.as_mut() {
-                b.thread = Some(thread);
-            }
-        }
-        Err(error) => {
-            *bridge = None;
-            drop(bridge);
-            tray::error(&format!("Could not start dashboard: {error}"));
-        }
-    }
-}
-fn native_options() -> eframe::NativeOptions {
-    eframe::NativeOptions {
-        viewport: ViewportBuilder::default()
-            .with_inner_size([1114.0, 848.0])
-            .with_min_inner_size([620.0, 580.0])
-            .with_icon(app_icon(
-                Palette::for_mode(true, false, Look::default()).accent,
-            )),
-        renderer: eframe::Renderer::Glow,
-        event_loop_builder: Some(Box::new(|builder| {
-            builder.with_any_thread(true);
-        })),
-        ..Default::default()
-    }
-}
-/// The window icon is the pause mark in the current state color.
-fn app_icon(color: Color32) -> IconData {
-    let mut rgba = vec![0; 32 * 32 * 4];
-    for y in 4..28 {
-        for x in (7..13).chain(19..25) {
-            let i = (y * 32 + x) * 4;
-            rgba[i..i + 4].copy_from_slice(&[color.r(), color.g(), color.b(), 255]);
-        }
-    }
-    IconData {
-        rgba,
-        width: 32,
-        height: 32,
-    }
-}
-/// Tint the native caption. Windows 10 ignores the color attributes and keeps its own bar.
-fn caption(hwnd: HWND, palette: Palette, dark: bool) {
-    use windows_sys::Win32::Graphics::Dwm::*;
-    const SYSTEM: u32 = 0xFFFF_FFFF;
-    let set = |attribute: DWMWINDOWATTRIBUTE, value: u32| unsafe {
-        DwmSetWindowAttribute(hwnd, attribute as u32, (&raw const value).cast(), 4);
-    };
-    let (bar, text) = palette.caption.map_or((SYSTEM, SYSTEM), |c| {
-        (
-            c.r() as u32 | (c.g() as u32) << 8 | (c.b() as u32) << 16,
-            0x00FF_FFFF,
-        )
-    });
-    set(DWMWA_USE_IMMERSIVE_DARK_MODE, dark as u32);
-    set(DWMWA_CAPTION_COLOR, bar);
-    set(DWMWA_TEXT_COLOR, text);
-}
-/// The native tray routes gameplay confirmation into the same themed modal.
-pub fn request_resume(shared: SharedState, tx: Sender<Action>, folder: PathBuf) {
-    show(shared, tx, folder);
-    dispatch(UiRequest::Resume);
-}
-pub fn request_verify_modal(shared: SharedState, tx: Sender<Action>, folder: PathBuf) {
-    show(shared, tx, folder);
-    dispatch(UiRequest::Verify);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1974,13 +1683,6 @@ impl Dashboard {
         self.modal(ctx, s, palette);
     }
 }
-fn native_window(frame: &eframe::Frame) -> Option<HWND> {
-    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    match frame.window_handle().ok()?.as_raw() {
-        RawWindowHandle::Win32(handle) => Some(handle.hwnd.get() as HWND),
-        _ => None,
-    }
-}
 impl eframe::App for Dashboard {
     fn update(&mut self, ctx: &Context, frame: &mut eframe::Frame) {
         if let Some(owner) = native_window(frame)
@@ -2092,29 +1794,6 @@ pub(crate) fn shared_command_ids(advanced: bool) -> Vec<i32> {
         .filter(|c| *c != crate::ui_commands::Command::OpenDashboard && c.visible(advanced))
         .map(|c| c as i32)
         .collect()
-}
-
-fn browse(hwnd: HWND) -> anyhow::Result<Option<String>> {
-    unsafe {
-        let mut buffer = vec![0u16; 32768];
-        let filter = wide("Windows executable (*.exe)\0*.exe\0\0");
-        let mut dialog: OPENFILENAMEW = std::mem::zeroed();
-        dialog.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
-        dialog.hwndOwner = hwnd;
-        dialog.lpstrFilter = filter.as_ptr();
-        dialog.lpstrFile = buffer.as_mut_ptr();
-        dialog.nMaxFile = buffer.len() as u32;
-        dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-        if GetOpenFileNameW(&mut dialog) == 0 {
-            let error = CommDlgExtendedError();
-            if error != 0 {
-                anyhow::bail!("File picker failed (code {error})");
-            }
-            return Ok(None);
-        }
-        let n = buffer.iter().position(|c| *c == 0).unwrap_or(buffer.len());
-        Ok(Some(String::from_utf16_lossy(&buffer[..n])))
-    }
 }
 
 #[cfg(test)]
