@@ -1,5 +1,6 @@
 use super::detection::{DetectionFrame, evidence_from};
 use super::*;
+use crate::{commands::Outcome, control::CoreCommand};
 #[test]
 fn log_lines_start_with_a_readable_local_time() {
     let stamp = local_timestamp();
