@@ -1,35 +1,41 @@
 //! Rust-native dashboard. Engine work stays on the existing worker channel.
-use crate::dashboard_theme::{Emphasis, Icon, Look, Palette, Push};
+//!
+//! This file owns the `Dashboard` state, its frame loop and the page layout.
+//! The children split the rest by responsibility: `bridge` runs the UI thread,
+//! `view_data` and `game_rules` are pure, and `chrome`, `games`, `settings`,
+//! `dialogs` and `activity` each draw one part of the window.
+
+mod activity;
+mod bridge;
+mod chrome;
+mod dialogs;
+mod game_rules;
+mod games;
+mod native;
+mod settings;
+mod view_data;
+
+pub use bridge::{
+    close, needs_running_apps, refresh, request_resume, request_verify_modal, show, theme_changed,
+};
+pub use game_rules::{apply_rename, apply_save, render_verify_report};
+
 use crate::{
     app::{Action, Shared, SharedState},
     commands::Outcome,
     config::Config,
     control::CoreCommand,
+    dashboard_theme::{Emphasis, Icon, Look, Palette, Push},
 };
-mod activity;
-mod bridge;
-mod chrome;
-mod dialogs;
 use activity::{ActivityLog, Toast};
-
-mod game_rules;
-mod games;
-mod native;
-mod settings;
 use bridge::{BRIDGE, RUNNING_REQUESTED, UI_VISIBLE, UiRequest};
-pub use bridge::{
-    close, needs_running_apps, refresh, request_resume, request_verify_modal, show, theme_changed,
-};
+use eframe::egui::*;
+use game_rules::{answer_ask, asking_paths};
 use native::{app_icon, caption, native_window};
 use settings::rebase_draft;
-mod view_data;
-use game_rules::{answer_ask, asking_paths};
-pub use game_rules::{apply_rename, apply_save, render_verify_report};
-use view_data::{Row, hero};
-
-use eframe::egui::*;
-use std::{path::PathBuf, ptr::null_mut};
 use std::{
+    path::PathBuf,
+    ptr::null_mut,
     sync::{
         Arc, Mutex,
         atomic::Ordering,
@@ -37,6 +43,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use view_data::{Row, hero};
 use windows_sys::Win32::Foundation::HWND;
 
 pub fn scale(value: i32, dpi: i32) -> i32 {

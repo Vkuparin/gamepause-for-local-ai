@@ -1,3 +1,18 @@
+//! Entry point and control thread. `main` handles the one-shot commands and
+//! starts the watcher; `run` is the watcher loop and keeps its tick order in
+//! one place. `shared` is the state published to the UI, `actions` applies
+//! queued actions and `detection` owns the scan the detection worker runs.
+
+mod actions;
+mod detection;
+mod shared;
+
+pub use actions::remove_custom;
+pub use shared::{
+    Action, Shared, SharedState, local_result, request_action, request_core, request_quit,
+    request_verify,
+};
+
 use crate::{
     commands::Commands,
     config::{self, Config, write_json},
@@ -9,23 +24,14 @@ use crate::{
     processes::{ActiveGame, Scanner},
     tray,
 };
-mod actions;
-mod detection;
-mod shared;
 #[cfg(test)]
 use actions::apply_action;
 use actions::apply_action_detected;
-pub use actions::remove_custom;
+use anyhow::{Context, Result, bail};
 use detection::{
     BackgroundDetection, DetectionInput, NativeDetection, fresh_detection, publish_detection,
     recovery_scanner, scan_evidence,
 };
-pub use shared::{
-    Action, Shared, SharedState, local_result, request_action, request_core, request_quit,
-    request_verify,
-};
-
-use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 #[cfg(test)]
 use std::time::SystemTime;
