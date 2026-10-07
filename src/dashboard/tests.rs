@@ -4,12 +4,13 @@ use super::{
     dialogs::confirmed_resume,
     game_rules::set_ignored,
     native::native_options,
-    view_data::{rows, sort_rows},
+    view_data::{Tone, provider_status, rows, sort_rows},
     *,
 };
 use crate::{
     control::Activity,
     coordinator::{Report, State},
+    dashboard_theme as design,
     discovery::Game,
     provider::{Guarantee, Kind},
 };
