@@ -1,4 +1,12 @@
-use super::*;
+use super::{diagnostics::failing_field, websocket::receive_until, *};
+use std::{
+    io::Write,
+    net::TcpStream,
+    os::windows::process::CommandExt,
+    process::{Command, Stdio},
+    time::Instant,
+};
+use tungstenite::{Message, WebSocket};
 #[test]
 fn neutral_inventory_refuses_unknown_residency() {
     assert!(resident_keys(&[]).unwrap().is_empty());
@@ -313,8 +321,8 @@ fn failing_field_produces_a_log_line_naming_that_field() {
     );
 
     // failing_field must pull out exactly that field from the real detail.
-    let field = crate::lmstudio::failing_field(&detail)
-        .expect("the failing field must be extractable from the detail");
+    let field =
+        failing_field(&detail).expect("the failing field must be extractable from the detail");
     assert_eq!(field, "temperature");
 
     // The log line for that step names the field and carries the LM
