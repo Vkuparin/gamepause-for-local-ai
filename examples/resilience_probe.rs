@@ -13,9 +13,13 @@ fn main() {
         .resilience_probe()
         .unwrap();
     assert!(
-        std::fs::read_to_string(folder.join("gamepause.log"))
+        std::fs::read_dir(folder.join("logs"))
             .unwrap()
-            .contains("injected discovery panic")
+            .any(|entry| {
+                std::fs::read_to_string(entry.unwrap().path())
+                    .unwrap()
+                    .contains("injected discovery panic")
+            })
     );
     println!("Release panic contained; last-good inventory and next refresh retained");
 }
