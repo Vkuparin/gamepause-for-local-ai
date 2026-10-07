@@ -180,7 +180,7 @@ impl Dashboard {
                     if ui
                         .add_enabled(
                             !s.commands.settings_pending,
-                            Checkbox::new(&mut auto, label),
+                            design::Checkbox::new(&mut auto, label),
                         )
                         .changed()
                     {

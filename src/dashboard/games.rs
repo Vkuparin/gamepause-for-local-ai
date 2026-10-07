@@ -276,7 +276,7 @@ impl Dashboard {
                                         if ui
                                             .add_enabled(
                                                 !s.commands.settings_pending,
-                                                Checkbox::new(
+                                                design::Checkbox::new(
                                                     &mut on,
                                                     if entry.ignored {
                                                         "Off"
