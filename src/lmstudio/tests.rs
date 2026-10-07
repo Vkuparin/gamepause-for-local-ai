@@ -1,4 +1,3 @@
-
 use super::*;
 #[test]
 fn neutral_inventory_refuses_unknown_residency() {

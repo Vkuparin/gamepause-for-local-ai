@@ -983,7 +983,7 @@ fn panic_hook_logs_to_gamepause_log() {
         "log should be tagged PANIC: {log_text:?}"
     );
     assert!(
-        log_text.contains("app.rs"),
+        log_text.contains(file!()),
         "log should contain the panic location (file): {log_text:?}"
     );
     std::panic::set_hook(previous);
