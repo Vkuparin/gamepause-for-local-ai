@@ -1,4 +1,6 @@
 //! LM-owned checkpoint and lifecycle units for the common coordinator.
+mod loadout;
+
 use crate::{
     config::{Config, normalized_endpoint},
     coordinator::{Outcome, Planned, Runtime},
@@ -39,6 +41,8 @@ pub enum Operation {
     Restore(usize),
     VerifyModel(usize),
     FinishRestore,
+    AcceptLoadout,
+    UnloadReplacement(usize),
 }
 pub struct Work {
     operation: Operation,
@@ -56,12 +60,20 @@ pub struct LMRuntime<B: Backend> {
     ready: Cell<bool>,
     verified: Cell<usize>,
     failed_models: RefCell<BTreeSet<usize>>,
+    offer: RefCell<Option<lmstudio::LoadoutOffer>>,
+    replacement: RefCell<Option<lmstudio::LoadoutOffer>>,
+    normal_restore: Cell<bool>,
+    accepted_loadout: Cell<bool>,
 }
 #[derive(Clone, Default)]
 pub struct Progress {
     ready: bool,
     verified: usize,
     failed_models: BTreeSet<usize>,
+    offer: Option<lmstudio::LoadoutOffer>,
+    replacement: Option<lmstudio::LoadoutOffer>,
+    normal_restore: bool,
+    accepted_loadout: bool,
 }
 impl<B: Backend> LMRuntime<B> {
     pub fn progress(&self) -> Progress {
@@ -69,12 +81,20 @@ impl<B: Backend> LMRuntime<B> {
             ready: self.ready.get(),
             verified: self.verified.get(),
             failed_models: self.failed_models.borrow().clone(),
+            offer: self.offer.borrow().clone(),
+            replacement: self.replacement.borrow().clone(),
+            normal_restore: self.normal_restore.get(),
+            accepted_loadout: self.accepted_loadout.get(),
         }
     }
     pub fn with_progress(self, progress: Progress) -> Self {
         self.ready.set(progress.ready);
         self.verified.set(progress.verified);
         *self.failed_models.borrow_mut() = progress.failed_models;
+        *self.offer.borrow_mut() = progress.offer;
+        *self.replacement.borrow_mut() = progress.replacement;
+        self.normal_restore.set(progress.normal_restore);
+        self.accepted_loadout.set(progress.accepted_loadout);
         self
     }
     pub fn new(backend: B, config: Config, verify_raw: bool) -> Self {
@@ -85,6 +105,10 @@ impl<B: Backend> LMRuntime<B> {
             ready: Cell::new(false),
             verified: Cell::new(0),
             failed_models: RefCell::new(BTreeSet::new()),
+            offer: RefCell::new(None),
+            replacement: RefCell::new(None),
+            normal_restore: Cell::new(false),
+            accepted_loadout: Cell::new(false),
         }
     }
     pub fn binding(&self) -> Result<Binding> {
@@ -178,6 +202,10 @@ impl<B: Backend> Runtime for LMRuntime<B> {
         }
     }
     fn begin(&self, payload: &mut Payload, _: Intent) -> Result<()> {
+        self.offer.borrow_mut().take();
+        self.replacement.borrow_mut().take();
+        self.normal_restore.set(false);
+        self.accepted_loadout.set(false);
         let snapshot = payload.lm_mut()?;
         snapshot.pause_complete = false;
         self.ready.set(false);
@@ -202,6 +230,18 @@ impl<B: Backend> Runtime for LMRuntime<B> {
                     && (model.stage != "restored" || index >= self.verified.get())
             })
     }
+    fn note(&self, _: &Payload) -> String {
+        if self.accepted_loadout.get() {
+            if self.normal_restore.get() {
+                "Matching LM Studio models available; instance names and copy counts may differ."
+                    .into()
+            } else {
+                "Same LM Studio model loadout already loaded; kept current instance names, settings and server state.".into()
+            }
+        } else {
+            String::new()
+        }
+    }
     fn retry(&self, _: &Binding) {
         self.failed_models.borrow_mut().clear();
         self.ready.set(false);
@@ -217,7 +257,14 @@ impl<B: Backend> Runtime for LMRuntime<B> {
         let mut snapshot = original.clone();
         let port = snapshot.server["port"].as_u64().unwrap() as u16;
         let running = self.state(port)?;
-        let operation = if intent == Intent::Pause {
+        let loadout_operation = if intent == Intent::Restore {
+            self.loadout_plan(&snapshot)?
+        } else {
+            None
+        };
+        let operation = if let Some(operation) = loadout_operation {
+            operation
+        } else if intent == Intent::Pause {
             let loaded = self.keys(true)?;
             if snapshot.pause_service_required(self.config.stop_server_during_gaming()) && running {
                 snapshot.server_stopped = true;
@@ -361,6 +408,11 @@ impl<B: Backend> LMRuntime<B> {
                 }
                 self.verified.set(index + 1);
             }
+            Operation::AcceptLoadout => {
+                self.accept_loadout(&mut snapshot)?;
+                restore_complete = true;
+            }
+            Operation::UnloadReplacement(index) => self.unload_replacement(&snapshot, index)?,
             Operation::FinishRestore => {
                 let loaded = self.keys(false)?;
                 if snapshot

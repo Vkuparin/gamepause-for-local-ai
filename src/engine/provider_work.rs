@@ -190,7 +190,8 @@ impl<B: Backend> Engine<B> {
                     .saturating_mul(2)
                     .saturating_add(journal.providers.len().saturating_mul(4))
             })
-            .saturating_add(6);
+            .saturating_add(6)
+            .saturating_add(crate::lmstudio::MAX_RESIDENTS);
         let memory = self.take_continuation(&journal)?;
         let progress = if memory.is_some() {
             self.adapter_progress.take().unwrap_or_default()

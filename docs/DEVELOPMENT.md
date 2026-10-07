@@ -24,11 +24,13 @@ The characterized policy starts a full configured grace period after reliable po
 
 ## Recovery and diagnostics safeguards
 
-LM Studio restore checks resident identifiers and model identity before loading, and repeats the duplicate check after catalog validation immediately before opening the load channel. A conflicting resident copy or idle TTL mismatch returns `ManualRetryRequired`. The coordinator retains the original snapshot and process-local manual-retry gate across continuations, finishes independent healthy work and omits automatic retry deadlines until an explicit retry. A process restart rechecks the journal; the gate is not a new persisted format. Inventory checks cannot prevent an external client from loading after the check.
+Normal LM Studio recovery compares sets of exact model/quantization keys and namespaces through adapter-owned `Resident` evidence. An externally loaded matching loadout satisfies recovery without requiring the captured instance names, copy count, TTL or settings; the completion note explicitly says current settings and server state were kept. The snapshot's original fields remain unchanged until recovery is cleared. A normal restore into an empty loadout still returns a temporarily started server to its captured state. Round-trip verification retains strict instance/configuration/lifecycle checks.
+
+A different nonempty loadout produces an adapter-owned `LoadoutOffer` and `ManualRetryRequired`. The UI defaults to Cancel and submits the exact offer only after confirmation. Approval is bound to immutable snapshot content and the current resident identities; the authority token is excluded from serialized display/status data. Each replacement unload runs as a separate checkpointed provider unit, rechecking identity before execution and inventory before the next unit. New resident identities invalidate approval. Approval is process-local, expires on power changes and interrupted game guards, and is never recovered from disk. The coordinator retains the original snapshot and manual retry gate across continuations; unrelated healthy providers can finish. Inventory checks cannot prevent external changes after a check.
 
 The process adapter caps residency at 256 processes. Inaccessible matching processes and incomplete Toolhelp enumeration fail closed. It rereads start details before each stop, matches roots one-to-one against sealed original commands when relaunch is enabled, and verifies creation time, executable path and expected start details on the held process handle before stopping. Parent relationships also check creation order to reject stale parent PIDs. Working directories retain their trailing separator; legacy sealed drive-root captures are repaired in memory without rewriting their original bytes.
 
-Worker log lines include the package version and PID. Watcher startup records mode, recovery status and data directory. Activity displays the current build/PID/data directory independently of old files and shows log-open/write failures. The dashboard repaint fingerprint includes gameplay suggestions, Ask prompts and provider visibility; UI refresh tests exercise changes in those fields. Log tests use an isolated directory and inject an open failure.
+Worker logs use `app/logging.rs`: dated files under `logs/`, a 1024 KiB byte limit per file, daily rollover and 10-file retention. Size rollover appends a numeric suffix to the date. Retention considers only managed filenames; unrelated files and legacy root logs are untouched. Directory scans occur on startup, rollover or explicit Activity log reads, rather than every idle tick. Worker log lines include the package version and PID. Watcher startup records mode, recovery status and data directory. Activity displays the current build/PID/data directory independently of old files and shows log-open/write failures. The dashboard repaint fingerprint includes gameplay suggestions, Ask prompts and provider visibility; UI refresh tests exercise changes in those fields. Log tests use an isolated directory and inject an open failure.
 
 ## Architecture
 
@@ -46,7 +48,7 @@ Worker log lines include the package version and PID. Watcher startup records mo
 | `detection_worker.rs` | Persistent periodic scanner, bounded latest-state mailbox and fresh guard deadlines |
 | `discovery.rs` | Launcher metadata adapters, incremental inventory, safe parser boundaries |
 | `lmstudio.rs` | Bounded CLI commands, local REST, WebSocket capture/load, restoration verification |
-| `lm_session.rs` | LM server/model/read-only verification units and original-capture transition validation |
+| `lm_session.rs` | LM server/model/read-only verification units, original-capture transition validation and private loadout acceptance/replacement policy |
 | `provider.rs` | Provider identity, guarantee and operation contract with adapter-owned snapshot/model types |
 | `provider_runtime.rs` | Kind/payload routing, exact queued-work binding checks and LM/Ollama runtime bridges |
 | `ollama_contract.rs` | Bounded evidence, validated typed candidates and limited wire construction |
@@ -70,10 +72,10 @@ The larger modules are a root file plus private children in a directory of the s
 
 | Root | Children |
 |---|---|
-| `app.rs` (entry point, `run` watcher loop, restore helpers, logging) | `shared` (published state, actions, tracked requests), `actions` (control-thread action dispatch and its handlers), `detection` (scan input/frame, native scan, fresh guard) |
+| `app.rs` (entry point, `run` watcher loop, restore helpers, log facade) | `shared` (published state, actions, tracked requests), `actions` (control-thread action dispatch and its handlers), `detection` (scan input/frame, native scan, fresh guard), `logging` (daily/size rotation and retention) |
 | `dashboard.rs` (`Dashboard` state, frame loop, page layout) | `bridge` (UI thread and mailbox), `view_data` and `game_rules` (pure), `chrome`, `games`, `settings`, `dialogs`, `activity` (one part of the window each), `native` (Win32 window helpers) |
 | `engine.rs` (state machine and policy) | `provider_work` (pause/restore unit loops, continuation), `verification` (round-trip test) |
-| `lmstudio.rs` (`Backend` contract, `LMStudio` client) | `command`, `websocket`, `snapshot`, `identity`, `diagnostics` |
+| `lmstudio.rs` (`Backend` contract, `LMStudio` client) | `command`, `websocket`, `snapshot`, `identity`, `loadout`, `diagnostics` |
 | `discovery.rs` (`Game`, `Discovery` refresh and retained inventories) | `launchers`, `metadata`, `registry`, `paths` |
 | `process_session.rs` (snapshot and adapter) | `native` (Win32 process control), `sealing` (DPAPI) |
 | `tray.rs` (window callback, menu session, timer) | `icons`, `notifications`, `shell` |

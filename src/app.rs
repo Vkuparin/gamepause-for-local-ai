@@ -5,6 +5,7 @@
 
 mod actions;
 mod detection;
+mod logging;
 mod shared;
 
 pub use actions::remove_custom;
@@ -36,8 +37,7 @@ use serde_json::{Value, json};
 #[cfg(test)]
 use std::time::SystemTime;
 use std::{
-    fs::{self, OpenOptions},
-    io::Write,
+    fs,
     path::PathBuf,
     sync::{Arc, Mutex, mpsc},
     time::{Duration, Instant},
@@ -229,6 +229,7 @@ pub fn main(console: bool) -> Result<()> {
         commands: Commands::default(),
         activity: engine.activity,
         restore_offer: None,
+        lm_loadout_offer: None,
         coexistence: false,
         restore_feedback: None,
         detection_ok: false,
@@ -355,6 +356,9 @@ impl OptionalBackend {
     }
 }
 impl Backend for OptionalBackend {
+    fn recovery_models(&mut self) -> Result<Option<Vec<crate::lmstudio::Resident>>> {
+        self.get()?.recovery_models()
+    }
     fn snapshot(&mut self) -> Result<crate::lmstudio::Snapshot> {
         self.get()?.snapshot()
     }
@@ -676,6 +680,7 @@ fn run(
     let start = Instant::now();
     let mut next_inventory = 0.;
     let mut last_status = Value::Null;
+    let mut last_log_status = (Activity::Unknown, String::new());
     let mut inventory_pending = false;
     let mut force_requested = false;
     let mut ask_approved = Vec::new();
@@ -945,6 +950,7 @@ fn run(
             let status = json!({"version":env!("CARGO_PKG_VERSION"),"implementation":"Rust","mode":engine.config.mode,"automation_enabled":engine.config.automation_enabled,"message":engine.message,"active_games":active,"installed_locations":games.len(),"detection_disabled":engine.disabled,"manual_pause":engine.manual_pause,"last_error":engine.last_error,"discovery_errors":errors,"inaccessible_processes":frame.inaccessible,"recovery_pending":engine.pending(),"provider_outcomes":engine.provider_statuses});
             if let Ok(mut shared) = state.lock() {
                 shared.restore_offer = engine.gameplay.offer();
+                shared.lm_loadout_offer = engine.lm_loadout_offer();
                 shared.coexistence =
                     engine.gameplay.active() && !engine.awaiting_resume_detection();
                 if let Some(feedback) = &mut shared.restore_feedback
@@ -1004,7 +1010,10 @@ fn run(
                 } else {
                     last_status = status;
                 }
-                log(&folder, &engine.message);
+                if logging::status_changed(&last_log_status, engine.activity, &engine.message) {
+                    log(&folder, &engine.message);
+                }
+                last_log_status = (engine.activity, engine.message.clone());
                 if console {
                     println!("{}", engine.message);
                 }
@@ -1108,24 +1117,10 @@ pub fn log(folder: &std::path::Path, message: &str) {
     }
 }
 fn write_log(folder: &std::path::Path, message: &str) -> std::io::Result<()> {
-    let file = folder.join("gamepause.log");
-    if fs::metadata(&file).is_ok_and(|m| m.len() > 1_000_000) {
-        for i in (1..3).rev() {
-            let _ = fs::rename(
-                folder.join(format!("gamepause.log.{i}")),
-                folder.join(format!("gamepause.log.{}", i + 1)),
-            );
-        }
-        let _ = fs::rename(&file, folder.join("gamepause.log.1"));
-    }
-    let mut file = OpenOptions::new().create(true).append(true).open(file)?;
-    writeln!(
-        file,
-        "{} GamePause {} (PID {}) {message}",
-        local_timestamp(),
-        env!("CARGO_PKG_VERSION"),
-        std::process::id()
-    )
+    logging::write(folder, message, &local_timestamp())
+}
+pub(crate) fn worker_log_path(folder: &std::path::Path) -> std::io::Result<PathBuf> {
+    logging::latest(folder)
 }
 /// Local wall-clock time for log lines, as `2026-10-06 21:44:07`.
 fn local_timestamp() -> String {

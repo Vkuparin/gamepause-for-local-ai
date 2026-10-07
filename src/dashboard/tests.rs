@@ -591,3 +591,30 @@ fn ui_design_review_snapshots() {
     .unwrap();
     assert!(std::path::Path::new("scratch/ui-review/18.png").exists());
 }
+
+#[test]
+fn lm_replacement_confirmation_rejects_stale_or_unavailable_offers() {
+    let offer = crate::lmstudio::LoadoutOffer {
+        loaded: vec![],
+        saved: vec![],
+        authority: "fixture".into(),
+    };
+    let mut s = Shared {
+        pending: true,
+        active_mode: true,
+        detection_ok: true,
+        discovery_ready: true,
+        activity: crate::control::Activity::Recovery,
+        lm_loadout_offer: Some(offer.clone()),
+        ..Default::default()
+    };
+    assert!(dialogs::confirmed_lm_replacement(&s, &offer).is_ok());
+    let mut stale = offer.clone();
+    stale.authority = "changed journal".into();
+    assert!(dialogs::confirmed_lm_replacement(&s, &stale).is_err());
+    s.commands.settings_pending = true;
+    assert!(dialogs::confirmed_lm_replacement(&s, &offer).is_err());
+    s.commands.settings_pending = false;
+    s.detection_ok = false;
+    assert!(dialogs::confirmed_lm_replacement(&s, &offer).is_err());
+}

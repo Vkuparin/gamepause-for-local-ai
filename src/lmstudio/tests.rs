@@ -381,7 +381,8 @@ fn ws_log_is_local_only_and_best_effort() {
     let dir = std::env::temp_dir().join(format!("gp_wslog_{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     crate::lmstudio::ws_log(&dir, "v1.5.1", "capture", true, "1 model(s) captured");
-    let content = std::fs::read_to_string(dir.join("gamepause.log")).unwrap_or_default();
+    let content =
+        std::fs::read_to_string(crate::app::worker_log_path(&dir).unwrap()).unwrap_or_default();
     assert!(
         content.contains("ws capture lm=v1.5.1 success"),
         "the log file must contain the ws line, got: {content:?}"
@@ -437,7 +438,7 @@ fn protocol_operation_logging_records_failure_without_leaking_payload() {
         bail!("Restored load field contextLength differs; token=secret")
     });
     assert!(result.is_err());
-    let log = std::fs::read_to_string(folder.join("gamepause.log")).unwrap();
+    let log = std::fs::read_to_string(crate::app::worker_log_path(&folder).unwrap()).unwrap();
     assert!(log.contains("getLoadConfig lm=cli:test-cli failed:contextLength"));
     assert!(!log.contains("secret"));
 }
@@ -528,7 +529,7 @@ fn actual_config_transport_logs_success_and_protocol_failure() {
         backend.cli_version.set("fixture".into()).unwrap();
         assert_eq!(backend.raw_config("llm", "instance").is_ok(), valid);
         peer.join().unwrap();
-        let log = std::fs::read_to_string(folder.join("gamepause.log")).unwrap();
+        let log = std::fs::read_to_string(crate::app::worker_log_path(&folder).unwrap()).unwrap();
         assert!(log.contains(&format!(
             "getLoadConfig:llm:instance lm=cli:fixture {}",
             if valid { "success" } else { "failed" }
@@ -601,4 +602,42 @@ fn restore_refuses_another_resident_copy_and_changed_idle_ttl() {
     model.ttl_ms = None;
     assert!(identity::verify_ttl(&model, &json!({})).is_ok());
     assert!(identity::verify_ttl(&model, &json!({"ttlMs":null})).is_ok());
+}
+
+#[test]
+fn recovery_loadout_inventory_requires_exact_quantization_and_bounded_unique_residents() {
+    let saved = Model {
+        identifier: "saved".into(),
+        model_key: "fixture/model@q4".into(),
+        base_key: "fixture/model".into(),
+        namespace: "llm".into(),
+        ttl_ms: None,
+        load_config: json!({"fields":[]}),
+        native_config: json!({}),
+        stage: "restoring".into(),
+    };
+    let snapshot = Snapshot {
+        schema: 2,
+        server: json!({"running":true,"port":1234}),
+        server_stopped: false,
+        models: vec![saved],
+        pause_complete: false,
+        games: vec![],
+    };
+    let loaded = loadout::inventory(&[json!({"identifier":"alias","modelKey":"fixture/model","selectedVariant":"fixture/model@q4"})]).unwrap();
+    assert!(loadout_matches(&snapshot, &loaded));
+    let other = loadout::inventory(&[json!({"identifier":"alias","modelKey":"fixture/model","selectedVariant":"fixture/model@q8"})]).unwrap();
+    assert!(!loadout_matches(&snapshot, &other));
+    assert!(loadout::inventory(&[json!({"identifier":"unknown"})]).is_err());
+    assert!(
+        loadout::inventory(&[
+            json!({"identifier":"same","modelKey":"fixture/model@q4"}),
+            json!({"identifier":"same","modelKey":"fixture/model@q4"})
+        ])
+        .is_err()
+    );
+    let oversized = (0..=MAX_RESIDENTS)
+        .map(|i| json!({"identifier":i.to_string(),"modelKey":"fixture/model@q4"}))
+        .collect::<Vec<_>>();
+    assert!(loadout::inventory(&oversized).is_err());
 }

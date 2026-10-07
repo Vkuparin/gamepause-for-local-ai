@@ -72,7 +72,7 @@ impl Toast {
 }
 pub(super) fn read_worker_log(folder: &std::path::Path) -> std::io::Result<String> {
     use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(folder.join("gamepause.log"))?;
+    let mut file = std::fs::File::open(crate::app::worker_log_path(folder)?)?;
     let len = file.metadata()?.len();
     let skipped = len.saturating_sub(65536);
     file.seek(SeekFrom::Start(skipped))?;
@@ -93,7 +93,7 @@ impl Dashboard {
                 self.set_page(Page::Games);
             }
             if ui.button("Open logs folder").clicked() {
-                tray::request_folder(&self.shared, &self.folder);
+                tray::request_folder(&self.shared, &self.folder.join("logs"));
             }
             if ui.button("Load recent worker log").clicked() {
                 self.worker_log = Some(

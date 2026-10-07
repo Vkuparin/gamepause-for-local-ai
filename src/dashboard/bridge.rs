@@ -151,7 +151,7 @@ pub(super) fn fingerprint(s: &crate::app::Shared) -> String {
         s.commands.latest,
         s.running_apps,
         s.settings_error,
-        s.restore_offer,
+        (&s.restore_offer, &s.lm_loadout_offer),
         s.verify_report,
         s.doctor_report,
         s.provider_statuses,

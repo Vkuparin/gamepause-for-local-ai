@@ -116,6 +116,20 @@ pub(super) fn apply_action_detected(
             engine.manual_pause = false;
         }
         Action::Restore => manual_restore(engine, games, now, state, detection)?,
+        Action::ReplaceLMLoadout(offer) => {
+            if !detection_ready(state)
+                || state
+                    .lock()
+                    .map(|s| !s.active_games.is_empty() || s.commands.settings_pending)
+                    .unwrap_or(true)
+            {
+                bail!(
+                    "Wait for reliable detection and no running games before replacing LM Studio models"
+                );
+            }
+            engine.approve_lm_replacement(&offer)?;
+            manual_restore(engine, games, now, state, detection)?;
+        }
         Action::ConfirmedRestore { offer_id, ignored } => confirm_gameplay_restore(
             offer_id, &ignored, engine, folder, scanner, games, now, state, detection,
         )?,
@@ -355,9 +369,10 @@ fn apply_tracked(
     let before = engine.config.clone();
     let waiting = match action {
         Action::Pause => Some(Waiting::Pause),
-        Action::Restore | Action::ConfirmedRestore { .. } | Action::RetryGameplayRestore => {
-            Some(Waiting::Restore)
-        }
+        Action::Restore
+        | Action::ConfirmedRestore { .. }
+        | Action::RetryGameplayRestore
+        | Action::ReplaceLMLoadout(_) => Some(Waiting::Restore),
         _ => None,
     };
     let success = match &action {

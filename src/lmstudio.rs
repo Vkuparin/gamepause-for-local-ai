@@ -5,6 +5,7 @@
 mod command;
 mod diagnostics;
 mod identity;
+mod loadout;
 mod snapshot;
 mod websocket;
 
@@ -12,6 +13,8 @@ pub use command::run_command;
 pub use diagnostics::{data_dir_writable, diagnostics, ws_log, ws_log_line};
 pub(crate) use identity::resident_keys;
 pub use identity::{compare_fields, resolved_key};
+pub use loadout::{LoadoutOffer, Resident};
+pub(crate) use loadout::{MAX_RESIDENTS, matches as loadout_matches, offer as loadout_offer};
 pub use snapshot::{Model, Snapshot};
 
 use crate::config::Config;
@@ -32,6 +35,10 @@ pub use crate::provider::InferenceBusy;
 pub trait Backend {
     fn snapshot(&mut self) -> Result<Snapshot>;
     fn loaded(&mut self) -> Result<Vec<Value>>;
+    /// Read-only identity evidence. Unsupported backends retain strict recovery.
+    fn recovery_models(&mut self) -> Result<Option<Vec<Resident>>> {
+        Ok(None)
+    }
     fn stop_server(&mut self) -> Result<()>;
     fn start_server(&mut self, port: u16) -> Result<()>;
     fn ensure_server(&mut self, port: u16) -> Result<()> {
@@ -69,6 +76,9 @@ pub trait Backend {
 
 /// Bridge existing LM transports and mocks to the neutral operation interface.
 impl<B: Backend + ?Sized> Backend for &mut B {
+    fn recovery_models(&mut self) -> Result<Option<Vec<Resident>>> {
+        (**self).recovery_models()
+    }
     fn snapshot(&mut self) -> Result<Snapshot> {
         (**self).snapshot()
     }
@@ -451,6 +461,9 @@ pub fn server_state(server: &Value) -> (bool, Option<u16>) {
 }
 
 impl Backend for LMStudio {
+    fn recovery_models(&mut self) -> Result<Option<Vec<Resident>>> {
+        loadout::inventory(&self.loaded()?).map(Some)
+    }
     fn loaded(&mut self) -> Result<Vec<Value>> {
         self.cli(&["ps", "--json"])?
             .as_array()

@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.5.2 - 2026-10-07
+
+- LM Studio accepts an already-loaded copy of the same model and quantization, even under another instance name or with different settings. Duplicate saved instances do not force another copy. If the loadout differs, a Cancel-default prompt offers to unload current models and restore saved models, with a fresh check before every confirmed unload.
+- Logs now use a `logs` subfolder, dated filenames, daily and 1024 KiB size rotation, and retention of the 10 newest managed files. Activity opens that folder and reads the latest log. Repeated countdown messages are omitted.
+
+Validated with 320 unit tests and 9 integration tests using isolated fixtures. Live provider operations and the installed app upgrade have not been exercised. Settings and recovery formats are unchanged.
+
 ## 2.5.1 - 2026-10-07
 
 - LM Studio recovery refuses to load a second copy when the saved instance is missing but the same model is already resident under another identifier. Conflicting copies and idle TTL mismatches retain recovery and stop automatic retries until **Resume AI**. Independent healthy models and providers can still finish recovery.

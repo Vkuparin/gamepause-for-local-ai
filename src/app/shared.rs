@@ -34,6 +34,7 @@ pub enum Action {
         ignored: Vec<String>,
     },
     RetryGameplayRestore,
+    ReplaceLMLoadout(crate::lmstudio::LoadoutOffer),
     Disable,
     Refresh,
     Verify,
@@ -75,6 +76,7 @@ impl Action {
 pub struct Shared {
     pub commands: Commands,
     pub restore_offer: Option<RestoreOffer>,
+    pub lm_loadout_offer: Option<crate::lmstudio::LoadoutOffer>,
     pub coexistence: bool,
     pub restore_feedback: Option<RestoreFeedback>,
     pub activity: Activity,

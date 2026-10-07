@@ -45,6 +45,8 @@ struct Mock {
     fail_load: Option<(String, bool)>,
     fail_verify: Option<String>,
     manual_conflict: bool,
+    loadout_policy: bool,
+    refuse_replacement: bool,
     events: Vec<String>,
     path: PathBuf,
 }
@@ -75,6 +77,8 @@ impl Mock {
             fail_load: None,
             fail_verify: None,
             manual_conflict: false,
+            loadout_policy: false,
+            refuse_replacement: false,
             events: Vec::new(),
             path,
         }
@@ -92,6 +96,18 @@ impl Mock {
     }
 }
 impl Backend for Mock {
+    fn recovery_models(&mut self) -> Result<Option<Vec<lmstudio::Resident>>> {
+        Ok(self.loadout_policy.then(|| {
+            self.current
+                .values()
+                .map(|m| lmstudio::Resident {
+                    identifier: m.identifier.clone(),
+                    model_key: m.model_key.clone(),
+                    namespace: m.namespace.clone(),
+                })
+                .collect()
+        }))
+    }
     fn snapshot(&mut self) -> Result<Snapshot> {
         self.events.push("capture".into());
         Ok(self.original.clone())
@@ -131,7 +147,16 @@ impl Backend for Mock {
         Ok(())
     }
     fn unload(&mut self, id: &str) -> Result<()> {
-        self.durable(id, Intent::Pause, "unloading");
+        if self.loadout_policy {
+            let journal: Journal = serde_json::from_slice(&fs::read(&self.path).unwrap()).unwrap();
+            assert_eq!(journal.session.intent, Intent::Restore);
+            validate_original(&self.original, journal.providers[0].payload.lm().unwrap()).unwrap();
+            if self.refuse_replacement {
+                bail!("fixture replacement failed");
+            }
+        } else {
+            self.durable(id, Intent::Pause, "unloading");
+        }
         self.events.push(format!("unload:{id}"));
         self.current.remove(id);
         Ok(())
@@ -561,4 +586,191 @@ fn manual_model_conflict_finishes_healthy_models_then_stops_all_automatic_work()
     .unwrap();
     pump(&mut c, Intent::Restore);
     assert!(c.journal().is_none());
+}
+
+fn loadout_harness(mut backend: Mock) -> Harness {
+    backend.loadout_policy = true;
+    let path = backend.path.clone();
+    let snapshot = backend.original.clone();
+    let runtime = LMRuntime::new(backend, Config::default(), false);
+    let binding = runtime.binding().unwrap();
+    let journal = Journal {
+        schema: 3,
+        session: recovery::Session {
+            intent: Intent::Restore,
+            games: vec![],
+        },
+        providers: vec![Entry {
+            binding: Binding::capture(&Config::default(), &snapshot).unwrap(),
+            payload: Payload::LMStudio(snapshot),
+            restore_complete: false,
+        }],
+    };
+    write_json(&path, &journal).unwrap();
+    Coordinator::new(
+        runtime,
+        JournalFile(path),
+        vec![binding],
+        Some(journal),
+        Duration::from_secs(10),
+    )
+    .unwrap()
+}
+#[test]
+fn same_model_alias_settings_and_duplicate_count_are_accepted_without_mutation() {
+    let fixture = Fixture::new();
+    let mut backend = Mock::new(false, fixture.path());
+    backend.original.models.retain(|m| m.namespace == "llm");
+    let mut duplicate = backend.original.models[0].clone();
+    duplicate.identifier = "llm:2".into();
+    backend.original.models.push(duplicate);
+    let mut resident = backend.original.models[0].clone();
+    resident.identifier = "autoload".into();
+    resident.ttl_ms = None;
+    resident.load_config = json!({"fields":[]});
+    resident.native_config = json!({"context_length":8192});
+    backend.current = [(resident.identifier.clone(), resident.clone())].into();
+    let mut c = loadout_harness(backend);
+    pump(&mut c, Intent::Restore);
+    assert!(c.journal().is_none());
+    assert_eq!(c.runtime.backend.current.len(), 1);
+    assert_eq!(c.runtime.backend.current["autoload"], resident);
+    assert!(c.runtime.backend.events.is_empty());
+    assert!(!c.runtime.backend.running);
+    assert!(
+        c.reports(Duration::ZERO)[0]
+            .note
+            .contains("kept current instance")
+    );
+}
+#[test]
+fn different_loadout_waits_for_confirmation_then_replaces_behind_checkpoints() {
+    let fixture = Fixture::new();
+    let mut backend = Mock::new(true, fixture.path());
+    let mut other = backend.original.models[0].clone();
+    other.model_key = "fixture/other@q8".into();
+    other.identifier = "other".into();
+    backend.current = [("other".into(), other)].into();
+    let mut c = loadout_harness(backend);
+    let original = c.runtime.backend.original.clone();
+    pump(&mut c, Intent::Restore);
+    assert!(c.runtime.backend.events.is_empty());
+    assert!(c.statuses().values().next().unwrap().manual_retry);
+    let offer = c.runtime.progress().loadout_offer().unwrap();
+    let snapshot = c.journal().unwrap().providers[0].payload.lm().unwrap();
+    validate_original(&original, snapshot).unwrap();
+    for _ in 0..8 {
+        c.advance(Intent::Restore, &[], Duration::from_secs(100), &mut || {
+            false
+        })
+        .unwrap();
+    }
+    assert!(c.runtime.backend.events.is_empty());
+    let bindings = vec![c.runtime.binding().unwrap()];
+    let (runtime, store, mut memory) = c.into_parts();
+    let mut progress = runtime.progress();
+    progress.approve_replacement(&offer).unwrap();
+    memory.request_retry();
+    let mut c = Coordinator::resume(
+        runtime.with_progress(progress),
+        store,
+        bindings,
+        memory,
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    pump(&mut c, Intent::Restore);
+    assert!(c.journal().is_none());
+    assert_eq!(c.runtime.backend.events.first().unwrap(), "unload:other");
+    assert_eq!(c.runtime.backend.current.len(), 2);
+    assert!(c.runtime.backend.current.contains_key("llm"));
+}
+#[test]
+fn stale_replacement_and_restart_cannot_unload_changed_models() {
+    for restart in [false, true] {
+        let fixture = Fixture::new();
+        let mut backend = Mock::new(true, fixture.path());
+        backend.current.get_mut("llm").unwrap().model_key = "fixture/changed@q8".into();
+        let mut c = loadout_harness(backend);
+        pump(&mut c, Intent::Restore);
+        let offer = c.runtime.progress().loadout_offer().unwrap();
+        let bindings = vec![c.runtime.binding().unwrap()];
+        let (runtime, store, mut memory) = c.into_parts();
+        let mut progress = runtime.progress();
+        progress.approve_replacement(&offer).unwrap();
+        let mut runtime = runtime.with_progress(progress);
+        runtime.backend.current.get_mut("llm").unwrap().model_key = "fixture/new@q4".into();
+        memory.request_retry();
+        let mut c = if restart {
+            Coordinator::new(
+                LMRuntime::new(runtime.backend, Config::default(), false),
+                store,
+                bindings,
+                memory.journal().cloned(),
+                Duration::from_secs(10),
+            )
+            .unwrap()
+        } else {
+            Coordinator::resume(runtime, store, bindings, memory, Duration::from_secs(10)).unwrap()
+        };
+        pump(&mut c, Intent::Restore);
+        assert!(c.runtime.backend.events.is_empty());
+        assert!(c.journal().is_some());
+        assert!(c.runtime.progress().loadout_offer().is_some());
+    }
+}
+
+#[test]
+fn replacement_failure_keeps_original_recovery_and_power_revokes_approval() {
+    let fixture = Fixture::new();
+    let mut backend = Mock::new(true, fixture.path());
+    backend.current.get_mut("llm").unwrap().model_key = "fixture/different@q8".into();
+    backend.refuse_replacement = true;
+    let mut c = loadout_harness(backend);
+    pump(&mut c, Intent::Restore);
+    let original = c.journal().unwrap().providers[0]
+        .payload
+        .lm()
+        .unwrap()
+        .clone();
+    let offer = c.runtime.progress().loadout_offer().unwrap();
+    let bindings = vec![c.runtime.binding().unwrap()];
+    let (runtime, store, mut memory) = c.into_parts();
+    let mut progress = runtime.progress();
+    progress.approve_replacement(&offer).unwrap();
+    let mut revoked = progress.clone();
+    revoked.revoke_replacement();
+    assert!(revoked.replacement.is_none());
+    memory.request_retry();
+    let mut c = Coordinator::resume(
+        runtime.with_progress(progress),
+        store,
+        bindings,
+        memory,
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    pump(&mut c, Intent::Restore);
+    assert!(c.journal().is_some());
+    validate_original(
+        &original,
+        c.journal().unwrap().providers[0].payload.lm().unwrap(),
+    )
+    .unwrap();
+    assert!(c.runtime.backend.events.is_empty());
+}
+
+#[test]
+fn own_empty_loadout_restoration_preserves_original_server_lifecycle() {
+    for running in [false, true] {
+        let fixture = Fixture::new();
+        let mut backend = Mock::new(running, fixture.path());
+        backend.current.clear();
+        backend.running = false;
+        let mut c = loadout_harness(backend);
+        pump(&mut c, Intent::Restore);
+        assert!(c.journal().is_none());
+        assert_eq!(c.runtime.backend.running, running);
+        assert_eq!(c.runtime.backend.current.len(), 2);
+    }
 }

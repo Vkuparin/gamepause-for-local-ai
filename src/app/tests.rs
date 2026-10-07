@@ -980,7 +980,7 @@ fn panic_hook_logs_to_gamepause_log() {
     install_panic_hook(&folder);
     let caught = std::panic::catch_unwind(|| panic!("hook-test panic"));
     assert!(caught.is_err(), "the test panic should have been raised");
-    let log_bytes = fs::read(folder.join("gamepause.log")).unwrap();
+    let log_bytes = fs::read(worker_log_path(&folder).unwrap()).unwrap();
     let log_text = String::from_utf8_lossy(&log_bytes);
     assert!(
         log_text.contains("hook-test panic"),
@@ -995,7 +995,7 @@ fn panic_hook_logs_to_gamepause_log() {
         "log should contain the panic location (file): {log_text:?}"
     );
     std::panic::set_hook(previous);
-    let _ = fs::remove_file(folder.join("gamepause.log"));
+    let _ = fs::remove_file(worker_log_path(&folder).unwrap());
 }
 #[test]
 fn recovery_guard_uses_remembered_paths_even_after_exclusion_and_removal() {
@@ -1388,13 +1388,14 @@ fn ask_answer_never_authorizes_another_instance_or_a_stale_click() {
 #[test]
 fn worker_log_identifies_the_build_and_surfaces_write_failures() {
     let folder = std::env::temp_dir().join(format!("gamepause-log-health-{}", std::process::id()));
-    fs::create_dir_all(folder.join("gamepause.log")).unwrap();
+    fs::create_dir_all(&folder).unwrap();
+    fs::write(folder.join("logs"), "fixture blocking directory").unwrap();
     log(&folder, "fixture failed write");
     assert!(log_error(&folder).unwrap().contains("could not be written"));
-    fs::remove_dir(folder.join("gamepause.log")).unwrap();
+    fs::remove_file(folder.join("logs")).unwrap();
     log(&folder, "fixture recovered write");
     assert!(log_error(&folder).is_none());
-    let text = fs::read_to_string(folder.join("gamepause.log")).unwrap();
+    let text = fs::read_to_string(worker_log_path(&folder).unwrap()).unwrap();
     assert!(text.contains(&format!(
         "GamePause {} (PID {}) fixture recovered write",
         env!("CARGO_PKG_VERSION"),

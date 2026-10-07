@@ -391,7 +391,25 @@ impl<B: Backend> Engine<B> {
         self.disabled = false;
     }
     /// Power events carry no game/provider evidence and authorize no mutation.
+    pub fn lm_loadout_offer(&self) -> Option<crate::lmstudio::LoadoutOffer> {
+        self.adapter_progress
+            .as_ref()
+            .and_then(|p| p.loadout_offer())
+    }
+    pub fn approve_lm_replacement(&mut self, offer: &crate::lmstudio::LoadoutOffer) -> Result<()> {
+        if !self.pending() || self.config.mode != "active" {
+            bail!("LM Studio recovery is no longer pending");
+        }
+        self.adapter_progress
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("LM Studio recovery changed"))?
+            .approve_replacement(offer)
+    }
+    /// Power events carry no approval for replacing a user loadout.
     pub fn resume_detected(&mut self) {
+        if let Some(progress) = &mut self.adapter_progress {
+            progress.revoke_replacement();
+        }
         self.resume_pending = true;
         self.resume_grace = true;
         self.retry_at = 0.;
@@ -798,12 +816,18 @@ impl<B: Backend> Engine<B> {
             bail!("AI recovery is pending; re-enable its provider in Advanced. Recovery retained");
         }
         if cancelled() {
+            if let Some(progress) = &mut self.adapter_progress {
+                progress.revoke_replacement();
+            }
             self.set_activity(Activity::Recovery);
             self.message = "Game restarted; restoration deferred".into();
             return Ok(());
         }
         self.set_activity(Activity::Restoring);
         if !self.restore_units(cancelled, compare)? {
+            if let Some(progress) = &mut self.adapter_progress {
+                progress.revoke_replacement();
+            }
             if self.power_interrupted() {
                 self.set_activity(Activity::DetectionUnavailable);
                 self.message =

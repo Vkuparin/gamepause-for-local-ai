@@ -81,6 +81,7 @@ enum Modal {
     Remove(Row),
     Resume(crate::gameplay::RestoreOffer, Vec<bool>),
     Verify,
+    ReplaceLM(crate::lmstudio::LoadoutOffer),
     Help,
     /// Escape was pressed in Advanced with unsaved edits.
     Discard,
@@ -113,6 +114,7 @@ struct Dashboard {
     window_icon: Option<Color32>,
     icons: crate::game_icons::Cache,
     worker_log: Option<String>,
+    shown_lm_offer: Option<crate::lmstudio::LoadoutOffer>,
 }
 impl Dashboard {
     fn new(
@@ -149,6 +151,7 @@ impl Dashboard {
             window_icon: None,
             icons: Default::default(),
             worker_log: None,
+            shown_lm_offer: None,
         }
     }
     fn action(&self, action: Action, label: &str) {
@@ -172,6 +175,10 @@ impl Dashboard {
     }
     fn resume(&mut self, s: &Shared) {
         let a = s.controls().availability();
+        if let Some(offer) = &s.lm_loadout_offer {
+            self.modal = Some(Modal::ReplaceLM(offer.clone()));
+            return;
+        }
         if !s.pending && a.resume {
             crate::app::request_core(&self.shared, &self.tx, CoreCommand::Resume);
         } else if !a.restore {
@@ -196,6 +203,16 @@ impl Dashboard {
 
 impl Dashboard {
     fn draw(&mut self, ctx: &Context, s: &Shared) {
+        if s.lm_loadout_offer.is_none() {
+            self.shown_lm_offer = None;
+        }
+        if self.modal.is_none()
+            && s.lm_loadout_offer != self.shown_lm_offer
+            && let Some(offer) = &s.lm_loadout_offer
+        {
+            self.modal = Some(Modal::ReplaceLM(offer.clone()));
+            self.shown_lm_offer = Some(offer.clone());
+        }
         let contrast = crate::theme::high_contrast();
         let dark = crate::theme::effective_dark(s.config.appearance);
         let hero = hero(s);

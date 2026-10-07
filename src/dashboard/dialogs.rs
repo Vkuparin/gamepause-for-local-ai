@@ -45,6 +45,21 @@ pub(super) fn confirmed_resume(
         ignored,
     })
 }
+pub(super) fn confirmed_lm_replacement(
+    s: &Shared,
+    offer: &crate::lmstudio::LoadoutOffer,
+) -> Result<Action, String> {
+    if s.lm_loadout_offer.as_ref() != Some(offer)
+        || !s.controls().availability().restore
+        || !s.active_games.is_empty()
+        || s.commands.settings_pending
+    {
+        return Err(
+            "Loadout or control availability changed; review the current prompt again.".into(),
+        );
+    }
+    Ok(Action::ReplaceLMLoadout(offer.clone()))
+}
 impl Dashboard {
     pub(super) fn modal(&mut self, ctx: &Context, s: &Shared, p: Palette) {
         let Some(mut modal) = self.modal.take() else {
@@ -61,6 +76,7 @@ impl Dashboard {
             Modal::Remove(..) => "Remove custom game?",
             Modal::Resume(..) => "Resume AI while a game is running?",
             Modal::Verify => "Test live pause and restore?",
+            Modal::ReplaceLM(_) => "Replace loaded LM Studio models?",
             Modal::Help => "Keyboard and controls",
             Modal::Discard => "Discard unsaved settings?",
         };
@@ -92,6 +108,16 @@ impl Dashboard {
                     });
                     ui.colored_label(p.muted,"Ignore selections are optional. Resume works without selecting any games.");
                 },
+                Modal::ReplaceLM(offer)=> {
+                    ui.label("Loaded LM Studio model doesn't match saved configuration; do you want to unload the current model(s) and load the saved model(s)?");
+                    ui.colored_label(p.error,"This interrupts current generation and replaces the loaded models.");
+                    ScrollArea::vertical().max_height(220.0).show(ui,|ui| {
+                        ui.strong("Currently loaded");
+                        for model in &offer.loaded { ui.label(format!("{} ({})",model.model_key,model.identifier)); }
+                        ui.strong("Saved models");
+                        for model in &offer.saved { ui.label(format!("{} ({})",model.model_key,model.identifier)); }
+                    });
+                },
                 Modal::Verify=> {ui.label("This live test captures settings, unloads models and restores them. It can interrupt current inference. Recovery safeguards and fresh game checks remain in force.");},
                 Modal::Discard=> {ui.label("Advanced has edits that were not saved. Discard them and go back to games, or keep editing.");},
                 Modal::Help=> {ui.label("Tab / Shift+Tab moves focus. Enter / Space activates controls. Arrow keys select table rows. Escape closes this dialog or returns to Games. F1 opens this help. Closing the dashboard keeps the tray watcher running. Quit uses the existing safe shutdown path.");},
@@ -103,7 +129,7 @@ impl Dashboard {
                 // Cancel is first in keyboard order. Dangerous actions require explicit activation.
                 if first {cancel_button.request_focus();}
                 cancel=cancel_button.clicked();
-                let label=match modal {Modal::Add{..}=>"Add game",Modal::Rename(..)=>"Rename",Modal::Remove(..)=>"Remove",Modal::Resume(..)=>"Resume AI",Modal::Verify=>"Test round-trip",Modal::Discard=>"Discard",Modal::Help=>""};
+                let label=match modal {Modal::Add{..}=>"Add game",Modal::Rename(..)=>"Rename",Modal::Remove(..)=>"Remove",Modal::Resume(..)=>"Resume AI",Modal::Verify=>"Test round-trip",Modal::ReplaceLM(_)=>"Unload current and restore saved",Modal::Discard=>"Discard",Modal::Help=>""};
                 if !label.is_empty(){accepted=ui.add_enabled(!s.commands.settings_pending,Button::new(label).fill(p.selected).stroke(Stroke::new(1.0_f32,p.accent))).clicked();}
             });
         });
@@ -166,6 +192,13 @@ impl Dashboard {
                 Modal::Resume(offer, checked) => match confirmed_resume(s, offer, checked) {
                     Ok(action) => {
                         self.action(action, "Resume AI during gameplay");
+                        return;
+                    }
+                    Err(error) => self.validation = error,
+                },
+                Modal::ReplaceLM(offer) => match confirmed_lm_replacement(s, offer) {
+                    Ok(action) => {
+                        self.action(action, "Replace LM Studio loadout");
                         return;
                     }
                     Err(error) => self.validation = error,
