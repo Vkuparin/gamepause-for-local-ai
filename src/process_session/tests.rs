@@ -204,7 +204,8 @@ fn stops_then_relaunches_each_instance_with_its_own_command() {
     assert_eq!(c.runtime.os.stopped, [1, 2]);
     assert_eq!(c.runtime.os.processes.len(), 1, "another path is untouched");
     let saved = serde_json::to_string(&c.store.journal().unwrap()).unwrap();
-    assert!(!saved.contains("fixture-secret") && !saved.contains("8080"));
+    // Markers that hex ciphertext cannot spell by chance, unlike a bare "8080".
+    assert!(!saved.contains("fixture-secret") && !saved.contains("--port"));
     drive(&mut c, Intent::Restore, 1);
     assert!(c.journal().is_none());
     assert_eq!(
