@@ -1,5 +1,8 @@
 use super::*;
-use super::{game_rules::add_game, view_data::ignored};
+use super::{
+    game_rules::{add_game, exclude_executable, set_ask, set_ignored},
+    view_data::ignored,
+};
 #[test]
 fn adding_executable_deduplicates_and_clears_ignore() {
     let mut config = Config::default();
