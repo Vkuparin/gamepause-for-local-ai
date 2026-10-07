@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.5.0 — 2026-10-07
+
+- No change in behavior. The source was reorganized into smaller files, and a test that failed by chance about once in thirty runs was fixed.
+- README screenshots and the recording were retaken with this version.
+
+Checked on one Windows 11 PC with a real game: LM Studio (one 27B model) and Ollama 0.40.0 (one small model) paused and restored, the Ollama model with the keep-alive time it had left. Not yet tested: sleep and wake, uninstalling, a real Ollama reload slower than ten seconds, real llama.cpp or KoboldCpp, the Scoop manifest, and Windows 10.
+
 ## 2.3.0 — 2026-10-07
 
 - GOG games are found automatically, whether they were installed through GOG Galaxy or with a GOG offline installer. DLC is not listed as a game of its own.
