@@ -1,4 +1,25 @@
 use super::*;
+#[test]
+fn desktop_opt_in_defaults_off_and_round_trips_without_format_migration() {
+    let mut config = Config::default();
+    assert!(matches!(
+        config.providers[1],
+        Provider::Ollama {
+            prevent_reload: false,
+            ..
+        }
+    ));
+    let old = serde_json::to_value(&config).unwrap();
+    assert!(old["providers"][1].get("prevent_reload").is_none());
+    assert_eq!(Config::parse(&old.to_string()).unwrap(), config);
+    if let Provider::Ollama { prevent_reload, .. } = &mut config.providers[1] {
+        *prevent_reload = true;
+    }
+    let saved = serde_json::to_string(&config).unwrap();
+    let parsed = Config::parse(&saved).unwrap();
+    assert_eq!(parsed.settings_version, 4);
+    assert_eq!(parsed, config);
+}
 struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {

@@ -4,6 +4,8 @@ GamePause reads local launcher metadata and process paths. It communicates only 
 configured loopback LM Studio and Ollama addresses. There is no telemetry, store authentication, or cloud API. Start commands of other AI apps that GamePause stops are stored encrypted with Windows per-user data protection, since they can contain API keys; this guards a copied or shared journal, not other programs already running as the same user.
 The app does not change game files or filesystem permissions.
 
+Opt-in Ollama Desktop shutdown/restart also encrypts the captured command, working directory, environment and effective server configuration with Windows per-user data protection. Recovery verifies executable hashes and native process/endpoint ownership before control. Requests arriving during Desktop shutdown may be canceled. These checks cannot exclude a third-party launch after the final check.
+
 Local configuration, inventory, status, recovery state, and rotated logs live under
 `%LOCALAPPDATA%\GamePause`. They can reveal game/model names and filesystem paths.
 Review and redact them before sharing. `GAMEPAUSE_LM_API_TOKEN` is read from the environment;

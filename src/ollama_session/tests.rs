@@ -65,6 +65,7 @@ impl Transport for Fake {
             return Err(Unreachable.into());
         }
         let value = match path {
+            "/api/version" => json!({"version":"0.40.3"}),
             "/api/ps" => {
                 self.inventories += 1;
                 if self.changed_capture && self.inventories == 2 {
@@ -153,6 +154,354 @@ impl Transport for Fake {
         };
         Ok(serde_json::to_vec(&value).unwrap())
     }
+}
+
+#[derive(Default)]
+struct DesktopState {
+    calls: Vec<&'static str>,
+    fail: Option<&'static str>,
+    stopped: bool,
+    started: bool,
+    external: bool,
+    unsupported: bool,
+}
+struct FakeDesktop {
+    disk: Disk,
+    state: Arc<Mutex<DesktopState>>,
+}
+pub(crate) fn desktop_capture() -> desktop::Capture {
+    desktop::Capture {
+        version: desktop::SUPPORTED_VERSION.into(),
+        source_revision: desktop::SOURCE_REVISION.into(),
+        executable: "C:\\Fixture\\Ollama\\ollama app.exe".into(),
+        executable_sha256: "a".repeat(64),
+        server_sha256: "b".repeat(64),
+        sealed_startup: "ab".repeat(64),
+        instance: desktop::Instance {
+            app: desktop::Process {
+                pid: 10,
+                created_at: 100,
+            },
+            server: Some(desktop::Process {
+                pid: 11,
+                created_at: 101,
+            }),
+        },
+    }
+}
+impl FakeDesktop {
+    fn call(&mut self, name: &'static str, phase: desktop::Phase) -> Result<()> {
+        let journal = self
+            .disk
+            .journal()
+            .expect("lifecycle intent must be durable before native work");
+        let d = journal.providers[0].payload.desktop.as_ref().unwrap();
+        assert_eq!(d.phase, phase);
+        assert_eq!(d.original, desktop_capture());
+        let mut state = self.state.lock().unwrap();
+        state.calls.push(name);
+        if name == "stop" {
+            state.stopped = true;
+        }
+        if name == "start" {
+            state.started = true;
+        }
+        if state.fail == Some(name) {
+            state.fail = None;
+            bail!("fixture lost lifecycle acknowledgement");
+        }
+        Ok(())
+    }
+    fn started(&self, ready: bool) -> desktop::Started {
+        let state = self.state.lock().unwrap();
+        desktop::Started {
+            instance: desktop::Instance {
+                app: desktop::Process {
+                    pid: if state.external { 30 } else { 20 },
+                    created_at: 200,
+                },
+                server: ready.then_some(desktop::Process {
+                    pid: 21,
+                    created_at: 201,
+                }),
+            },
+            external: state.external,
+        }
+    }
+}
+impl desktop::Control for FakeDesktop {
+    fn capture(&mut self, _: &str, _: &str) -> Result<desktop::Eligibility> {
+        if self.state.lock().unwrap().unsupported {
+            Ok(desktop::Eligibility::Fallback(
+                "Fixture unsupported; unload only.".into(),
+            ))
+        } else {
+            Ok(desktop::Eligibility::Supported(desktop_capture()))
+        }
+    }
+    fn request_stop(&mut self, _: &DesktopSnapshot, _: &str) -> Result<()> {
+        if self.state.lock().unwrap().external {
+            bail!("external instance cannot be stopped");
+        }
+        self.call("stop", desktop::Phase::Stopping)?;
+        Ok(())
+    }
+    fn verify_stopped(&mut self, _: &DesktopSnapshot, _: &str) -> Result<()> {
+        self.call("stopped", desktop::Phase::Stopped)
+    }
+    fn start(&mut self, _: &DesktopSnapshot, _: &str) -> Result<desktop::Started> {
+        self.call("start", desktop::Phase::Starting)?;
+        Ok(self.started(false))
+    }
+    fn verify_ready(&mut self, snapshot: &DesktopSnapshot, _: &str) -> Result<desktop::Started> {
+        self.call("ready", snapshot.phase)?;
+        Ok(self.started(true))
+    }
+}
+fn lifecycle_fixture() -> (TestCoordinator, Arc<Mutex<DesktopState>>) {
+    let (mut adapter, disk, _) = fixture().into_parts();
+    let state = Arc::new(Mutex::new(DesktopState::default()));
+    adapter.desktop = Some(Box::new(FakeDesktop {
+        disk: disk.clone(),
+        state: state.clone(),
+    }));
+    adapter.prevent_reload = true;
+    (
+        Coordinator::new(
+            adapter,
+            disk,
+            vec![binding()],
+            None,
+            Duration::from_secs(10),
+        )
+        .unwrap(),
+        state,
+    )
+}
+fn lifecycle_drive(c: &mut TestCoordinator, intent: Intent, now: u64) {
+    for _ in 0..16 {
+        c.advance(intent, &[], Duration::from_secs(now), &mut || false)
+            .unwrap();
+    }
+}
+#[test]
+fn desktop_units_checkpoint_each_change_and_verify_before_completion() {
+    let (mut c, state) = lifecycle_fixture();
+    lifecycle_drive(&mut c, Intent::Pause, 0);
+    assert!(c.pause_complete());
+    let captured = c.journal().unwrap().providers[0].payload.clone();
+    assert_eq!(captured.version, 2);
+    assert_eq!(
+        captured.desktop.as_ref().unwrap().phase,
+        desktop::Phase::Stopped
+    );
+    assert!(captured.note().contains("managed server stopped"));
+    let inventories = c.runtime.transport.inventories;
+    lifecycle_drive(&mut c, Intent::Pause, 1);
+    assert_eq!(
+        inventories, c.runtime.transport.inventories,
+        "completed pause performs no polling"
+    );
+    lifecycle_drive(&mut c, Intent::Restore, 2);
+    assert!(c.journal().is_none());
+    assert_eq!(
+        state.lock().unwrap().calls,
+        ["stop", "stopped", "start", "ready", "ready"]
+    );
+    assert_eq!(c.runtime.transport.posts.len(), 4);
+}
+#[test]
+fn lifecycle_restart_recovers_each_lost_acknowledgement_without_losing_originals() {
+    for failure in ["stop", "stopped", "start", "ready"] {
+        let (mut c, state) = lifecycle_fixture();
+        state.lock().unwrap().fail = Some(failure);
+        lifecycle_drive(&mut c, Intent::Pause, 0);
+        if matches!(failure, "start" | "ready") {
+            lifecycle_drive(&mut c, Intent::Restore, 1);
+        }
+        let saved = c.journal().unwrap().clone();
+        assert_eq!(
+            saved.providers[0]
+                .payload
+                .desktop
+                .as_ref()
+                .unwrap()
+                .original,
+            desktop_capture()
+        );
+        let (adapter, disk, _) = c.into_parts();
+        let mut restarted = Coordinator::new(
+            adapter,
+            disk,
+            vec![binding()],
+            Some(saved),
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        lifecycle_drive(&mut restarted, Intent::Restore, 20);
+        assert!(restarted.journal().is_none(), "failed phase {failure}");
+        assert_eq!(restarted.runtime.transport.resident.len(), 2);
+    }
+}
+#[test]
+fn unsupported_desktop_falls_back_without_lifecycle_calls() {
+    let (mut c, state) = lifecycle_fixture();
+    state.lock().unwrap().unsupported = true;
+    lifecycle_drive(&mut c, Intent::Pause, 0);
+    let snapshot = &c.journal().unwrap().providers[0].payload;
+    assert!(snapshot.desktop.is_none());
+    assert!(snapshot.note().contains("unsupported"));
+    lifecycle_drive(&mut c, Intent::Restore, 1);
+    assert!(c.journal().is_none());
+    assert!(state.lock().unwrap().calls.is_empty());
+}
+#[test]
+fn absent_service_does_not_probe_desktop_even_when_opted_in() {
+    let (mut c, state) = lifecycle_fixture();
+    c.runtime.transport.down = true;
+    lifecycle_drive(&mut c, Intent::Pause, 0);
+    assert!(c.pause_complete());
+    assert!(c.journal().unwrap().providers[0].payload.absent);
+    lifecycle_drive(&mut c, Intent::Restore, 1);
+    assert!(c.journal().is_none());
+    assert!(state.lock().unwrap().calls.is_empty());
+}
+#[test]
+fn desktop_payload_guards_versions_immutable_evidence_and_false_completion() {
+    let (mut c, _) = lifecycle_fixture();
+    lifecycle_drive(&mut c, Intent::Pause, 0);
+    let original = c.journal().unwrap().providers[0].payload.clone();
+    let mut changed = original.clone();
+    changed.version = 1;
+    assert!(changed.validate().is_err());
+    changed.version = 3;
+    assert!(changed.validate().is_err());
+    changed = original.clone();
+    changed.desktop.as_mut().unwrap().original.executable_sha256 = "c".repeat(64);
+    assert!(original.validate_transition(&changed).is_err());
+    changed = original;
+    changed.desktop.as_mut().unwrap().phase = desktop::Phase::Ready;
+    assert!(changed.validate().is_err());
+}
+
+#[test]
+fn new_game_during_desktop_start_reconciles_server_before_repause() {
+    let (mut c, state) = lifecycle_fixture();
+    lifecycle_drive(&mut c, Intent::Pause, 0);
+    for _ in 0..4 {
+        c.advance(Intent::Restore, &[], Duration::from_secs(1), &mut || false)
+            .unwrap();
+        if c.journal().unwrap().providers[0]
+            .payload
+            .desktop
+            .as_ref()
+            .unwrap()
+            .current
+            .server
+            .is_none()
+        {
+            break;
+        }
+    }
+    assert!(
+        c.journal().unwrap().providers[0]
+            .payload
+            .desktop
+            .as_ref()
+            .unwrap()
+            .current
+            .server
+            .is_none()
+    );
+    lifecycle_drive(&mut c, Intent::Pause, 2);
+    assert!(c.pause_complete());
+    assert_eq!(
+        state.lock().unwrap().calls,
+        ["stop", "stopped", "start", "ready", "stop", "stopped"]
+    );
+    lifecycle_drive(&mut c, Intent::Restore, 3);
+    assert!(c.journal().is_none());
+}
+#[test]
+fn failed_model_restore_rechecks_desktop_readiness_before_retrying_loads() {
+    let (mut c, state) = lifecycle_fixture();
+    lifecycle_drive(&mut c, Intent::Pause, 0);
+    c.runtime.transport.fail = Some((false, false));
+    lifecycle_drive(&mut c, Intent::Restore, 1);
+    assert!(c.journal().is_some());
+    assert_eq!(
+        c.journal().unwrap().providers[0]
+            .payload
+            .desktop
+            .as_ref()
+            .unwrap()
+            .phase,
+        desktop::Phase::Ready
+    );
+    c.runtime.transport.fail = None;
+    lifecycle_drive(&mut c, Intent::Restore, 20);
+    assert!(c.journal().is_none());
+    assert_eq!(
+        state
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .filter(|call| **call == "start")
+            .count(),
+        2
+    );
+}
+#[test]
+fn externally_restarted_instance_can_restore_but_never_gains_stop_authority() {
+    let (mut c, state) = lifecycle_fixture();
+    lifecycle_drive(&mut c, Intent::Pause, 0);
+    state.lock().unwrap().external = true;
+    for _ in 0..4 {
+        c.advance(Intent::Restore, &[], Duration::from_secs(1), &mut || false)
+            .unwrap();
+        if c.journal().unwrap().providers[0]
+            .payload
+            .desktop
+            .as_ref()
+            .unwrap()
+            .phase
+            == desktop::Phase::Ready
+        {
+            break;
+        }
+    }
+    assert!(
+        c.journal().unwrap().providers[0]
+            .payload
+            .desktop
+            .as_ref()
+            .unwrap()
+            .external_restart
+    );
+    lifecycle_drive(&mut c, Intent::Pause, 2);
+    assert!(!c.pause_complete());
+    assert_eq!(
+        state
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .filter(|call| **call == "stop")
+            .count(),
+        1
+    );
+    assert_eq!(
+        c.journal().unwrap().providers[0]
+            .payload
+            .desktop
+            .as_ref()
+            .unwrap()
+            .original,
+        desktop_capture()
+    );
+    lifecycle_drive(&mut c, Intent::Restore, 20);
+    assert!(c.journal().is_none());
 }
 fn binding() -> Binding {
     Binding {
@@ -966,6 +1315,69 @@ fn held_unload_only_model_defers_pause_until_it_is_absent() {
     drive(&mut c, Intent::Restore, 11);
     assert!(c.journal().is_none());
     assert!(c.runtime.transport.resident.is_empty());
+}
+#[test]
+fn client_reload_before_final_inventory_defers_pause_and_keeps_originals() {
+    let mut c = fixture();
+    for _ in 0..8 {
+        c.advance(Intent::Pause, &[], Duration::ZERO, &mut || false)
+            .unwrap();
+        if c.runtime.transport.posts.len() == 2 {
+            break;
+        }
+    }
+    assert_eq!(c.runtime.transport.posts.len(), 2);
+    assert!(!c.pause_complete());
+    let originals = c.journal().unwrap().providers[0]
+        .payload
+        .models
+        .iter()
+        .map(|model| model.original.clone())
+        .collect::<Vec<_>>();
+    let name = "fixture-a:latest";
+    c.runtime
+        .transport
+        .resident
+        .insert(name.into(), c.runtime.transport.catalog[name].clone());
+    drive(&mut c, Intent::Pause, 0);
+    assert!(!c.pause_complete());
+    assert_eq!(c.statuses()["ollama-main"].state, State::Deferred);
+    assert_eq!(c.runtime.transport.posts.len(), 2);
+    assert_eq!(
+        c.store.journal().unwrap().providers[0]
+            .payload
+            .models
+            .iter()
+            .map(|model| model.original.clone())
+            .collect::<Vec<_>>(),
+        originals
+    );
+}
+
+#[test]
+fn completed_unload_only_pause_does_not_poll_or_fight_a_client_reload() {
+    let mut c = fixture();
+    drive(&mut c, Intent::Pause, 0);
+    assert!(c.pause_complete());
+    let saved = c.store.0.lock().unwrap().clone();
+    let reads = c.runtime.transport.inventories;
+    let posts = c.runtime.transport.posts.clone();
+    let name = "fixture-a:latest";
+    c.runtime
+        .transport
+        .resident
+        .insert(name.into(), c.runtime.transport.catalog[name].clone());
+    for now in [1, 10, 300, 3600] {
+        assert_eq!(
+            c.advance(Intent::Pause, &[], Duration::from_secs(now), &mut || false)
+                .unwrap(),
+            Step::Idle
+        );
+    }
+    assert_eq!(c.runtime.transport.inventories, reads);
+    assert_eq!(c.runtime.transport.posts, posts);
+    assert!(c.runtime.transport.resident.contains_key(name));
+    assert_eq!(*c.store.0.lock().unwrap(), saved);
 }
 #[test]
 fn short_frozen_residency_ending_before_verification_is_expiry_not_eviction() {

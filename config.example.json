@@ -20,7 +20,8 @@
       "kind": "ollama",
       "id": "ollama-main",
       "enabled": true,
-      "endpoint": "127.0.0.1:11434"
+      "endpoint": "127.0.0.1:11434",
+      "prevent_reload": false
     },
     {
       "kind": "process",

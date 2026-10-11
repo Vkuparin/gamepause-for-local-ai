@@ -171,11 +171,13 @@ impl Dashboard {
                     SettingsPage::Ollama=> {
                         ui.heading("Ollama");
                         ui.label("Works when Ollama is running; nothing happens when it is not. Local models are unloaded for gaming. GGUF completion models come back with their context and the keep-alive time they had left; other local models, such as embedding models, stay unloaded. Full load options, parallelism, conversations and KV cache are not preserved.");
-                        ui.label("Ollama itself keeps running. GamePause does not download models or fight later client reloads. Tested with Ollama 0.35.1 and 0.40.0.");
+                        ui.label("Ordinary unloading leaves Ollama running, so clients can reload models. GamePause does not download models.");
                         let editable=!s.provider_pending(crate::provider::Kind::Ollama);
                         ui.add_enabled_ui(editable,|ui| {
-                            if let Some(crate::config::Provider::Ollama{enabled,endpoint,..})=self.edit_config.providers.iter_mut().find(|p|p.kind()==crate::provider::Kind::Ollama) {
+                            if let Some(crate::config::Provider::Ollama{enabled,endpoint,prevent_reload,..})=self.edit_config.providers.iter_mut().find(|p|p.kind()==crate::provider::Kind::Ollama) {
                                 self.dirty |= ui.styled_checkbox(enabled,"Pause Ollama models while gaming").changed();
+                                self.dirty |= ui.styled_checkbox(prevent_reload,"Prevent Ollama from reloading models while gaming").changed();
+                                ui.label("Temporarily closes and restarts Ollama Desktop, including its UI. Supported with verified Windows Ollama 0.40.3; other installations use ordinary unloading. Requests arriving during shutdown may be canceled. External restarts are left alone.");
                                 ui.label("Loopback endpoint");self.dirty |= ui.text_edit_singleline(endpoint).changed();
                             } else {ui.label("No Ollama entry is configured.");}
                         });

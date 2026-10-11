@@ -194,16 +194,22 @@ impl<L: Runtime, O: Runtime> Runtime for Router<L, O> {
 
 /// Loopback transport with a control claim retained by the engine-owned adapter.
 pub struct ClaimedHttp {
+    desktop: bool,
     http: crate::ollama_session::Http,
     binding: Binding,
     claims: crate::ownership::SharedClaims,
 }
 impl ClaimedHttp {
     fn claim(&self) -> Result<()> {
-        self.claims
+        let mut claims = self
+            .claims
             .lock()
-            .map_err(|_| anyhow::anyhow!("Ollama ownership lock failed"))?
-            .claim(&self.binding.id, Kind::Ollama, &[&self.binding.endpoint])
+            .map_err(|_| anyhow::anyhow!("Ollama ownership lock failed"))?;
+        if self.desktop {
+            claims.claim_ollama_desktop(&self.binding.id, &[&self.binding.endpoint])
+        } else {
+            claims.claim(&self.binding.id, Kind::Ollama, &[&self.binding.endpoint])
+        }
     }
 }
 impl crate::ollama_session::Transport for ClaimedHttp {
@@ -279,6 +285,12 @@ impl Runtime for OllamaRuntime {
         entry: &Entry<Self::Payload>,
         intent: Intent,
     ) -> Result<Planned<Self::Payload, Self::Work>> {
+        if entry.payload.desktop.is_some()
+            && let Some(adapter) = &mut self.adapter
+        {
+            adapter.transport.desktop = true;
+            adapter.transport.claim()?;
+        }
         self.adapter
             .as_mut()
             .filter(|_| self.active)
@@ -453,15 +465,30 @@ impl OllamaRuntime {
                     guarantee: Guarantee::SupportedFields,
                 };
                 let transport = ClaimedHttp {
+                    desktop: matches!(
+                        provider,
+                        crate::config::Provider::Ollama {
+                            prevent_reload: true,
+                            ..
+                        }
+                    ),
                     http: crate::ollama_session::Http::new(&endpoint)?,
                     binding: binding.clone(),
                     claims: Default::default(),
                 };
-                crate::ollama_session::Adapter::new(
+                let mut adapter = crate::ollama_session::Adapter::new(
                     transport,
                     crate::ollama_session::SystemClock::default(),
                     binding,
-                )
+                )?;
+                adapter.prevent_reload(matches!(
+                    provider,
+                    crate::config::Provider::Ollama {
+                        prevent_reload: true,
+                        ..
+                    }
+                ));
+                Ok(adapter)
             })();
             match created {
                 Ok(adapter) => self.adapter = Some(adapter),

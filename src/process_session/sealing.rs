@@ -6,13 +6,19 @@ use anyhow::{Context, Result, bail};
 /// Encrypts with Windows per-user data protection and hex-encodes the result.
 /// Another account or another PC cannot read it.
 pub fn seal(launch: &Launch) -> Result<String> {
-    let plain = serde_json::to_vec(launch)?;
+    seal_value(launch)
+}
+pub(crate) fn seal_value<T: serde::Serialize>(value: &T) -> Result<String> {
+    let plain = serde_json::to_vec(value)?;
     Ok(protect(&plain, true)?
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect())
 }
 pub fn open(sealed: &str) -> Result<Launch> {
+    open_value(sealed)
+}
+pub(crate) fn open_value<T: serde::de::DeserializeOwned>(sealed: &str) -> Result<T> {
     if sealed.is_empty() || !sealed.len().is_multiple_of(2) || !sealed.is_ascii() {
         bail!("Saved start command is missing or malformed");
     }

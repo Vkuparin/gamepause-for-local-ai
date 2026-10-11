@@ -27,9 +27,9 @@ It is local only: no telemetry, no downloads, no administrator service, and mode
 
 ## Made for always-on AI assistants
 
-GamePause started as a fix for one situation: an assistant such as [Hermes Agent](https://hermes-agent.nousresearch.com) or [OpenClaw](https://openclaw.ai) keeps a large local model loaded around the clock, and then you want to play something. Any assistant, agent or chat app that runs on LM Studio or Ollama works the same way, because GamePause pauses the model server underneath it. Nothing has to be set up in the assistant.
+GamePause started as a fix for one situation: an assistant such as [Hermes Agent](https://hermes-agent.nousresearch.com) or [OpenClaw](https://openclaw.ai) keeps a large local model loaded around the clock, and then you want to play something. GamePause saves and unloads models used by these clients through LM Studio or Ollama.
 
-While a game runs, the assistant's requests to the local model fail or wait, as they would with the AI app closed, and they work again once the models are back. An assistant that reloads models on its own can undo the pause, so crons should be configured not to run unless model provider process is running.
+LM Studio's HTTP server is stopped during gaming by default, so requests fail until it is restored. Ollama normally stays running, allowing clients to reload models. Under **Advanced > Ollama**, enable **Prevent Ollama from reloading models while gaming** to temporarily close and restart a verified Windows Ollama Desktop 0.40.3 installation, including its UI. Requests arriving during shutdown may be canceled. Unsupported installations keep ordinary unloading; external restarts are left alone. [Details](docs/USAGE.md#background-ai-applications).
 
 ## One window, four states
 
@@ -77,7 +77,7 @@ The installer and executables are unsigned, so Windows may show a publisher warn
 | AI app | Version | Notes |
 |---|---|---|
 | LM Studio | 0.4.25 | Full restore uses LM Studio's internal protocol, so a newer version can need a GamePause update. |
-| Ollama | 0.35.1, 0.40.0 | One local GGUF model per run. Embedding, vision and multi-model sessions have automated coverage only. |
+| Ollama | 0.35.1, 0.40.0, 0.40.3 | One local GGUF model per run. Desktop shutdown/restart tested with 0.40.3 only. Embedding, vision and multi-model sessions have automated coverage only. |
 | llama.cpp, KoboldCpp | none yet | Stop and restart was tested with stand-in programs. |
 
 Using another version? **Advanced > Diagnostics** shows what GamePause can see, and a [report](https://github.com/Vkuparin/gamepause-for-local-ai/issues) with that output helps extend this table.

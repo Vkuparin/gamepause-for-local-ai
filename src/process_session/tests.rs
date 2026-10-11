@@ -173,14 +173,35 @@ fn drive(c: &mut TestCoordinator, intent: Intent, now: u64) {
 #[test]
 fn this_process_start_command_and_folder_are_readable() {
     let exe = std::env::current_exe().unwrap();
-    let found = Windows
-        .running(&[exe.to_string_lossy().to_string()])
-        .unwrap();
-    let me = found
-        .iter()
-        .find(|found| found.pid == std::process::id())
-        .unwrap();
-    let launch = Windows.launch_details(me).unwrap();
+    // Other tests run short-lived children from this same executable. This
+    // test checks our own launch evidence, not their racing inventory.
+    use windows_sys::Win32::{
+        Foundation::FILETIME,
+        System::Threading::{GetCurrentProcess, GetProcessTimes},
+    };
+    let mut created: FILETIME = unsafe { std::mem::zeroed() };
+    let mut exit = created;
+    let mut kernel = created;
+    let mut user = created;
+    assert_ne!(
+        unsafe {
+            GetProcessTimes(
+                GetCurrentProcess(),
+                &mut created,
+                &mut exit,
+                &mut kernel,
+                &mut user,
+            )
+        },
+        0
+    );
+    let me = Found {
+        pid: std::process::id(),
+        parent: 0,
+        path: exe.to_string_lossy().into_owned(),
+        created_at: (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime),
+    };
+    let launch = Windows.launch_details(&me).unwrap();
     let name = exe.file_stem().unwrap().to_string_lossy().to_string();
     assert!(
         launch.command_line.contains(&name),

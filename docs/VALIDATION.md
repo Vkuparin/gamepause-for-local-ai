@@ -1,5 +1,15 @@
 # Validation
 
+## 2.5.3 Ollama Desktop - 2026-10-12
+
+The owner authorized live lifecycle tests, accepted possible concurrent-request cancellation for the opt-in setting, and requested release 2.5.3. Native Desktop shutdown/restart is verified only with Windows Ollama 0.40.3. Unsupported installations fall back to ordinary unloading. Startup evidence is sealed for the current Windows user; original executable hashes and process identities are retained through checkpointed recovery.
+
+Live private-profile checks verified Desktop/server exit, endpoint unavailability, hidden restart, recovery through a fresh adapter, external restart without a duplicate launch, and one local GGUF completion model restored with context 4096 and indefinite keep-alive. An active request completed before shutdown; pause waited 33.3 seconds for it. A harmless executable supplied to the native scanner triggered the production engine/router/journal pause and automatic restore. LM Studio was disabled; the original Ollama instance returned to empty residency. No model/runtime was downloaded and no real pending journal was overwritten.
+
+The published 2.5.2 binary and release candidate used two private observation samples each: no extra idle CPU was measured, private memory increased about 0.1–0.3 MiB, and the executable grew 128 KiB (1.69%). In release-mode model cycles, unchanged v2.5.2 source paused/restored in 152/1,567 ms; native Desktop protection took 2,391/6,897 ms. Startup/cache variation and short samples limit the comparison. No permanent thread, listener or completed-pause poll was added.
+
+Final gates cover 337 library tests, nine CLI integration tests, formatting and Clippy; six standalone interactive/child tests remain ignored. Live multiple/embedding/vision models, mixed LM Studio recovery, Windows reboot/sleep, foreign-account ownership, installed-app upgrade and arbitrary third-party launch races remain untested. The initial full-watcher harness held recovery for an unrelated real game as designed; the isolated scanner/engine harness supplied only the harmless fixture. Another harness check misread the cleared null journal and was corrected, with original Desktop recovery completed from sealed test evidence.
+
 ## Owner acceptance - 2026-10-05
 
 The owner reported "Human tests passed" and explicitly authorized pushing and publishing v1.0.0. This approval applies to the final appearance review build below. The installer and ZIP are published unchanged. Later versions will focus on further UI and UX improvements.

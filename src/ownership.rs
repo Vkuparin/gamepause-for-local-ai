@@ -46,6 +46,10 @@ impl Claims {
         let namespace = self.namespace.clone();
         self.claim_in(&namespace, owner, kind, endpoints)
     }
+    pub fn claim_ollama_desktop(&mut self, owner: &str, endpoints: &[&str]) -> Result<()> {
+        let namespace = self.namespace.clone();
+        self.claim_set(&namespace, owner, Kind::Ollama, endpoints, true)
+    }
     fn claim_in(
         &mut self,
         namespace: &str,
@@ -53,10 +57,23 @@ impl Claims {
         kind: Kind,
         endpoints: &[&str],
     ) -> Result<()> {
+        self.claim_set(namespace, owner, kind, endpoints, false)
+    }
+    fn claim_set(
+        &mut self,
+        namespace: &str,
+        owner: &str,
+        kind: Kind,
+        endpoints: &[&str],
+        desktop: bool,
+    ) -> Result<()> {
         if owner.is_empty() || endpoints.is_empty() {
             bail!("Provider control requires an identity and route");
         }
         let mut keys = BTreeSet::new();
+        if desktop {
+            keys.insert("ollama-desktop-service".into());
+        }
         for endpoint in endpoints {
             keys.insert(format!("endpoint.{}", normalized_endpoint(endpoint)?));
         }
@@ -120,6 +137,43 @@ mod tests {
             std::process::id(),
             SERIAL.fetch_add(1, Ordering::Relaxed)
         )
+    }
+    #[test]
+    fn desktop_service_claim_excludes_other_ports_and_preserves_claim_on_failure() {
+        let ns = namespace();
+        let mut first = Claims {
+            namespace: ns.clone(),
+            ..Claims::default()
+        };
+        let mut second = Claims {
+            namespace: ns,
+            ..Claims::default()
+        };
+        first
+            .claim_ollama_desktop("first", &["localhost:1234"])
+            .unwrap();
+        assert!(
+            second
+                .claim_ollama_desktop("second", &["localhost:4321"])
+                .is_err()
+        );
+        second
+            .claim("ordinary", Kind::Ollama, &["localhost:4321"])
+            .unwrap();
+        assert!(
+            first
+                .claim_ollama_desktop("first", &["localhost:4321"])
+                .is_err()
+        );
+        assert!(
+            second
+                .claim("same-port", Kind::Ollama, &["localhost:1234"])
+                .is_err()
+        );
+        drop(first);
+        second
+            .claim_ollama_desktop("after", &["localhost:1234"])
+            .unwrap();
     }
     #[test]
     fn aliases_and_provider_ids_share_endpoint_ownership() {

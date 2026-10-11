@@ -5,6 +5,7 @@ mod native;
 mod sealing;
 
 pub use sealing::{open, seal};
+pub(crate) use sealing::{open_value, seal_value};
 
 use crate::{
     config::ProcessApp,

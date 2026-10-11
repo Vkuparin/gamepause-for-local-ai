@@ -9,6 +9,8 @@ use crate::{
     recovery::{Binding, Entry, Intent},
 };
 use anyhow::{Context, Result, bail};
+mod desktop;
+pub use desktop::Snapshot as DesktopSnapshot;
 use serde::{Deserialize, Serialize};
 use std::{
     cell::Cell,
@@ -159,6 +161,10 @@ pub struct Snapshot {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub absent: bool,
     pub pause_complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop: Option<Box<DesktopSnapshot>>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub desktop_note: String,
 }
 impl Snapshot {
     pub fn begin(&mut self) {
@@ -174,7 +180,7 @@ impl Snapshot {
     }
     /// Serial control units one pause can need; bounds the engine's drivers.
     pub fn units(&self) -> usize {
-        self.models.len() + self.unload_only.len()
+        self.models.len() + self.unload_only.len() + usize::from(self.desktop.is_some()) * 3
     }
     pub fn policy(&self) -> Result<Policy> {
         Policy::parse(&self.expiry_policy)
@@ -184,8 +190,12 @@ impl Snapshot {
         if self.absent {
             return NOT_RUNNING.into();
         }
+        let lifecycle = self
+            .desktop
+            .as_ref()
+            .map_or_else(|| self.desktop_note.as_str(), |desktop| desktop.note());
         if self.unload_only.is_empty() {
-            return String::new();
+            return lifecycle.into();
         }
         let mut names = self
             .unload_only
@@ -197,10 +207,18 @@ impl Snapshot {
         if self.unload_only.len() > 3 {
             names.push_str(&format!(" and {} more", self.unload_only.len() - 3));
         }
-        format!("Unloaded without reload (outside the restore subset): {names}.")
+        format!("Unloaded without reload (outside the restore subset): {names}. {lifecycle}")
+            .trim()
+            .into()
     }
     pub fn validate_transition(&self, new: &Self) -> Result<()> {
+        match (&self.desktop, &new.desktop) {
+            (Some(old), Some(new)) => old.transition(new)?,
+            (None, None) => (),
+            _ => bail!("Ollama Desktop recovery evidence changed"),
+        }
         if self.version != new.version
+            || self.desktop_note != new.desktop_note
             || self.source_revision != new.source_revision
             || self.expiry_policy != new.expiry_policy
             || self.absent != new.absent
@@ -226,12 +244,20 @@ impl Snapshot {
         let Ok(policy) = self.policy() else {
             bail!("Unsupported Ollama recovery contract");
         };
-        if self.version != 1
+        if !matches!(self.version, 1 | 2)
+            || (self.version == 1 && (self.desktop.is_some() || !self.desktop_note.is_empty()))
+            || self.desktop_note.len() > 512
             || self.source_revision != contract::SOURCE_REVISION
-            || self.units() > 256
+            || self.models.len() + self.unload_only.len() > 256
             || (self.absent && self.units() != 0)
         {
             bail!("Unsupported Ollama recovery contract");
+        }
+        if let Some(desktop) = &self.desktop {
+            desktop.validate()?;
+            if self.pause_complete && desktop.phase != desktop::Phase::Stopped {
+                bail!("Ollama Desktop shutdown is not verified");
+            }
         }
         let mut names = std::collections::BTreeSet::new();
         for model in &self.unload_only {
@@ -290,6 +316,10 @@ impl Snapshot {
 }
 #[derive(Clone, Copy)]
 enum Operation {
+    StopDesktop,
+    VerifyDesktopStopped,
+    StartDesktop,
+    VerifyDesktopReady,
     Unload(usize),
     Release(usize),
     Load(usize),
@@ -302,6 +332,8 @@ pub struct Work {
     operation: Operation,
 }
 pub struct Adapter<T, C = SystemClock> {
+    desktop: Option<Box<dyn desktop::Control>>,
+    prevent_reload: bool,
     pub transport: T,
     pub clock: C,
     binding: Binding,
@@ -331,6 +363,8 @@ impl<T: Transport, C: Clock> Adapter<T, C> {
             .context("Invalid Ollama clock")?;
         let started_monotonic = clock.monotonic();
         Ok(Self {
+            desktop: None,
+            prevent_reload: false,
             transport,
             clock,
             binding,
@@ -341,6 +375,12 @@ impl<T: Transport, C: Clock> Adapter<T, C> {
             loaded_at: BTreeMap::new(),
             captured_bytes: 0,
         })
+    }
+    pub fn prevent_reload(&mut self, enabled: bool) {
+        self.prevent_reload = enabled;
+        if enabled && self.desktop.is_none() {
+            self.desktop = Some(Box::new(desktop::Native));
+        }
     }
     fn guard(&self, binding: &Binding) -> Result<()> {
         if *binding != self.binding {
@@ -438,6 +478,8 @@ impl<T: Transport, C: Clock> Runtime for Adapter<T, C> {
                         unload_only: vec![],
                         absent: true,
                         pause_complete: false,
+                        desktop: None,
+                        desktop_note: String::new(),
                     },
                     restore_complete: false,
                 });
@@ -470,14 +512,43 @@ impl<T: Transport, C: Clock> Runtime for Adapter<T, C> {
         if self.inventory()? != inventory {
             bail!("Ollama residency changed during capture; no control started");
         }
+        let (desktop, desktop_note) = if self.prevent_reload {
+            let value = self
+                .transport
+                .request("/api/version", None)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .unwrap_or(serde_json::Value::Null);
+            match self
+                .desktop
+                .as_mut()
+                .context("Desktop control unavailable")?
+                .capture(&binding.endpoint, value["version"].as_str().unwrap_or(""))?
+            {
+                desktop::Eligibility::Supported(original) => (
+                    Some(Box::new(DesktopSnapshot {
+                        current: original.instance.clone(),
+                        original,
+                        phase: desktop::Phase::Captured,
+                        external_restart: false,
+                    })),
+                    String::new(),
+                ),
+                desktop::Eligibility::Fallback(note) => (None, note),
+            }
+        } else {
+            (None, String::new())
+        };
         let snapshot = Snapshot {
-            version: 1,
+            version: if self.prevent_reload { 2 } else { 1 },
             source_revision: contract::SOURCE_REVISION.into(),
             expiry_policy: policy.name().into(),
             models,
             unload_only,
             absent: false,
             pause_complete: false,
+            desktop,
+            desktop_note,
         };
         snapshot.validate()?;
         Ok(Entry {
@@ -491,6 +562,11 @@ impl<T: Transport, C: Clock> Runtime for Adapter<T, C> {
         entry.payload.validate()?;
         if entry.restore_complete
             && (entry.payload.pause_complete
+                || entry
+                    .payload
+                    .desktop
+                    .as_ref()
+                    .is_some_and(|desktop| !desktop.restored())
                 || entry
                     .payload
                     .models
@@ -520,7 +596,14 @@ impl<T: Transport, C: Clock> Runtime for Adapter<T, C> {
     fn plan(&mut self, entry: &Entry<Snapshot>, intent: Intent) -> Result<Planned<Snapshot, Work>> {
         self.validate(entry, &[])?;
         let mut snapshot = entry.payload.clone();
-        if intent == Intent::Restore && self.retry_restore.replace(false) {
+        if snapshot.desktop.is_some() && self.desktop.is_none() {
+            self.desktop = Some(Box::new(desktop::Native));
+        }
+        let retry = intent == Intent::Restore && self.retry_restore.replace(false);
+        if retry {
+            if let Some(desktop) = &mut snapshot.desktop {
+                desktop.phase = desktop::Phase::Starting;
+            }
             for model in &mut snapshot.models {
                 if !matches!(model.stage, Stage::Expired | Stage::ExpiryPending) {
                     model.stage = Stage::Captured;
@@ -528,6 +611,39 @@ impl<T: Transport, C: Clock> Runtime for Adapter<T, C> {
             }
         }
         let operation = match intent {
+            Intent::Pause
+                if snapshot
+                    .desktop
+                    .as_ref()
+                    .is_some_and(|d| d.current.server.is_none()) =>
+            {
+                Operation::VerifyDesktopReady
+            }
+            Intent::Pause
+                if snapshot.desktop.as_ref().is_some_and(|d| {
+                    matches!(d.phase, desktop::Phase::Stopping | desktop::Phase::Stopped)
+                }) =>
+            {
+                if snapshot.desktop.as_ref().unwrap().phase == desktop::Phase::Stopped {
+                    Operation::VerifyDesktopStopped
+                } else {
+                    Operation::StopDesktop
+                }
+            }
+            Intent::Restore
+                if snapshot
+                    .desktop
+                    .as_ref()
+                    .is_some_and(|d| d.phase != desktop::Phase::Ready) =>
+            {
+                let d = snapshot.desktop.as_mut().unwrap();
+                if !retry && d.phase == desktop::Phase::Starting && d.current.server.is_none() {
+                    Operation::VerifyDesktopReady
+                } else {
+                    d.phase = desktop::Phase::Starting;
+                    Operation::StartDesktop
+                }
+            }
             _ if snapshot
                 .models
                 .iter()
@@ -585,6 +701,58 @@ impl<T: Transport, C: Clock> Runtime for Adapter<T, C> {
         let policy = snapshot.policy()?;
         let mut complete = false;
         match work.operation {
+            Operation::StopDesktop => {
+                let d = snapshot
+                    .desktop
+                    .as_ref()
+                    .context("Missing Desktop recovery")?;
+                // A missing endpoint after a lost acknowledgement is reconciled by native identities.
+                match self.inventory() {
+                    Ok(observed) if !observed.0.is_empty() => return Err(InferenceBusy.into()),
+                    Ok(_) => (),
+                    Err(error) if error.downcast_ref::<Unreachable>().is_some() => (),
+                    Err(error) => return Err(error),
+                }
+                self.desktop
+                    .as_mut()
+                    .context("Desktop control unavailable")?
+                    .request_stop(d, &binding.endpoint)?;
+                snapshot.desktop.as_mut().unwrap().phase = desktop::Phase::Stopped;
+            }
+            Operation::VerifyDesktopStopped => {
+                self.desktop
+                    .as_mut()
+                    .context("Desktop control unavailable")?
+                    .verify_stopped(snapshot.desktop.as_ref().unwrap(), &binding.endpoint)?;
+                for model in &mut snapshot.models {
+                    if model.stage != Stage::Expired {
+                        model.stage = Stage::UnloadAcknowledged;
+                    }
+                }
+                for model in &mut snapshot.unload_only {
+                    model.stage = Stage::UnloadAcknowledged;
+                }
+                snapshot.pause_complete = true;
+            }
+            Operation::StartDesktop | Operation::VerifyDesktopReady => {
+                let control = self
+                    .desktop
+                    .as_mut()
+                    .context("Desktop control unavailable")?;
+                let d = snapshot.desktop.as_mut().unwrap();
+                let started = if matches!(work.operation, Operation::StartDesktop) {
+                    control.start(d, &binding.endpoint)?
+                } else {
+                    control.verify_ready(d, &binding.endpoint)?
+                };
+                d.current = started.instance;
+                d.external_restart = started.external;
+                d.phase = if d.current.server.is_some() {
+                    desktop::Phase::Ready
+                } else {
+                    desktop::Phase::Starting
+                };
+            }
             Operation::ResolveExpiry(index) => {
                 let observed = self.inventory()?;
                 if observed.0.values().any(|resident| {
@@ -669,9 +837,22 @@ impl<T: Transport, C: Clock> Runtime for Adapter<T, C> {
                 if !observed.0.is_empty() {
                     bail!("Other Ollama content is resident; pause incomplete");
                 }
-                snapshot.pause_complete = true;
+                if let Some(desktop) = &mut snapshot.desktop {
+                    desktop.phase = desktop::Phase::Stopping;
+                } else {
+                    snapshot.pause_complete = true;
+                }
             }
             Operation::VerifyRestore => {
+                if let Some(d) = &mut snapshot.desktop {
+                    let started = self
+                        .desktop
+                        .as_mut()
+                        .context("Desktop control unavailable")?
+                        .verify_ready(d, &binding.endpoint)?;
+                    d.current = started.instance;
+                    d.external_restart = started.external;
+                }
                 for model in &mut snapshot.models {
                     if model.stage != Stage::Expired
                         && self.preload(&model.original, policy)?.is_none()

@@ -217,6 +217,22 @@ impl<B: Backend> Engine<B> {
                 .iter()
                 .find(|provider| provider.id() == entry.binding.id);
             if original != replacement {
+                if let (
+                    Some(crate::config::Provider::Ollama {
+                        prevent_reload: old,
+                        ..
+                    }),
+                    Some(crate::config::Provider::Ollama {
+                        prevent_reload: new,
+                        ..
+                    }),
+                ) = (original, replacement)
+                    && old != new
+                {
+                    bail!(
+                        "Ollama recovery is pending; finish recovery before changing Desktop control"
+                    );
+                }
                 entry.binding.validate_route(updated).map_err(|error| {
                     anyhow::anyhow!("{} recovery is pending; {error}", entry.binding.kind.name())
                 })?;

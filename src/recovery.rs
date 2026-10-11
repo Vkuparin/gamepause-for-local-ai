@@ -164,6 +164,14 @@ impl Journal {
                 }
                 (Payload::Ollama(snapshot), Kind::Ollama, Guarantee::SupportedFields) => {
                     snapshot.validate()?;
+                    if entry.restore_complete
+                        && snapshot
+                            .desktop
+                            .as_ref()
+                            .is_some_and(|desktop| !desktop.restored())
+                    {
+                        bail!("Ollama Desktop restoration is not verified; recovery retained");
+                    }
                     if config::normalized_endpoint(&binding.endpoint)?
                         != config::normalized_endpoint(&binding.configured_endpoint)?
                         || (self.session.intent == Intent::Restore && snapshot.pause_complete)
@@ -369,6 +377,8 @@ pub(crate) fn ollama_fixture() -> Entry {
             unload_only: vec![],
             absent: false,
             pause_complete: false,
+            desktop: None,
+            desktop_note: String::new(),
         }),
         restore_complete: false,
     }

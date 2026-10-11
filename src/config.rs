@@ -91,6 +91,9 @@ pub enum Provider {
         id: String,
         enabled: bool,
         endpoint: String,
+        /// Opt-in native Desktop Quit/restart; concurrent requests may be canceled.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        prevent_reload: bool,
     },
     /// Executables to stop for gaming. Not tied to a port or protocol.
     Process {
@@ -156,6 +159,7 @@ fn default_providers() -> Vec<Provider> {
         },
         Provider::Ollama {
             id: "ollama-main".into(),
+            prevent_reload: false,
             // Unit tests must not reach a developer's real Ollama through
             // default settings; fixtures enable it against private endpoints.
             enabled: !cfg!(test),

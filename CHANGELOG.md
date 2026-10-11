@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.5.3 - 2026-10-12
+
+- Advanced > Ollama has an opt-in **Prevent Ollama from reloading models while gaming** setting. For verified Windows Ollama Desktop 0.40.3, GamePause unloads models, closes Desktop and its managed server, then restarts it in hidden mode and restores supported models after gaming. Requests arriving during shutdown may be canceled. Unknown versions and unsupported installations keep ordinary model unloading; external restarts are left alone.
+- Desktop recovery keeps encrypted startup evidence, original executable hashes and process identities in the existing journal. Separate checkpoints cover shutdown, restart and verification. Replaced executables, changed server configuration, unrelated servers and partial failures retain recovery. Desktop is rechecked after a failed model restoration before retrying loads.
+
+Validated with 337 library tests and nine CLI integration tests, formatting and Clippy. Live Ollama 0.40.3 checks covered native shutdown/restart, persisted model recovery, active inference, external restart reconciliation and a harmless custom-game scanner/engine cycle. Original residency was restored. The model check used one small local GGUF completion model with context 4096 and indefinite keep-alive. LM Studio and generic process behavior were checked with fixtures; live mixed-provider recovery, Windows reboot/sleep and installed-app upgrade were not exercised. Settings remain version 4 and recovery envelope version 3; opt-in Ollama captures use guarded snapshot version 2, and ordinary captures retain version 1. Restore pending AI and turn the new setting off before downgrading.
+
 ## 2.5.2 - 2026-10-07
 
 - LM Studio accepts an already-loaded copy of the same model and quantization, even under another instance name or with different settings. Duplicate saved instances do not force another copy. If the loadout differs, a Cancel-default prompt offers to unload current models and restore saved models, with a fresh check before every confirmed unload.

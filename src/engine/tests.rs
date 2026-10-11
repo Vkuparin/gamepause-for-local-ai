@@ -850,6 +850,13 @@ fn routed_private_http_pause_restore_preserves_mixed_and_ollama_only_recovery() 
         assert!(e.pause_verified());
         assert_eq!(e.state.is_some(), lm_enabled);
         assert_eq!(e.pause_completions, 1);
+        let mut lifecycle_edit = e.config.clone();
+        for provider in &mut lifecycle_edit.providers {
+            if let crate::config::Provider::Ollama { prevent_reload, .. } = provider {
+                *prevent_reload = true;
+            }
+        }
+        assert!(e.validate_recovery_edit(&lifecycle_edit).is_err());
         let mut competitor = crate::ownership::Claims::default();
         assert!(
             competitor
