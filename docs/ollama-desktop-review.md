@@ -56,7 +56,9 @@ Earlier proof runs used no models. They do not establish broad model compatibili
 
 Fixtures cover each checkpoint, lost acknowledgements across native phases, retained original evidence, fresh-adapter recovery, unknown snapshot versions, false completion, unsupported fallback, absent service, client reloads, no work after completed pause, external restart authority and a new game during Desktop startup. Native fixtures check process creation-time guards, current-account identity, repeatable SHA-256/changed content and effective environment normalization/drift. Existing mixed-provider and LM Studio/process tests remain applicable.
 
-Final ordinary suite: 337 library tests and nine CLI integration tests passed; six interactive/child fixtures remained ignored as standalone tests. Formatting, Clippy for all targets/default features and all features, and diff checks are required for the final source. Fixture network/atomic-write restrictions required running the suite outside the sandbox. No ignored live/UI tests were run as a batch.
+Final ordinary suite: 337 library tests and nine CLI integration tests passed; six interactive/child fixtures remained ignored as standalone tests. Formatting, Clippy for all targets/default features and all features, and diff checks passed. Fixture network/atomic-write restrictions required running the suite outside the sandbox. No ignored live/UI tests were run as a batch.
+
+Branch CI and the tagged release workflow passed for commit `28dfa03e7850347c36141677f8dff09dd4ee2bff`. The published [v2.5.3 assets](https://github.com/Vkuparin/gamepause-for-local-ai/releases/tag/v2.5.3) were downloaded and passed `scripts/verify_release.ps1`: checksums, executable version, defaults, license texts and archive contents. All 112 recorded source files matched the locally tested content; nine unchanged files differed only in CRLF/LF line endings. The Scoop manifest uses the published ZIP SHA-256 `8d7eb075e0fd763eac627230215fcc0639c88f694b902d139f1ca22d53999875`.
 
 ## Release performance
 
