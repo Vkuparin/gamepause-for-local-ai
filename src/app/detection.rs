@@ -87,6 +87,7 @@ pub(super) struct DetectionFrame {
     pub(super) candidate: u64,
     pub(super) lm_running: bool,
     pub(super) ollama_running: bool,
+    pub(super) hermes_running: bool,
     pub(super) running_apps: Vec<RunningApp>,
 }
 /// Scans a fullscreen program must lead before it is suggested.
@@ -204,6 +205,7 @@ impl NativeDetection {
             candidate: self.candidate,
             lm_running: self.scanner.lmstudio_running(),
             ollama_running: self.scanner.ollama_running(),
+            hermes_running: self.scanner.hermes_running(),
             running_apps: if crate::dashboard::needs_running_apps() {
                 self.scanner.running_apps()
             } else {
@@ -232,6 +234,7 @@ pub(super) fn publish_detection(
                 shared.running_apps = frame.running_apps.clone();
                 shared.lm_running = frame.lm_running;
                 shared.ollama_running = frame.ollama_running;
+                shared.hermes_running = frame.hermes_running;
                 if !shared.detection_ok {
                     shared.restore_offer = None;
                     shared.coexistence = false;

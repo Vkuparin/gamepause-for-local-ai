@@ -34,6 +34,18 @@ Worker logs use `app/logging.rs`: dated files under `logs/`, a 1024 KiB byte lim
 
 ## Architecture
 
+v2.6.0 adds Hermes's managed local runtime. The [review](hermes-local-runtime-review.md) records its contract, source evidence and the focused live pause/restore result. The [task record](v2.6.0-tasks.md) records implementation and focused checks.
+
+Settings are version 5, with a guarded version-4 migration and `config.v4.backup.json`; earlier v2/v3 migrations and backups remain. The recovery envelope remains version 3 and accepts four provider kinds. Hermes snapshot 1 has immutable original runtime/model evidence and mutable stages. Descriptions below of version-4 settings and three-provider limits refer to the earlier implementation and are superseded by these v2.6.0 rules.
+
+`hermes.rs` is the adapter facade with private `native` (process/account/listener evidence, bounded environment and SHA-256) and `transport` (verified local discovery and authenticated HTTP) children. `hermes_session.rs` owns checkpointed native stop/start, per-model replay and verification; tests live in each module's `tests.rs`. `Providers` dispatches Hermes directly beside Process, retaining the existing tested LM/Ollama router. No adapter payload enters another provider's contract.
+
+Hermes discovery verifies the user's local default-profile host record and private token, actual router/control listener PID, native birth identities and installation directory. `server.json` supplies the dynamic managed route; records lacking a home field use the backend's bounded native `HERMES_HOME` value. Model/engine files are SHA-256 checked and kept under read-only sharing through the hold; each file is capped at 128 GiB and 90 seconds. Claims include the per-user shared runtime and every original/current endpoint across transport reconciliation. Duplicate process-provider control is rejected before scheduling.
+
+The runtime remains on the control thread across retries. Detection publishes cached process evidence only; inventory refresh updates installed visibility without HTTP. A closed dashboard has no new work. Native stop changes Hermes's persistent enabled setting, so that obligation is journaled before mutation. Each native change/model load has a separate checkpoint; final checks establish process absence and exact supported restoration fields. An off/absent runtime is untouched. Doctor uses authenticated configuration/inventory reads and never the Local Models status handler, which can perform legacy-file adoption.
+
+The dashboard orders LM Studio, Ollama, Hermes, then Other AI apps, and measures hero content height. Hermes has its own settings/diagnostics page and scoped verification. A focused live native lifecycle/model replay passed on CUDA llama.cpp b11370. The release gates passed 347 library and nine CLI tests, formatting and Clippy. Physical UI acceptance and broader live scenarios remain untested; no ignored interactive batch was run.
+
 | Module | Responsibility |
 |---|---|
 | `app.rs` | Command-line switches, watcher lifecycle, discovery worker, shared tray status, diagnostics, bounded logging |

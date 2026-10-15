@@ -147,6 +147,7 @@ fn background_detection_publishes_during_control_and_rejects_old_settings() {
         candidate: 0,
         lm_running: true,
         ollama_running: false,
+        hermes_running: false,
         running_apps: vec![],
     };
     state.lock().unwrap().activity = Activity::Restoring;
@@ -211,6 +212,7 @@ fn power_change_during_fresh_detection_cannot_authorize_control() {
                 candidate: 0,
                 lm_running: false,
                 ollama_running: false,
+                hermes_running: false,
                 running_apps: vec![],
             })
         },
@@ -664,7 +666,7 @@ fn ollama_only_core_actions_and_independent_recovery_edit_state() {
         match provider {
             config::Provider::LMStudio { enabled, .. } => *enabled = false,
             config::Provider::Ollama { enabled, .. } => *enabled = true,
-            config::Provider::Process { .. } => (),
+            config::Provider::Process { .. } | config::Provider::Hermes { .. } => (),
         }
     }
     shared.config.validate().unwrap();

@@ -76,6 +76,48 @@ fn typed_mixed_journal_round_trips_without_dropping_disabled_ollama() {
     }
 }
 #[test]
+fn all_four_provider_payloads_persist_without_losing_original_hermes_evidence() {
+    let fixture = Fixture::new();
+    let config = Config::default();
+    let lm = snapshot("unloaded", true);
+    let mut journal = Journal::lm(Binding::capture(&config, &lm).unwrap(), lm, Intent::Pause);
+    journal.providers.push(ollama_fixture());
+    journal.providers.push(Entry {
+        binding: Binding {
+            id: "process-fixture".into(),
+            kind: Kind::Process,
+            endpoint: crate::process_session::ROUTE.into(),
+            configured_endpoint: crate::process_session::ROUTE.into(),
+            payload_version: 1,
+            guarantee: Guarantee::ProcessRelaunch,
+        },
+        payload: Payload::Process(crate::process_session::Snapshot {
+            version: 1,
+            apps: vec![],
+            pause_complete: false,
+        }),
+        restore_complete: false,
+    });
+    journal.providers.push(Entry {
+        binding: crate::hermes_session::binding("hermes-main"),
+        payload: Payload::Hermes(crate::hermes_session::Snapshot {
+            version: 1,
+            original: crate::hermes_session::tests::original(),
+            stage: crate::hermes_session::Stage::Captured,
+            loaded: vec![],
+            pause_complete: false,
+        }),
+        restore_complete: false,
+    });
+    save(&fixture.path(), Some(&journal)).unwrap();
+    assert_eq!(load(&fixture.path(), &config).unwrap().unwrap(), journal);
+    let original_bytes = fs::read(fixture.path()).unwrap();
+    let mut invalid = journal;
+    invalid.providers[3].binding.kind = Kind::Ollama;
+    assert!(save(&fixture.path(), Some(&invalid)).is_err());
+    assert_eq!(fs::read(fixture.path()).unwrap(), original_bytes);
+}
+#[test]
 fn invalid_mixed_payloads_and_failed_writes_preserve_both_originals() {
     use std::os::windows::fs::OpenOptionsExt;
     let fixture = Fixture::new();

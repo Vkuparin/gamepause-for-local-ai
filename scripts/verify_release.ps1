@@ -21,11 +21,11 @@ try {
         if ($taskEntries -cnotcontains "GamePause/$taskRequired") { throw "Missing packaged file: $taskRequired" }
     }
     if ($taskEntries -ccontains 'GamePause/GamePauseCLI.exe') { throw 'The development console build must not be packaged' }
-    if ($taskEntries | Where-Object { $_ -match '(?i)(-review\.md$|-plan\.md$|AGENTS\.md$|playtest_notes\.md$|(^|/)(config|state|status|inventory)\.json$|\.log($|\.))' }) { throw 'Internal/runtime file in candidate archive' }
+    if ($taskEntries | Where-Object { $_ -match '(?i)(-(review|plan|spec|tasks)\.md$|AGENTS\.md$|playtest_notes\.md$|(^|/)(config|state|status|inventory)\.json$|\.log($|\.))' }) { throw 'Internal/runtime file in candidate archive' }
     $taskConfigEntry = $taskArchive.GetEntry('GamePause/config.example.json')
     $taskReader = [IO.StreamReader]::new($taskConfigEntry.Open())
     try { $taskConfig = $taskReader.ReadToEnd() | ConvertFrom-Json } finally { $taskReader.Dispose() }
-    if ($taskConfig.settings_version -ne 4 -or $taskConfig.advanced_settings_visible) { throw 'Unsafe packaged default preferences' }
+    if ($taskConfig.settings_version -ne 5 -or $taskConfig.advanced_settings_visible -or @($taskConfig.providers | Where-Object { $_.kind -eq 'hermes' -and $_.enabled }).Count -ne 0) { throw 'Unsafe packaged default preferences' }
     $taskNoticeEntry = $taskArchive.GetEntry('GamePause/THIRD_PARTY_NOTICES.json')
     $taskReader = [IO.StreamReader]::new($taskNoticeEntry.Open())
     try { $taskNotices = @($taskReader.ReadToEnd() | ConvertFrom-Json) } finally { $taskReader.Dispose() }

@@ -99,6 +99,7 @@ impl Dashboard {
                     (SettingsPage::Detection, "Detection"),
                     (SettingsPage::LMStudio, "LM Studio"),
                     (SettingsPage::Ollama, "Ollama"),
+                    (SettingsPage::Hermes, "Hermes"),
                     (SettingsPage::Apps, "Other apps"),
                     (SettingsPage::Recovery, "Recovery"),
                     (SettingsPage::Diagnostics, "Diagnostics"),
@@ -185,6 +186,22 @@ impl Dashboard {
                         self.save_bar(ui,s,p);
                         ui.hyperlink_to("Report Ollama problems or contribute fixes",concat!(env!("CARGO_PKG_REPOSITORY"),"/blob/main/CONTRIBUTING.md"));
                     },
+                    SettingsPage::Hermes=> {
+                        ui.heading("Hermes");
+                        ui.label("Temporarily turns off Hermes's managed local runtime while gaming, leaving Hermes open. Restores the captured resident models and supported load fields afterwards. Conversations and idle timing are not preserved.");
+                        ui.label("The runtime's enabled setting is saved by Hermes's native off switch. GamePause records recovery before changing it and turns it back on after gaming. If Hermes closes, reopen it to finish recovery. External changes can override the pause.");
+                        let editable = !s.provider_pending(crate::provider::Kind::Hermes);
+                        if !editable { ui.colored_label(p.accent,"Finish pending Hermes recovery before changing its configuration."); }
+                        ui.add_enabled_ui(editable,|ui| {
+                            if let Some(crate::config::Provider::Hermes { enabled,home,.. }) = self.edit_config.providers.iter_mut().find(|p|p.kind()==crate::provider::Kind::Hermes) {
+                                self.dirty |= ui.styled_checkbox(enabled,"Pause Hermes local models while gaming").changed();
+                                ui.label("Hermes data directory");
+                                self.dirty |= ui.add(TextEdit::singleline(home).hint_text("Automatic (HERMES_HOME or Windows default)")).changed();
+                            } else { ui.label("No Hermes entry is configured."); }
+                        });
+                        ui.colored_label(p.muted,"Uses the verified local default-profile backend and installed runtime. Does not download models or start Hermes.");
+                        self.save_bar(ui,s,p);
+                    },
                     SettingsPage::Apps=> {
                         ui.heading("Other AI apps");
                         ui.colored_label(p.accent,"Not yet tested with real AI tools such as llama.cpp or KoboldCpp.");
@@ -230,7 +247,7 @@ impl Dashboard {
                         self.save_bar(ui,s,p);
                         ui.add_space(design::GAP);
                         if ui.add_enabled(crate::ui_commands::verify_available(s),Button::new("Test round-trip...")).clicked(){self.modal=Some(Modal::Verify);}
-                        ui.colored_label(p.muted,"The test captures, unloads and reloads the models LM Studio and Ollama have loaded. It requires no running games or pending recovery.");
+                        ui.colored_label(p.muted,"The test pauses and restores enabled LM Studio, Ollama and Hermes providers. It requires no running games or pending recovery.");
                     },
                     SettingsPage::Diagnostics=> {
                         ui.heading("Read-only diagnostics");

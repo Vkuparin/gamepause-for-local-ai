@@ -11,6 +11,8 @@ pub mod discovery;
 pub mod engine;
 mod game_icons;
 pub mod gameplay;
+pub mod hermes;
+pub mod hermes_session;
 pub mod lm_session;
 pub mod lmstudio;
 mod native_menu;

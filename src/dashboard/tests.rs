@@ -403,6 +403,7 @@ fn all_pages_and_states_render_at_supported_sizes_and_dpi() {
             for page in [
                 SettingsPage::General,
                 SettingsPage::Detection,
+                SettingsPage::Hermes,
                 SettingsPage::LMStudio,
                 SettingsPage::Ollama,
                 SettingsPage::Apps,
@@ -423,6 +424,90 @@ fn all_pages_and_states_render_at_supported_sizes_and_dpi() {
                 assert!(!output.shapes.is_empty());
             }
         }
+    }
+}
+#[test]
+fn three_main_providers_and_other_apps_have_stable_visible_rows() {
+    let mut s = fixture();
+    s.hermes_installed = true;
+    s.hermes_running = true;
+    s.ollama_installed = true;
+    for provider in &mut s.config.providers {
+        match provider {
+            crate::config::Provider::Hermes { enabled, .. }
+            | crate::config::Provider::Ollama { enabled, .. } => *enabled = true,
+            crate::config::Provider::Process { apps, .. } => apps.push(crate::config::ProcessApp {
+                name: "Fixture server".into(),
+                path: r"D:\Fixture\server.exe".into(),
+                relaunch: true,
+            }),
+            _ => (),
+        }
+    }
+    s.config.providers.reverse();
+    assert_eq!(
+        provider_status(&s)
+            .iter()
+            .map(|r| r.0.as_str())
+            .collect::<Vec<_>>(),
+        ["LM Studio:", "Ollama:", "Hermes:", "Other AI apps:"]
+    );
+    let mut d = dashboard(s.clone());
+    let ctx = Context::default();
+    design::fonts(&ctx);
+    for size in [vec2(620.0, 580.0), vec2(1114.0, 848.0)] {
+        let output = ctx.run(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+                ..Default::default()
+            },
+            |ctx| d.draw(ctx, &s),
+        );
+        assert!(!output.shapes.is_empty());
+        let measure = |d: &mut Dashboard, state: &Shared| {
+            let mut bounds = Rect::NOTHING;
+            let _ = ctx.run(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+                    ..Default::default()
+                },
+                |ctx| {
+                    CentralPanel::default().show(ctx, |ui| {
+                        let h = hero(state);
+                        d.hero(
+                            ui,
+                            state,
+                            &h,
+                            design::Palette::for_mode(true, false, h.look),
+                        );
+                        bounds = Rect::from_min_max(
+                            ui.max_rect().min,
+                            pos2(ui.min_rect().right(), ui.cursor().top()),
+                        );
+                    });
+                },
+            );
+            bounds
+        };
+        let four = measure(&mut d, &s);
+        let mut one = s.clone();
+        for provider in &mut one.config.providers {
+            match provider {
+                crate::config::Provider::Ollama { enabled, .. }
+                | crate::config::Provider::Hermes { enabled, .. }
+                | crate::config::Provider::Process { enabled, .. } => *enabled = false,
+                _ => (),
+            }
+        }
+        let single = measure(&mut d, &one);
+        assert!(
+            four.height() > single.height() + 40.0,
+            "extra provider rows must expand the card: four={four:?}, single={single:?}"
+        );
+        assert!(
+            four.right() <= size.x + 1.0 && four.bottom() < size.y,
+            "hero must fit the viewport"
+        );
     }
 }
 /// Render only fictional state. No watcher, provider, startup or config writes.

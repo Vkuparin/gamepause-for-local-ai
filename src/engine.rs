@@ -68,6 +68,7 @@ pub struct Engine<B: Backend> {
     adapter_progress: Option<crate::lm_session::Progress>,
     ollama_runtime: crate::provider_runtime::OllamaRuntime,
     process_runtime: crate::provider_runtime::ProcessRuntime,
+    hermes_runtime: crate::provider_runtime::HermesRuntime,
     provider_now: Duration,
     progress: Option<Box<dyn FnMut(Activity) + Send>>,
     quiet_since: Option<f64>,
@@ -130,6 +131,7 @@ impl<B: Backend> Engine<B> {
             adapter_progress: None,
             ollama_runtime: Default::default(),
             process_runtime: Default::default(),
+            hermes_runtime: Default::default(),
             provider_now: Duration::ZERO,
             progress: None,
             quiet_since: None,
@@ -179,6 +181,7 @@ impl<B: Backend> Engine<B> {
                         crate::recovery::Payload::LMStudio(snapshot) => snapshot.pause_complete,
                         crate::recovery::Payload::Ollama(snapshot) => snapshot.pause_complete,
                         crate::recovery::Payload::Process(snapshot) => snapshot.pause_complete,
+                        crate::recovery::Payload::Hermes(snapshot) => snapshot.pause_complete,
                     })
                 },
             )
@@ -217,6 +220,11 @@ impl<B: Backend> Engine<B> {
                 .iter()
                 .find(|provider| provider.id() == entry.binding.id);
             if original != replacement {
+                if entry.binding.kind == crate::provider::Kind::Hermes {
+                    bail!(
+                        "Hermes recovery is pending; finish recovery before changing its configuration"
+                    );
+                }
                 if let (
                     Some(crate::config::Provider::Ollama {
                         prevent_reload: old,
@@ -318,6 +326,7 @@ impl<B: Backend> Engine<B> {
                 }
                 crate::recovery::Payload::Ollama(snapshot) => snapshot.units() == 0,
                 crate::recovery::Payload::Process(snapshot) => snapshot.units() == 0,
+                crate::recovery::Payload::Hermes(snapshot) => !snapshot.held(),
             })
         })
     }
@@ -345,6 +354,7 @@ impl<B: Backend> Engine<B> {
                 crate::recovery::Payload::LMStudio(snapshot) => lm |= !snapshot.models.is_empty(),
                 crate::recovery::Payload::Ollama(snapshot) => ollama |= snapshot.units() > 0,
                 crate::recovery::Payload::Process(_) => (),
+                crate::recovery::Payload::Hermes(_) => (),
             }
         }
         let lm = if lm { self.backend.captured_bytes() } else { 0 };
@@ -402,6 +412,9 @@ impl<B: Backend> Engine<B> {
         if !self.provider_pending(crate::provider::Kind::Process) {
             self.process_runtime = Default::default();
         }
+        if !self.provider_pending(crate::provider::Kind::Hermes) {
+            self.hermes_runtime = Default::default();
+        }
         self.retry_providers();
         self.retry_at = 0.;
         self.disabled = false;
@@ -455,6 +468,7 @@ impl<B: Backend> Engine<B> {
             {
                 match &mut entry.payload {
                     crate::recovery::Payload::LMStudio(snapshot) => snapshot.pause_complete = false,
+                    crate::recovery::Payload::Hermes(snapshot) => snapshot.begin(),
                     crate::recovery::Payload::Ollama(snapshot) => {
                         if journal.session.intent == Intent::Pause {
                             snapshot.begin();

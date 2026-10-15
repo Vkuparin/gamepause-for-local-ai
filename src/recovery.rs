@@ -51,6 +51,7 @@ pub enum Payload {
     LMStudio(Snapshot),
     Ollama(crate::ollama_session::Snapshot),
     Process(crate::process_session::Snapshot),
+    Hermes(crate::hermes_session::Snapshot),
 }
 impl Payload {
     pub fn lm(&self) -> Result<&Snapshot> {
@@ -103,7 +104,7 @@ impl Binding {
         let configured = config.providers.iter().find(|provider| provider.id() == self.id).context("Recovery provider ID is missing; restore its original configuration. Recovery retained")?;
         if !configured.enabled()
             || configured.kind() != self.kind
-            || (self.kind != Kind::Process
+            || (!matches!(self.kind, Kind::Process | Kind::Hermes)
                 && config::normalized_endpoint(configured.endpoint())?
                     != config::normalized_endpoint(&self.configured_endpoint)?)
         {
@@ -134,7 +135,7 @@ impl Journal {
         if self.schema != 3 {
             bail!("Unsupported recovery format; source retained");
         }
-        if !(1..=3).contains(&self.providers.len()) {
+        if !(1..=4).contains(&self.providers.len()) {
             bail!("Unsupported recovery provider set; source retained");
         }
         crate::coordinator::validate_bindings(self.providers.iter().map(|entry| &entry.binding))?;
@@ -195,6 +196,16 @@ impl Journal {
                         || (entry.restore_complete && !snapshot.restore_finished())
                     {
                         bail!("Process recovery binding/progress mismatch; source retained");
+                    }
+                }
+                (Payload::Hermes(snapshot), Kind::Hermes, Guarantee::SupportedFields) => {
+                    snapshot.validate()?;
+                    if binding != &crate::hermes_session::binding(&binding.id)
+                        || (self.session.intent == Intent::Restore && snapshot.pause_complete)
+                        || (entry.restore_complete
+                            && snapshot.stage != crate::hermes_session::Stage::Restored)
+                    {
+                        bail!("Hermes recovery binding/progress mismatch; source retained");
                     }
                 }
                 _ => bail!("Recovery provider kind/payload/guarantee mismatch; source retained"),

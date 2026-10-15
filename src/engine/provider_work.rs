@@ -38,6 +38,7 @@ impl<B: Backend> Engine<B> {
             false,
             &mut self.ollama_runtime,
             &mut self.process_runtime,
+            &mut self.hermes_runtime,
         )
         .with_progress(progress);
         let mut bindings = runtime.bindings()?;
@@ -148,6 +149,7 @@ impl<B: Backend> Engine<B> {
                                         snapshot.models.len()
                                     }
                                     crate::recovery::Payload::Ollama(snapshot) => snapshot.units(),
+                                    crate::recovery::Payload::Hermes(snapshot) => snapshot.units(),
                                     crate::recovery::Payload::Process(snapshot) => {
                                         snapshot.pause_units()
                                     }
@@ -184,6 +186,7 @@ impl<B: Backend> Engine<B> {
                     .map(|entry| match &entry.payload {
                         crate::recovery::Payload::LMStudio(snapshot) => snapshot.models.len(),
                         crate::recovery::Payload::Ollama(snapshot) => snapshot.units(),
+                        crate::recovery::Payload::Hermes(snapshot) => snapshot.units(),
                         crate::recovery::Payload::Process(snapshot) => snapshot.units(),
                     })
                     .sum::<usize>()
@@ -206,6 +209,7 @@ impl<B: Backend> Engine<B> {
             compare,
             &mut self.ollama_runtime,
             &mut self.process_runtime,
+            &mut self.hermes_runtime,
         )
         .with_progress(progress);
         let mut bindings = runtime.bindings()?;

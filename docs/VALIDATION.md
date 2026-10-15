@@ -1,5 +1,24 @@
 # Validation
 
+## v2.6.0 Hermes - 2026-10-15
+
+A private Hermes-only configuration passed the native CLI round-trip: stop, verified process absence, start, replay and original supported-field verification. LM Studio and Ollama were disabled. The resident model was `Qwen3.8-27B-UD-Q4_K_M` on CUDA llama.cpp `b11370`, with actual live context `147456` (saved UI override `131072`). An independent authenticated read-back matched the baseline model, enabled runtime and saved model/runtime preferences; `state.json` was cleared. No independently verified Hermes application release range is claimed.
+
+The initial live attempts found two defects: Windows retained exited process objects whose executable paths were unreadable, and model-load acknowledgements preceded inventory readiness. The fixes check process exit before path/owner checks and wait for bounded inventory readiness after loading. Regression tests cover both. A pending recovery was completed before the final fresh passing cycle; no journal was discarded.
+
+| Command | Result |
+|---|---|
+| `cargo test --locked hermes --lib` | 9 passed |
+| `cargo test --locked` | 347 library + 9 CLI tests passed; 6 interactive/child fixtures ignored |
+| `cargo fmt --check` | Passed |
+| `cargo clippy --locked --all-targets -- -D warnings` | Passed |
+| `cargo run --locked --release --features resilience-test --example resilience_probe` | Passed; injected panic contained, last-good inventory and next refresh retained |
+| `git diff --check` | Passed |
+
+Earlier focused checks also passed configuration (14), dashboard (13; 2 ignored), recovery (10), provider runtime (6) and coordinator (10) selections. Offscreen UI checks cover compact/normal/large sizes and 100/125/150/175/200% scaling; the four-provider regression checks measured card expansion and viewport bounds. They do not establish physical appearance, screen-reader or multi-monitor acceptance.
+
+No game or installer was launched, and startup registration was unchanged. GPU memory was not independently sampled. Multi-model replay, mixed live providers, sleep/reboot, installed-app upgrade and Windows 10 remain untested. See the [Hermes review](hermes-local-runtime-review.md) for the contract and limits. Older release results below remain evidence for their own versions.
+
 ## 2.5.3 Ollama Desktop - 2026-10-12
 
 The owner authorized live lifecycle tests, accepted possible concurrent-request cancellation for the opt-in setting, and requested release 2.5.3. Native Desktop shutdown/restart is verified only with Windows Ollama 0.40.3. Unsupported installations fall back to ordinary unloading. Startup evidence is sealed for the current Windows user; original executable hashes and process identities are retained through checkpointed recovery.
@@ -33,7 +52,7 @@ Validation: 82 focused tests passed (dashboard 23, theme three, tray 12, applica
 
 Human appearance/accessibility and live recovery acceptance remain pending. No installed application, real journal, provider/model/server, startup registration or game was changed. This build remains unpublished and requires further human feedback before release.
 
-## UI feedback correction — 2026-10-05
+## UI feedback correction â€” 2026-10-05
 
 The human screenshot exposed group boxes above overlapping sibling controls. The corrected dashboard moves group boxes to the bottom of the sibling order, keeps native controls and dark painting, removes frames from read-only summaries and shows scrollbars only for actual overflow. Both axes account for the space required by the other bar. Long text retains wrapping, keyboard scrolling and selection.
 

@@ -62,6 +62,7 @@ enum Page {
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SettingsPage {
+    Hermes,
     General,
     Detection,
     LMStudio,

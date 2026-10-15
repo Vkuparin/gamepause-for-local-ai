@@ -397,6 +397,26 @@ impl Scanner {
     pub fn ollama_running(&self) -> bool {
         self.running("ollama.exe")
     }
+    pub fn hermes_running(&self) -> bool {
+        let home = self
+            .config
+            .providers
+            .iter()
+            .find_map(|p| match p {
+                crate::config::Provider::Hermes { home, .. } => Some(home.as_str()),
+                _ => None,
+            })
+            .unwrap_or("");
+        let root = if home.is_empty() {
+            crate::hermes::default_home()
+        } else {
+            home.into()
+        };
+        self.cache.values().any(|path| {
+            crate::discovery::inside(path, &root.to_string_lossy())
+                && path.to_ascii_lowercase().ends_with("llama-server.exe")
+        })
+    }
     pub fn new_game_candidate(&mut self, games: &[Game], roots: &[String]) -> bool {
         self.candidates_seen
             .retain(|key| self.cache.contains_key(key));

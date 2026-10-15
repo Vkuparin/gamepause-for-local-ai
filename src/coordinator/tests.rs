@@ -122,7 +122,7 @@ impl Runtime for Fake {
                 original_raw: "fixture original raw config".into(),
                 progress,
             },
-            Kind::Ollama | Kind::Process => Payload::Other {
+            Kind::Ollama | Kind::Process | Kind::Hermes => Payload::Other {
                 original_digest: "fixture original content digest".into(),
                 progress,
             },

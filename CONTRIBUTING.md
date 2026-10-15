@@ -1,6 +1,6 @@
 # Contributing
 
-Bug reports, launcher compatibility fixes, documentation, and measured performance improvements are welcome. Check existing issues first. Include GamePause / Windows / LM Studio versions, the launcher, expected behavior, and sanitized diagnostics. Do not upload complete recovery journals, tokens, prompts, or private paths.
+Bug reports, launcher compatibility fixes, documentation, and measured performance improvements are welcome. Check existing issues first. Include GamePause, Windows and the affected provider's versions, the launcher, expected behavior, and sanitized diagnostics. For Hermes, include its application build and llama.cpp runtime tag. Do not upload complete recovery journals, tokens, prompts, or private paths.
 
 Develop on Windows x64 with the pinned Rust toolchain. Keep idle work bounded, save recovery before changing model state, and avoid telemetry or automatic downloads. Include failure-focused tests when changing restoration or discovery parsing.
 

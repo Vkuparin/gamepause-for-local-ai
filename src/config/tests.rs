@@ -17,7 +17,7 @@ fn desktop_opt_in_defaults_off_and_round_trips_without_format_migration() {
     }
     let saved = serde_json::to_string(&config).unwrap();
     let parsed = Config::parse(&saved).unwrap();
-    assert_eq!(parsed.settings_version, 4);
+    assert_eq!(parsed.settings_version, 5);
     assert_eq!(parsed, config);
 }
 struct Fixture(PathBuf);
@@ -67,7 +67,7 @@ fn version_two_preserves_choices_and_backups_are_not_authority() {
     write_json(&fixture.path(), &legacy).unwrap();
     let original = fs::read(fixture.path()).unwrap();
     let mut migrated = Config::load(&fixture.path()).unwrap();
-    assert_eq!(migrated.settings_version, 4);
+    assert_eq!(migrated.settings_version, 5);
     assert_eq!(migrated.mode, "observe");
     assert!(!migrated.automation_enabled);
     assert_eq!(migrated.lm_endpoint(), "localhost:4321");
@@ -161,6 +161,10 @@ fn version_three_migrates_with_backup_and_takes_the_ollama_default_once() {
     let fixture = Fixture::new();
     let mut three = serde_json::to_value(Config::default()).unwrap();
     three["settings_version"] = 3.into();
+    three["providers"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|p| p["kind"] != "hermes");
     three["providers"][1]["enabled"] = false.into();
     three["restore_delay_seconds"] = 41.into();
     write_json(&fixture.path(), &three).unwrap();
@@ -169,7 +173,7 @@ fn version_three_migrates_with_backup_and_takes_the_ollama_default_once() {
     // Doctor's in-memory parse migrates without writing.
     let text = String::from_utf8(original.clone()).unwrap();
     let parsed = Config::parse(&text).unwrap();
-    assert!(parsed.ollama_enabled() && parsed.settings_version == 4);
+    assert!(parsed.ollama_enabled() && parsed.settings_version == 5);
     assert_eq!(fs::read(fixture.path()).unwrap(), original);
     assert!(!backup.exists());
     let mut loaded = Config::load(&fixture.path()).unwrap();
@@ -178,7 +182,7 @@ fn version_three_migrates_with_backup_and_takes_the_ollama_default_once() {
     assert_eq!(fs::read(&backup).unwrap(), original);
     let saved: serde_json::Value =
         serde_json::from_slice(&fs::read(fixture.path()).unwrap()).unwrap();
-    assert_eq!(saved["settings_version"], 4);
+    assert_eq!(saved["settings_version"], 5);
     assert!(saved.get("ollama_default_applied").is_none());
     // Version 4 keeps a later choice to turn Ollama off.
     if let Provider::Ollama { enabled, .. } = &mut loaded.providers[1] {
@@ -221,6 +225,44 @@ fn ollama_endpoint_and_enablement_persist() {
         "127.0.0.1:24680"
     );
     assert!(!Config::default().providers[1].enabled());
+}
+#[test]
+fn version_four_adds_disabled_hermes_with_guarded_byte_identical_backup() {
+    let fixture = Fixture::new();
+    let mut four = serde_json::to_value(Config::default()).unwrap();
+    four["settings_version"] = 4.into();
+    four["providers"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|p| p["kind"] != "hermes");
+    four["providers"][1]["enabled"] = false.into();
+    write_json(&fixture.path(), &four).unwrap();
+    let original = fs::read(fixture.path()).unwrap();
+    let migrated = Config::load(&fixture.path()).unwrap();
+    assert_eq!(migrated.settings_version, 5);
+    assert_eq!(migrated.providers.len(), 4);
+    assert!(!migrated.hermes_enabled() && !migrated.ollama_enabled());
+    assert_eq!(
+        fs::read(fixture.path().with_extension("v4.backup.json")).unwrap(),
+        original
+    );
+    let mut opted_out = migrated;
+    opted_out
+        .providers
+        .retain(|p| p.kind() != crate::provider::Kind::Hermes);
+    write_json(&fixture.path(), &opted_out).unwrap();
+    assert_eq!(
+        Config::load(&fixture.path()).unwrap().providers,
+        opted_out.providers
+    );
+    write_json(&fixture.path(), &four).unwrap();
+    fs::write(
+        fixture.path().with_extension("v4.backup.json"),
+        b"conflicting source",
+    )
+    .unwrap();
+    assert!(Config::load(&fixture.path()).is_err());
+    assert_eq!(fs::read(fixture.path()).unwrap(), original);
 }
 #[test]
 fn providers_refuse_ambiguous_identity_and_nonlocal_or_unknown_control() {

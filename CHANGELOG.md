@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.6.0 - 2026-10-15
+
+- Hermes is a main provider beside LM Studio and Ollama. Enable it under **Advanced > Hermes** to pause its verified managed local runtime while gaming, leaving Hermes open. GamePause records recovery before using Hermes's native off switch, then restores the runtime and captured local model content, live context and supported load fields. A Hermes-only setup needs no LM Studio installation.
+- The dashboard fits three main providers and Other AI apps, with stable provider order, a Hermes settings page, read-only diagnostics and provider-scoped round-trip verification.
+- Settings migrate to version 5 with a byte-identical version-4 backup and Hermes disabled. Recovery stays at envelope version 3 and accepts four provider kinds. Original Hermes evidence remains unchanged through retries and partial failures.
+
+A live native pause/start/model replay passed with Qwen3.8-27B-UD-Q4_K_M on CUDA llama.cpp b11370. The runtime returned enabled, the model returned with its original 147456-token live context and supported fields, saved preferences matched, and recovery cleared. The check also exposed and fixed retained exited-process handles and asynchronous model readiness. Multi-model replay, mixed live providers, sleep/reboot, installer upgrade and physical/accessibility UI checks remain untested. Hermes support currently targets a local default-profile backend; cloud, remote and independently managed servers are excluded. Conversations, KV cache and idle timing are not restored. Restore pending AI before downgrading; older builds cannot read version-5 settings or Hermes recovery.
+
 ## 2.5.3 - 2026-10-12
 
 - Advanced > Ollama has an opt-in **Prevent Ollama from reloading models while gaming** setting. For verified Windows Ollama Desktop 0.40.3, GamePause unloads models, closes Desktop and its managed server, then restarts it in hidden mode and restores supported models after gaming. Requests arriving during shutdown may be canceled. Unknown versions and unsupported installations keep ordinary model unloading; external restarts are left alone.

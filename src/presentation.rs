@@ -265,6 +265,10 @@ fn provider_lines(shared: &Shared, fallback: &str) -> String {
                     Kind::LMStudio => format!("{}: {fallback}", provider.kind().name()),
                     Kind::Ollama => "Ollama: AI state unknown until capture.".into(),
                     Kind::Process => "Other AI apps: left running until a game starts.".into(),
+                    Kind::Hermes if detected && !shared.hermes_running => {
+                        "Hermes: local runtime is not running.".into()
+                    }
+                    Kind::Hermes => "Hermes: local runtime is ready to pause.".into(),
                 };
             };
             let state = match report.state {

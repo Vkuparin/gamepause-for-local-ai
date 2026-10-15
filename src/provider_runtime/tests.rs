@@ -144,7 +144,7 @@ fn bindings() -> Vec<Binding> {
             let (id, endpoint, guarantee) = match kind {
                 Kind::LMStudio => ("lm", "127.0.0.1:1234", Guarantee::CapturedConfiguration),
                 Kind::Ollama => ("ollama", "127.0.0.1:11434", Guarantee::SupportedFields),
-                Kind::Process => unreachable!(),
+                Kind::Process | Kind::Hermes => unreachable!(),
             };
             Binding {
                 id: id.into(),

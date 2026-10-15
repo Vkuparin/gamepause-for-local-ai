@@ -32,8 +32,9 @@ impl<B: Backend> Engine<B> {
             self.refresh_installed();
             let test_lm = self.config.lm_enabled() && !self.lm_missing && !self.lm_idle;
             let test_ollama = self.config.ollama_enabled();
+            let test_hermes = self.config.hermes_enabled();
             if self.config.mode != "active"
-                || !(test_lm || test_ollama)
+                || !(test_lm || test_ollama || test_hermes)
                 || self.disabled
                 || self.manual_pause
                 || self.pending()
@@ -49,7 +50,13 @@ impl<B: Backend> Engine<B> {
             }
             self.set_activity(Activity::Verifying);
             if !test_lm {
-                return self.verify_ollama(&mut steps, cancelled);
+                if test_ollama {
+                    self.verify_ollama(&mut steps, cancelled)?;
+                }
+                if test_hermes {
+                    self.verify_hermes(&mut steps, cancelled)?;
+                }
+                return Ok(());
             }
             phase = "capture";
             let snapshot = self.backend.capture()?;
@@ -126,6 +133,9 @@ impl<B: Backend> Engine<B> {
             recovered?;
             if test_ollama {
                 self.verify_ollama(&mut steps, cancelled)?;
+            }
+            if test_hermes {
+                self.verify_hermes(&mut steps, cancelled)?;
             }
             Ok(())
         })();
@@ -221,5 +231,44 @@ impl<B: Backend> Engine<B> {
         });
         unloaded?;
         recovered
+    }
+    fn verify_hermes(
+        &mut self,
+        steps: &mut Vec<VerifyStep>,
+        cancelled: &mut dyn FnMut() -> bool,
+    ) -> Result<()> {
+        self.verify_scope = Some(crate::provider::Kind::Hermes);
+        let paused = self.pause_scoped(cancelled, false);
+        steps.push(VerifyStep {
+            name: "hermes-pause".into(),
+            ok: paused.is_ok(),
+            detail: paused
+                .as_ref()
+                .err()
+                .map(|e| format!("{e:#}"))
+                .unwrap_or_else(|| {
+                    "Managed runtime paused and absence verified; an absent runtime is left alone"
+                        .into()
+                }),
+        });
+        let restored = self.restore_checked(cancelled, false).and_then(|()| {
+            if self.pending() {
+                bail!("Hermes recovery is still pending");
+            }
+            Ok(())
+        });
+        steps.push(VerifyStep {
+            name: "hermes-restore".into(),
+            ok: restored.is_ok(),
+            detail: restored
+                .as_ref()
+                .err()
+                .map(|e| format!("{e:#}"))
+                .unwrap_or_else(|| {
+                    "Original runtime state and captured model content/context verified".into()
+                }),
+        });
+        paused?;
+        restored
     }
 }

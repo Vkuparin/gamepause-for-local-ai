@@ -111,6 +111,14 @@ pub fn doctor(config: &Config, folder: &Path) -> Value {
                         json!({"error":format!("{error:#}"),"compatibility":"unverified"})
                     }
                 },
+                Provider::Hermes { id, home, .. } => match crate::hermes::Local::new(home, id)
+                    .and_then(|local| local.diagnostics())
+                {
+                    Ok(evidence) => evidence,
+                    Err(_) => {
+                        json!({"error":"Hermes native control or managed runtime cannot be verified", "compatibility":"unverified"})
+                    }
+                },
                 // Names only: start commands can hold secrets and stay unread here.
                 Provider::Process { apps, .. } => json!({
                     "apps": apps.iter().map(|app| json!({"name":app.name,
@@ -125,6 +133,9 @@ pub fn doctor(config: &Config, folder: &Path) -> Value {
         evidence["endpoint"] = json!(provider.endpoint());
         if let Provider::LMStudio { connection, .. } = provider {
             evidence["connection"] = json!(connection);
+        }
+        if let Provider::Hermes { home, .. } = provider {
+            evidence["connection"] = json!({"home":home});
         }
         evidence["evidence"] = json!(if provider.enabled() {
             "read_only_probe"
@@ -196,7 +207,8 @@ pub fn render(shared: &crate::app::Shared) -> String {
             continue;
         };
         let connection_changed = matches!(provider, Provider::LMStudio { connection, .. }
-            if evidence["connection"] != json!(connection));
+            if evidence["connection"] != json!(connection))
+            || matches!(provider,Provider::Hermes { home,.. } if evidence["connection"] != json!({"home":home}));
         if connection_changed
             || evidence["endpoint"] != provider.endpoint()
             || evidence["enabled"] != provider.enabled()
@@ -217,6 +229,7 @@ pub fn render(shared: &crate::app::Shared) -> String {
             Provider::LMStudio { .. } => &["cli_version", "server", "loaded_models", "ws_protocol"],
             Provider::Ollama { .. } => &["version", "inventory"],
             Provider::Process { .. } => &[],
+            Provider::Hermes { .. } => &["runtime"],
         };
         for field in fields {
             let probe = &evidence[*field];
@@ -234,6 +247,13 @@ pub fn render(shared: &crate::app::Shared) -> String {
                         probe["value"].as_array().map_or(0, Vec::len)
                     ),
                     "server" => format!("running={}", probe["value"]["running"]),
+                    "runtime" => format!(
+                        "running={}, enabled={}, resident models={}, native control={}",
+                        probe["value"]["running"],
+                        probe["value"]["enabled"],
+                        probe["value"]["resident_models"],
+                        probe["value"]["native_control"]
+                    ),
                     _ => "compatible probe".into(),
                 }
             } else {

@@ -28,6 +28,7 @@ impl std::error::Error for ManualRetryRequired {}
 pub enum Kind {
     LMStudio,
     Ollama,
+    Hermes,
     /// Chosen executables stopped for gaming and relaunched afterwards.
     Process,
 }
@@ -36,6 +37,7 @@ impl Kind {
         match self {
             Self::LMStudio => "LM Studio",
             Self::Ollama => "Ollama",
+            Self::Hermes => "Hermes",
             Self::Process => "Other AI apps",
         }
     }

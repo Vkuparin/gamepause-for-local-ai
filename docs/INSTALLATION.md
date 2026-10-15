@@ -2,8 +2,8 @@
 
 ## Requirements
 
-- Windows 10/11 x64 and LM Studio with its `lms` CLI installed.
-- LM Studio open. GamePause handles the local HTTP server automatically and does not launch the LM Studio application itself.
+- Windows 10/11 x64 and a supported local provider: LM Studio, Ollama or Hermes. A Hermes-only or Ollama-only setup needs no LM Studio installation.
+- For LM Studio, install its `lms` CLI and keep the app open. For Hermes, keep its local default-profile backend open and enable **Advanced > Hermes**. GamePause does not install or download provider runtimes.
 - Your desired models loaded before gaming. Model names are captured dynamically.
 
 Destination PCs do not need Python, Node.js, Rust, or administrator rights. The development tools below are needed only to build from source.

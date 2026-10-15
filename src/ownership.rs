@@ -81,6 +81,10 @@ impl Claims {
         if kind == Kind::LMStudio {
             keys.insert("lmstudio-service".into());
         }
+        if kind == Kind::Hermes {
+            // The native off switch affects the per-user shared managed runtime.
+            keys.insert("hermes-local-runtime-service".into());
+        }
         let mut acquired = Vec::new();
         for key in &keys {
             if let Some((existing, _)) = self.held.get(key) {

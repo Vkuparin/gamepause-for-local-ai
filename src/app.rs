@@ -112,7 +112,7 @@ pub fn main(console: bool) -> Result<()> {
     }
     if args.help {
         println!(
-            "GamePause for Local AI: pauses local AI for games\n--background --data-dir PATH --restore\nDevelopment and diagnostics: --headless --active --observe --duration SECONDS --doctor --discover --verify\nDefault: automatic pausing with a native dashboard. --background starts in the tray. --observe is a diagnostic override. --verify unloads/reloads the models LM Studio and Ollama have loaded, using durable recovery; close games and the GUI first. --doctor never starts/stops the server or unloads models. --restore retries a pending restore when GamePause is not running and reports the result. Ollama is used when it is running and ignored when it is not; turn it off in Advanced settings or its enabled config field. Tested with Ollama 0.35.1 and 0.40.0. Local GGUF completion models are restored with their identity, context and the keep-alive time left at pause; other local models are unloaded without reload; full load options and conversations are not preserved."
+            "GamePause for Local AI: pauses local AI for games\n--background --data-dir PATH --restore\nDevelopment and diagnostics: --headless --active --observe --duration SECONDS --doctor --discover --verify\nDefault: automatic pausing with a native dashboard. --background starts in the tray. --observe is a diagnostic override. --verify pauses/restores enabled LM Studio, Ollama and Hermes providers, using durable recovery; close games and the GUI first. --doctor never starts/stops the server or unloads models. --restore retries a pending restore when GamePause is not running and reports the result. Ollama is used when it is running and ignored when it is not; turn it off in Advanced settings or its enabled config field. Tested with Ollama 0.35.1 and 0.40.0. Local GGUF completion models are restored with their identity, context and the keep-alive time left at pause; other local models are unloaded without reload; full load options and conversations are not preserved."
         );
         return Ok(());
     }
@@ -257,6 +257,8 @@ pub fn main(console: bool) -> Result<()> {
         lm_running: false,
         ollama_running: false,
         ollama_installed: ollama_installed(),
+        hermes_installed: hermes_installed(&config),
+        hermes_running: false,
         freed_bytes: 0,
         ask_prompt: vec![],
         suggestion: None,
@@ -495,6 +497,9 @@ fn ollama_installed() -> bool {
                 .collect::<Vec<_>>(),
         )
         .any(|folder| folder.join("ollama.exe").is_file())
+}
+fn hermes_installed(config: &Config) -> bool {
+    config.providers.iter().any(|p|matches!(p,crate::config::Provider::Hermes { home,.. } if crate::hermes::installed(home)))
 }
 fn recovery_games(engine: &Engine<OptionalBackend>, games: &[Game]) -> Vec<Game> {
     let mut known = games.to_vec();
@@ -798,6 +803,7 @@ fn run(
                 } else {
                     let changed = games != updated;
                     let ollama = ollama_installed();
+                    let hermes = hermes_installed(&engine.config);
                     let was_ready = inventory_ready;
                     inventory_ready = true;
                     steam_roots = roots;
@@ -824,6 +830,7 @@ fn run(
                         shared.revision += 1;
                         shared.discovery_ready = true;
                         shared.ollama_installed = ollama;
+                        shared.hermes_installed = hermes;
                     }
                 }
             }

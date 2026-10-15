@@ -161,7 +161,7 @@ pub(super) fn fingerprint(s: &crate::app::Shared) -> String {
         s.discovery_ready,
         s.games
     ) + &format!(
-        "|{:?}|{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        "|{:?}|{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
         s.suggestion,
         s.ask_prompt,
         s.freed_bytes,
@@ -169,6 +169,8 @@ pub(super) fn fingerprint(s: &crate::app::Shared) -> String {
         s.lm_running,
         s.ollama_running,
         s.ollama_installed,
+        s.hermes_installed,
+        s.hermes_running,
         s.pending,
         s.manual_pause,
         s.coexistence,

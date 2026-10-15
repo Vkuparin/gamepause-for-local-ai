@@ -25,9 +25,9 @@ try {
     Copy-Item -LiteralPath 'target\release\GamePause.exe' -Destination $taskBundle -Force
     foreach ($taskFile in @('README.md','LICENSE','CHANGELOG.md','config.example.json')) { Copy-Item -LiteralPath $taskFile -Destination $taskBundle -Force }
     New-Item -ItemType Directory -Path (Join-Path $taskBundle 'docs') -Force | Out-Null
-    $taskUserDocs = Get-ChildItem -LiteralPath 'docs' -File | Where-Object { $_.Name -notlike '*-review.md' -and $_.Name -notlike '*-plan.md' }
+    $taskUserDocs = Get-ChildItem -LiteralPath 'docs' -File | Where-Object { $_.Name -notmatch '-(review|plan|spec|tasks)\.md$' }
     if (Test-Path -LiteralPath (Join-Path $taskBundle 'docs')) {
-        $taskInternalDocs = Get-ChildItem -LiteralPath (Join-Path $taskBundle 'docs') -File | Where-Object { $_.Name -like '*-review.md' -or $_.Name -like '*-plan.md' }
+        $taskInternalDocs = Get-ChildItem -LiteralPath (Join-Path $taskBundle 'docs') -File | Where-Object { $_.Name -match '-(review|plan|spec|tasks)\.md$' }
         foreach ($taskInternalDoc in $taskInternalDocs) { Remove-Item -LiteralPath $taskInternalDoc.FullName -Force }
     }
     foreach ($taskDoc in $taskUserDocs) { Copy-Item -LiteralPath $taskDoc.FullName -Destination (Join-Path $taskBundle 'docs') -Force }

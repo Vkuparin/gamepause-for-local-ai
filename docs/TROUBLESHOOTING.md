@@ -2,7 +2,15 @@
 
 ## Gather diagnostics
 
-Open **Advanced > Diagnostics** and choose **Check enabled providers** for read-only evidence about LM Studio, Ollama and other AI apps. **Activity** shows recent state changes and can load the recent worker log. **Advanced > Recovery > Test round-trip...** runs a live pause and restore on request.
+Open **Advanced > Diagnostics** and choose **Check enabled providers** for read-only evidence about LM Studio, Ollama, Hermes and other AI apps. **Activity** shows recent state changes and can load the recent worker log. **Advanced > Recovery > Test round-trip...** runs a live pause and restore on request.
+
+## Hermes local models
+
+Enable **Advanced > Hermes** and keep Hermes open. If discovery fails, set its data directory explicitly and repeat diagnostics. GamePause verifies the control token, process birth identity, local endpoint owner and managed engine; a custom OpenAI endpoint alone is insufficient. Named profiles, remote backends and ambiguous owners are refused.
+
+Generating, loading or queued requests defer pausing. Stop long-running agents if you need memory promptly. The native runtime off switch also saves Hermes's enabled setting; GamePause records that obligation before stopping it. If Hermes closes during a pause, reopen it and choose **Resume AI** to finish recovery. Changed model content, engine or preferences retain the journal. Do not delete it to hide an error.
+
+The live context may differ from the context override shown in Hermes settings. GamePause captures the live value and verifies supported fields after replay. A live native pause/start and Qwen3.8-27B-UD-Q4_K_M replay passed on CUDA llama.cpp b11370. Model loading waits for inventory readiness before final verification; timeout or conflicting state retains recovery. Explicitly restarting Hermes's runtime can override a completed gaming pause.
 
 Reports, `status.json`, `inventory.json`, and rotated `gamepause.log` files are in `%LOCALAPPDATA%\GamePause`. Use `--data-dir DIRECTORY` consistently for a custom installation. Doctor reports independent probe outcomes without changing LM Studio model/server state; unavailable CLI, busy inference, protocol errors, or unwritable storage do not discard all results. WS compatibility is unknown when the server is stopped or no model is loaded. **Test round-trip** is disruptive: it persists recovery, unloads, confirms an empty inventory, restores and compares settings. Close games and finish inference first. Existing/corrupt recovery blocks a new verify. Failed or deferred restoration remains in `state.json`; use **Resume AI** after games exit. The report uses `capture`, `unload`, `verify-unloaded`, `restore`, and `verify-fields`. Actual WS operation logs include the instance and `lm=cli:...`; this identifies the CLI version, not an independently measured server version. Review and redact reports before posting them.
 

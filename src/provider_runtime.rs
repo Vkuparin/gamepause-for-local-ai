@@ -74,14 +74,14 @@ impl<L: Runtime, O: Runtime> Runtime for Router<L, O> {
                     restore_complete: entry.restore_complete,
                 }
             }
-            Kind::Process => bail!("{UNROUTED}"),
+            Kind::Process | Kind::Hermes => bail!("{UNROUTED}"),
         })
     }
     fn validate(&self, entry: &Entry<Self::Payload>, games: &[Game]) -> Result<()> {
         match entry.binding.kind {
             Kind::LMStudio => self.lm.validate(&lm_entry(entry)?, games),
             Kind::Ollama => self.ollama.validate(&ollama_entry(entry)?, games),
-            Kind::Process => bail!("{UNROUTED}"),
+            Kind::Process | Kind::Hermes => bail!("{UNROUTED}"),
         }
     }
     fn validate_transition(&self, original: &Self::Payload, updated: &Self::Payload) -> Result<()> {
@@ -121,14 +121,14 @@ impl<L: Runtime, O: Runtime> Runtime for Router<L, O> {
             Kind::Ollama => {
                 ollama_entry(entry).is_ok_and(|entry| self.ollama.can_continue(&entry, intent))
             }
-            Kind::Process => false,
+            Kind::Process | Kind::Hermes => false,
         }
     }
     fn retry(&self, binding: &Binding) {
         match binding.kind {
             Kind::LMStudio => self.lm.retry(binding),
             Kind::Ollama => self.ollama.retry(binding),
-            Kind::Process => (),
+            Kind::Process | Kind::Hermes => (),
         }
     }
     fn note(&self, payload: &Self::Payload) -> String {
@@ -157,7 +157,7 @@ impl<L: Runtime, O: Runtime> Runtime for Router<L, O> {
                     Routed::Ollama(planned.work),
                 )
             }
-            Kind::Process => bail!("{UNROUTED}"),
+            Kind::Process | Kind::Hermes => bail!("{UNROUTED}"),
         };
         Ok(Planned {
             checkpoint,
@@ -408,10 +408,71 @@ fn process_entry(entry: &Entry<Payload>) -> Result<Entry<crate::process_session:
 pub enum ProviderWork {
     Routed(Work<LMWork, crate::ollama_session::Work>),
     Process(crate::process_session::Work),
+    Hermes(crate::hermes_session::Work),
+}
+#[derive(Default)]
+pub struct HermesRuntime {
+    adapter: Option<crate::hermes_session::Adapter<crate::hermes::Local>>,
+    active: bool,
+    error: String,
+}
+impl HermesRuntime {
+    fn configure(&mut self, config: &Config) {
+        let configured = config
+            .providers
+            .iter()
+            .find(|p| p.kind() == Kind::Hermes && p.enabled());
+        self.active = config.mode == "active" && configured.is_some();
+        if !self.active {
+            self.error = "Hermes is disabled or observation is active; recovery retained".into();
+        } else if self.adapter.is_none()
+            && let Some(crate::config::Provider::Hermes { id, home, .. }) = configured
+        {
+            let created = crate::hermes::Local::new(home, id).and_then(|mut backend| {
+                backend.exclude_apps(
+                    config
+                        .providers
+                        .iter()
+                        .filter(|p| p.enabled())
+                        .filter_map(|p| match p {
+                            crate::config::Provider::Process { apps, .. } => Some(apps),
+                            _ => None,
+                        })
+                        .flatten()
+                        .map(|a| a.path.clone())
+                        .collect(),
+                );
+                crate::hermes_session::Adapter::new(backend, crate::hermes_session::binding(id))
+            });
+            match created {
+                Ok(adapter) => self.adapter = Some(adapter),
+                Err(e) => self.error = format!("{e:#}"),
+            }
+        }
+    }
+    fn adapter(&mut self) -> Result<&mut crate::hermes_session::Adapter<crate::hermes::Local>> {
+        if !self.active {
+            bail!("{}", self.error);
+        }
+        self.adapter
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Hermes control unavailable: {}", self.error))
+    }
+}
+fn hermes_entry(entry: &Entry<Payload>) -> Result<Entry<crate::hermes_session::Snapshot>> {
+    match &entry.payload {
+        Payload::Hermes(snapshot) if entry.binding.kind == Kind::Hermes => Ok(Entry {
+            binding: entry.binding.clone(),
+            payload: snapshot.clone(),
+            restore_complete: entry.restore_complete,
+        }),
+        _ => bail!("Hermes provider kind/payload mismatch; recovery retained"),
+    }
 }
 pub struct Providers<'a, B: Backend> {
     pub router: Router<LMRuntime<B>, OllamaRef<'a>>,
     processes: &'a mut ProcessRuntime,
+    hermes: &'a mut HermesRuntime,
 }
 impl<'a, B: Backend> Providers<'a, B> {
     pub fn with_progress(mut self, progress: crate::lm_session::Progress) -> Self {
@@ -424,15 +485,18 @@ impl<'a, B: Backend> Providers<'a, B> {
         verify_raw: bool,
         ollama: &'a mut OllamaRuntime,
         processes: &'a mut ProcessRuntime,
+        hermes: &'a mut HermesRuntime,
     ) -> Self {
         ollama.configure(&config);
         processes.configure(&config);
+        hermes.configure(&config);
         Self {
             router: Router {
                 lm: LMRuntime::new(backend, config, verify_raw),
                 ollama: OllamaRef(ollama),
             },
             processes,
+            hermes,
         }
     }
 }
@@ -499,6 +563,11 @@ impl OllamaRuntime {
 }
 impl<B: Backend> Providers<'_, B> {
     pub fn bindings(&self) -> Result<Vec<Binding>> {
+        if self.hermes.active
+            && let Some(adapter) = &self.hermes.adapter
+        {
+            adapter.backend.check_process_overlap()?;
+        }
         self.router
             .lm
             .config
@@ -508,6 +577,9 @@ impl<B: Backend> Providers<'_, B> {
             .map(|provider| {
                 if provider.kind() == Kind::Process {
                     return Ok(process_binding(provider.id()));
+                }
+                if provider.kind() == Kind::Hermes {
+                    return Ok(crate::hermes_session::binding(provider.id()));
                 }
                 let endpoint = normalized_endpoint(provider.endpoint())?;
                 Ok(Binding {
@@ -519,6 +591,7 @@ impl<B: Backend> Providers<'_, B> {
                     guarantee: match provider.kind() {
                         Kind::LMStudio => Guarantee::CapturedConfiguration,
                         Kind::Ollama => Guarantee::SupportedFields,
+                        Kind::Hermes => Guarantee::SupportedFields,
                         Kind::Process => Guarantee::ProcessRelaunch,
                     },
                 })
@@ -533,7 +606,7 @@ fn wrap(entry: &Entry<Payload>) -> Entry<Routed<Payload, crate::ollama_session::
             Payload::LMStudio(_) => Routed::LMStudio(entry.payload.clone()),
             Payload::Ollama(snapshot) => Routed::Ollama(snapshot.clone()),
             // Never reached: `Providers` handles process entries before routing.
-            Payload::Process(_) => Routed::LMStudio(entry.payload.clone()),
+            Payload::Process(_) | Payload::Hermes(_) => Routed::LMStudio(entry.payload.clone()),
         },
         restore_complete: entry.restore_complete,
     }
@@ -548,6 +621,14 @@ impl<B: Backend> Runtime for Providers<'_, B> {
     type Payload = Payload;
     type Work = ProviderWork;
     fn capture(&mut self, binding: &Binding, games: &[Game]) -> Result<Entry<Payload>> {
+        if binding.kind == Kind::Hermes {
+            let entry = self.hermes.adapter()?.capture(binding, games)?;
+            return Ok(Entry {
+                binding: entry.binding,
+                payload: Payload::Hermes(entry.payload),
+                restore_complete: entry.restore_complete,
+            });
+        }
         if binding.kind == Kind::Process {
             let entry = self.processes.adapter()?.capture(binding, games)?;
             return Ok(Entry {
@@ -564,6 +645,10 @@ impl<B: Backend> Runtime for Providers<'_, B> {
         })
     }
     fn validate(&self, entry: &Entry<Payload>, games: &[Game]) -> Result<()> {
+        if entry.binding.kind == Kind::Hermes || matches!(entry.payload, Payload::Hermes(_)) {
+            let typed = hermes_entry(entry)?;
+            return typed.payload.validate();
+        }
         if entry.binding.kind == Kind::Process || matches!(entry.payload, Payload::Process(_)) {
             let typed = process_entry(entry)?;
             return match &self.processes.adapter {
@@ -580,6 +665,7 @@ impl<B: Backend> Runtime for Providers<'_, B> {
             }
             (Payload::Ollama(old), Payload::Ollama(new)) => old.validate_transition(new),
             (Payload::Process(old), Payload::Process(new)) => old.validate_transition(new),
+            (Payload::Hermes(old), Payload::Hermes(new)) => old.validate_transition(new),
             _ => bail!("Provider payload kind changed; all recovery retained"),
         }
     }
@@ -597,6 +683,10 @@ impl<B: Backend> Runtime for Providers<'_, B> {
                 snapshot.begin();
                 Ok(())
             }
+            Payload::Hermes(snapshot) => {
+                snapshot.begin();
+                Ok(())
+            }
         }
     }
     fn complete(&self, payload: &Payload, intent: Intent) -> bool {
@@ -604,12 +694,20 @@ impl<B: Backend> Runtime for Providers<'_, B> {
             Payload::LMStudio(_) => self.router.lm.complete(payload, intent),
             Payload::Ollama(snapshot) => intent == Intent::Pause && snapshot.pause_complete,
             Payload::Process(snapshot) => intent == Intent::Pause && snapshot.pause_complete,
+            Payload::Hermes(snapshot) => intent == Intent::Pause && snapshot.pause_complete,
         }
     }
     fn can_continue(&self, entry: &Entry<Payload>, intent: Intent) -> bool {
-        entry.binding.kind != Kind::Process && self.router.can_continue(&wrap(entry), intent)
+        !matches!(entry.binding.kind, Kind::Process | Kind::Hermes)
+            && self.router.can_continue(&wrap(entry), intent)
     }
     fn retry(&self, binding: &Binding) {
+        if binding.kind == Kind::Hermes {
+            if let Some(adapter) = &self.hermes.adapter {
+                adapter.retry(binding);
+            }
+            return;
+        }
         self.router.retry(binding);
     }
     fn note(&self, payload: &Payload) -> String {
@@ -617,6 +715,7 @@ impl<B: Backend> Runtime for Providers<'_, B> {
             Payload::LMStudio(_) => String::new(),
             Payload::Ollama(snapshot) => snapshot.note(),
             Payload::Process(snapshot) => snapshot.note(),
+            Payload::Hermes(snapshot) => snapshot.note(),
         }
     }
     fn plan(
@@ -624,6 +723,13 @@ impl<B: Backend> Runtime for Providers<'_, B> {
         entry: &Entry<Payload>,
         intent: Intent,
     ) -> Result<Planned<Payload, Self::Work>> {
+        if entry.binding.kind == Kind::Hermes {
+            let planned = self.hermes.adapter()?.plan(&hermes_entry(entry)?, intent)?;
+            return Ok(Planned {
+                checkpoint: Payload::Hermes(planned.checkpoint),
+                work: ProviderWork::Hermes(planned.work),
+            });
+        }
         if entry.binding.kind == Kind::Process {
             let planned = self
                 .processes
@@ -642,6 +748,13 @@ impl<B: Backend> Runtime for Providers<'_, B> {
     }
     fn execute(&mut self, binding: &Binding, work: Self::Work) -> Result<Outcome<Payload>> {
         match work {
+            ProviderWork::Hermes(work) => {
+                let outcome = self.hermes.adapter()?.execute(binding, work)?;
+                Ok(Outcome {
+                    payload: Payload::Hermes(outcome.payload),
+                    restore_complete: outcome.restore_complete,
+                })
+            }
             ProviderWork::Process(work) => {
                 let outcome = self.processes.adapter()?.execute(binding, work)?;
                 Ok(Outcome {

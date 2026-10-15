@@ -28,6 +28,12 @@
       "id": "apps-main",
       "enabled": true,
       "apps": []
+    },
+    {
+      "kind": "hermes",
+      "id": "hermes-main",
+      "enabled": false,
+      "home": ""
     }
   ],
   "advanced_settings_visible": false,
@@ -39,7 +45,7 @@
   "extra_games": [],
   "excluded_executables": [],
   "excluded_paths": [],
-  "settings_version": 4,
+  "settings_version": 5,
   "automation_enabled": true,
   "ignored_games": []
 }

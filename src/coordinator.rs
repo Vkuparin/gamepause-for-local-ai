@@ -773,7 +773,7 @@ fn same_provider(configured: &Binding, captured: &Binding) -> Result<()> {
         || configured.kind != captured.kind
         || configured.payload_version != captured.payload_version
         || configured.guarantee != captured.guarantee
-        || if configured.kind == Kind::Process {
+        || if matches!(configured.kind, Kind::Process | Kind::Hermes) {
             configured.configured_endpoint != captured.configured_endpoint
         } else {
             normalized_endpoint(&configured.configured_endpoint)?
@@ -801,6 +801,12 @@ pub(crate) fn validate_bindings<'a>(bindings: impl Iterator<Item = &'a Binding>)
             || !kinds.insert(binding.kind as u8)
         {
             bail!("Unsupported or duplicate provider binding; recovery retained");
+        }
+        if binding.kind == Kind::Hermes {
+            if binding != &crate::hermes_session::binding(&binding.id) {
+                bail!("Unsupported Hermes provider route; recovery retained");
+            }
+            continue;
         }
         if binding.kind == Kind::Process {
             // Local processes have one fixed route identity instead of a port.

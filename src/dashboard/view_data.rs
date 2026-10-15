@@ -166,6 +166,7 @@ fn app_running(s: &Shared, kind: crate::provider::Kind) -> bool {
         crate::provider::Kind::LMStudio => s.lm_running,
         crate::provider::Kind::Ollama => s.ollama_running,
         crate::provider::Kind::Process => true,
+        crate::provider::Kind::Hermes => s.hermes_running,
     }
 }
 /// The status card names only AI apps this PC has: installed or running, or
@@ -185,6 +186,7 @@ fn listed(s: &Shared, provider: &crate::config::Provider) -> bool {
                 })
         }
         Kind::Process => true,
+        Kind::Hermes => s.hermes_installed || s.hermes_running || s.provider_pending(Kind::Hermes),
     }
 }
 /// One line per listed provider: name, short outcome, dot tone.
@@ -196,42 +198,51 @@ pub(super) fn provider_status(s: &Shared) -> Vec<(String, &'static str, Tone)> {
     } else {
         s.activity
     };
-    s.config
-        .providers
-        .iter()
-        .filter(|p| p.enabled() && listed(s, p))
-        .map(|p| {
-            let report = s
-                .provider_statuses
-                .iter()
-                .find(|r| r.id == p.id() && r.kind == p.kind());
-            let state = report.map(|r| r.state);
-            let absent = report.is_some_and(|r| r.note == crate::ollama_session::NOT_RUNNING);
-            let (text, tone) = match (state, activity) {
-                (Some(State::Paused | State::Restored), _) if absent => {
-                    ("Not running", Tone::Neutral)
-                }
-                (Some(State::Failed), _) => ("Something went wrong", Tone::Error),
-                (Some(State::Deferred), _) => ("Waiting", Tone::Busy),
-                (Some(State::Pausing), _) => ("Pausing AI", Tone::Busy),
-                (Some(State::Restoring), _) => ("Resuming AI", Tone::Busy),
-                // A report from the previous session can outlive the start of new work.
-                (
-                    None | Some(State::Restored),
-                    Activity::Capturing | Activity::WaitingForInference | Activity::Unloading,
-                ) => ("Pausing AI", Tone::Busy),
-                (None | Some(State::Paused), Activity::Restoring) => ("Resuming AI", Tone::Busy),
-                (_, Activity::Verifying) => ("Testing", Tone::Busy),
-                (Some(State::Paused), _) => ("Models unloaded successfully", Tone::Success),
-                (Some(State::Restored), _) => ("Models restored", Tone::Success),
-                (_, Activity::Unknown | Activity::DetectionUnavailable) => {
-                    ("Waiting for game detection", Tone::Neutral)
-                }
-                // "Ready" claims the app is there to be paused.
-                _ if !app_running(s, p.kind()) => ("Not running", Tone::Neutral),
-                _ => ("Ready", Tone::Success),
-            };
-            (format!("{}:", p.kind().name()), text, tone)
-        })
-        .collect()
+    [
+        crate::provider::Kind::LMStudio,
+        crate::provider::Kind::Ollama,
+        crate::provider::Kind::Hermes,
+        crate::provider::Kind::Process,
+    ]
+    .into_iter()
+    .filter_map(|kind| s.config.providers.iter().find(|p| p.kind() == kind))
+    .filter(|p| {
+        (p.enabled() || (p.kind() == crate::provider::Kind::Hermes && s.provider_pending(p.kind())))
+            && listed(s, p)
+    })
+    .map(|p| {
+        let report = s
+            .provider_statuses
+            .iter()
+            .find(|r| r.id == p.id() && r.kind == p.kind());
+        let state = report.map(|r| r.state);
+        let absent = report.is_some_and(|r| r.note == crate::ollama_session::NOT_RUNNING);
+        let (text, tone) = match (state, activity) {
+            (Some(State::Paused | State::Restored), _) if absent => ("Not running", Tone::Neutral),
+            (Some(State::Failed), _) => ("Something went wrong", Tone::Error),
+            (Some(State::Deferred), _) => ("Waiting", Tone::Busy),
+            (Some(State::Pausing), _) => ("Pausing AI", Tone::Busy),
+            (Some(State::Restoring), _) => ("Resuming AI", Tone::Busy),
+            // A report from the previous session can outlive the start of new work.
+            (
+                None | Some(State::Restored),
+                Activity::Capturing | Activity::WaitingForInference | Activity::Unloading,
+            ) => ("Pausing AI", Tone::Busy),
+            (None | Some(State::Paused), Activity::Restoring) => ("Resuming AI", Tone::Busy),
+            (_, Activity::Verifying) => ("Testing", Tone::Busy),
+            (Some(State::Paused), _) if p.kind() == crate::provider::Kind::Hermes => {
+                ("Local runtime paused", Tone::Success)
+            }
+            (Some(State::Paused), _) => ("Models unloaded successfully", Tone::Success),
+            (Some(State::Restored), _) => ("Models restored", Tone::Success),
+            (_, Activity::Unknown | Activity::DetectionUnavailable) => {
+                ("Waiting for game detection", Tone::Neutral)
+            }
+            // "Ready" claims the app is there to be paused.
+            _ if !app_running(s, p.kind()) => ("Not running", Tone::Neutral),
+            _ => ("Ready", Tone::Success),
+        };
+        (format!("{}:", p.kind().name()), text, tone)
+    })
+    .collect()
 }

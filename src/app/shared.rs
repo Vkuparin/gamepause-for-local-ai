@@ -111,6 +111,8 @@ pub struct Shared {
     pub ollama_running: bool,
     /// Ollama's program file was found on this PC, running or not.
     pub ollama_installed: bool,
+    pub hermes_installed: bool,
+    pub hermes_running: bool,
     /// Approximate model memory released by the current pause; 0 if unknown.
     pub freed_bytes: u64,
     /// Running games whose rule is "ask" and that have not been answered.

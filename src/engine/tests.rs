@@ -840,7 +840,8 @@ fn routed_private_http_pause_restore_preserves_mixed_and_ollama_only_recovery() 
                     *enabled = true;
                     *route = endpoint.clone();
                 }
-                crate::config::Provider::Process { .. } => (),
+                crate::config::Provider::Process { .. }
+                | crate::config::Provider::Hermes { .. } => (),
             }
         }
         let initial_lm_events = e.backend.events.clone();

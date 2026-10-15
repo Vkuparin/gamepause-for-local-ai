@@ -71,6 +71,7 @@ pub struct Config {
 enum Source {
     Current,
     VersionThree,
+    VersionFour,
     Legacy,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -82,6 +83,12 @@ pub struct ExtraGame {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
 pub enum Provider {
+    Hermes {
+        id: String,
+        enabled: bool,
+        /// Empty discovers HERMES_HOME or the platform's default data directory.
+        home: String,
+    },
     LMStudio {
         id: String,
         enabled: bool,
@@ -121,12 +128,17 @@ pub struct LMConnection {
 impl Provider {
     pub fn id(&self) -> &str {
         match self {
-            Self::LMStudio { id, .. } | Self::Ollama { id, .. } | Self::Process { id, .. } => id,
+            Self::LMStudio { id, .. }
+            | Self::Ollama { id, .. }
+            | Self::Process { id, .. }
+            | Self::Hermes { id, .. } => id,
         }
     }
     pub fn enabled(&self) -> bool {
         match self {
-            Self::LMStudio { enabled, .. } | Self::Ollama { enabled, .. } => *enabled,
+            Self::LMStudio { enabled, .. }
+            | Self::Ollama { enabled, .. }
+            | Self::Hermes { enabled, .. } => *enabled,
             // With no app chosen there is nothing to control.
             Self::Process { enabled, apps, .. } => *enabled && !apps.is_empty(),
         }
@@ -136,6 +148,7 @@ impl Provider {
             Self::LMStudio { .. } => crate::provider::Kind::LMStudio,
             Self::Ollama { .. } => crate::provider::Kind::Ollama,
             Self::Process { .. } => crate::provider::Kind::Process,
+            Self::Hermes { .. } => crate::provider::Kind::Hermes,
         }
     }
     pub fn endpoint(&self) -> &str {
@@ -143,6 +156,7 @@ impl Provider {
             Self::LMStudio { connection, .. } => &connection.endpoint,
             Self::Ollama { endpoint, .. } => endpoint,
             Self::Process { .. } => crate::process_session::ROUTE,
+            Self::Hermes { .. } => crate::hermes::ROUTE,
         }
     }
 }
@@ -170,6 +184,11 @@ fn default_providers() -> Vec<Provider> {
             enabled: true,
             apps: vec![],
         },
+        Provider::Hermes {
+            id: "hermes-main".into(),
+            enabled: false,
+            home: String::new(),
+        },
     ]
 }
 impl Default for Config {
@@ -180,7 +199,7 @@ impl Default for Config {
             restore_delay_seconds: 30.,
             retry_seconds: 30.,
             mode: "active".into(),
-            settings_version: 4,
+            settings_version: 5,
             automation_enabled: true,
             ignored_games: vec![],
             ask_games: vec![],
@@ -270,12 +289,17 @@ impl Config {
             .iter()
             .any(|provider| provider.kind() == crate::provider::Kind::Ollama && provider.enabled())
     }
+    pub fn hermes_enabled(&self) -> bool {
+        self.providers
+            .iter()
+            .any(|p| p.kind() == crate::provider::Kind::Hermes && p.enabled())
+    }
     /// Validated in-memory migration for read-only diagnostics. No files change.
     pub fn parse(text: &str) -> Result<Self> {
         Ok(Self::decode(text)?.0)
     }
     /// Returns the settings and the format they were read from. Version-2 and
-    /// unversioned files pass through the version-3 shape on their way to 4.
+    /// unversioned files pass through versions 3 and 4 on their way to 5.
     fn decode(text: &str) -> Result<(Self, Source)> {
         let mut raw: serde_json::Value = serde_json::from_str(text.trim_start_matches('\u{feff}'))
             .context("Invalid configuration")?;
@@ -303,6 +327,7 @@ impl Config {
                 }
             }
             let mut providers = default_providers();
+            providers.retain(|p| p.kind() != crate::provider::Kind::Hermes);
             if let Provider::LMStudio { connection, .. } = &mut providers[0] {
                 if let Some(value) = map.remove("api_host") {
                     connection.endpoint = serde_json::from_value(value)?;
@@ -346,6 +371,23 @@ impl Config {
             }
             map.insert("settings_version".into(), 4.into());
         }
+        let version_four = raw["settings_version"] == 4;
+        if version_four {
+            let map = raw
+                .as_object_mut()
+                .context("Configuration must be an object")?;
+            if let Some(providers) = map.get_mut("providers").and_then(|v| v.as_array_mut()) {
+                if !providers.iter().any(|p| p["kind"] == "hermes") {
+                    if providers.iter().any(|p| p["id"] == "hermes-main") {
+                        bail!("Hermes provider ID is already used; source retained");
+                    }
+                    providers.push(serde_json::to_value(&default_providers()[3])?);
+                } else {
+                    bail!("Hermes entry in old settings format; source retained");
+                }
+            }
+            map.insert("settings_version".into(), 5.into());
+        }
         let config: Self = serde_json::from_value(raw).context("Invalid configuration")?;
         config.validate()?;
         Ok((
@@ -354,6 +396,8 @@ impl Config {
                 Source::Legacy
             } else if version_three {
                 Source::VersionThree
+            } else if version_four {
+                Source::VersionFour
             } else {
                 Source::Current
             },
@@ -369,6 +413,7 @@ impl Config {
             Source::Current => return Ok(config),
             Source::Legacy => path.with_extension("v2.backup.json"),
             Source::VersionThree => path.with_extension("v3.backup.json"),
+            Source::VersionFour => path.with_extension("v4.backup.json"),
         };
         match OpenOptions::new()
             .write(true)
@@ -455,13 +500,13 @@ impl Config {
             bail!("mode must be active or observe");
         }
         parse_hotkey(&self.pause_hotkey)?;
-        if self.settings_version != 4 {
+        if self.settings_version != 5 {
             bail!("Unsupported settings version; configuration retained");
         }
         let mut ids = std::collections::HashSet::new();
         let mut kinds = std::collections::HashSet::new();
         let mut endpoints = std::collections::HashSet::new();
-        if self.providers.len() > 3 {
+        if self.providers.len() > 4 {
             bail!("Only one entry per supported provider kind is allowed");
         }
         for provider in &self.providers {
@@ -492,8 +537,44 @@ impl Config {
                         "Other AI apps need a name and a distinct full path to an .exe file, at most 32"
                     );
                 }
+            } else if let Provider::Hermes { home, .. } = provider {
+                if !home.is_empty() && !crate::hermes::local_path(home) {
+                    bail!("Hermes data directory must be a full path");
+                }
             } else if !endpoints.insert(normalized_endpoint(provider.endpoint())?) {
                 bail!("Duplicate provider endpoint");
+            }
+        }
+        if let Some(Provider::Hermes { home, .. }) = self
+            .providers
+            .iter()
+            .find(|p| p.kind() == crate::provider::Kind::Hermes && p.enabled())
+        {
+            let home = if home.is_empty() {
+                crate::hermes::default_home()
+            } else {
+                home.into()
+            };
+            if self
+                .providers
+                .iter()
+                .filter(|p| p.enabled())
+                .any(|p| match p {
+                    Provider::Process { apps, .. } => apps.iter().any(|a| {
+                        crate::discovery::inside(&a.path, &home.to_string_lossy())
+                            && matches!(
+                                crate::process_session::file_name(&a.path)
+                                    .to_ascii_lowercase()
+                                    .as_str(),
+                                "llama-server.exe" | "hermes.exe" | "hermes desktop.exe"
+                            )
+                    }),
+                    _ => false,
+                })
+            {
+                bail!(
+                    "Hermes runtime is also chosen under Other AI apps; remove duplicate control"
+                );
             }
         }
         for game in &self.extra_games {

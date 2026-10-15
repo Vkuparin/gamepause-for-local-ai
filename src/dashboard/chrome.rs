@@ -40,7 +40,7 @@ impl Dashboard {
                     };
                     let width = (ui.available_width() - right - design::GAP).max(220.0);
                     ui.allocate_ui_with_layout(
-                        vec2(width, 112.0),
+                        vec2(width, 0.0),
                         Layout::top_down(Align::Min),
                         |ui| {
                             ui.set_min_width(width);
@@ -70,7 +70,8 @@ impl Dashboard {
                                     ui.label(
                                         RichText::new(name).size(19.0).family(design::heading()),
                                     );
-                                    ui.add(Label::new(RichText::new(text).size(19.0)).truncate());
+                                    ui.add(Label::new(RichText::new(text).size(19.0)).truncate())
+                                        .on_hover_text(text);
                                 });
                             }
                             if !s.config.any_provider_enabled() {
