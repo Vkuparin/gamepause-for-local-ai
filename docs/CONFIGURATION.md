@@ -17,7 +17,7 @@ The complete starting configuration is [config.example.json](../config.example.j
 | `pause_hotkey` | `""` | System-wide Pause AI / Resume AI shortcut such as `Ctrl+Alt+P`; needs Ctrl, Alt or Win plus one letter, digit, F1-F24 or a named key (Pause, Space, Home, End, Insert, Delete, PageUp, PageDown). Empty registers nothing |
 | `suggest_unknown_games` | `true` | Point out fullscreen programs that no launcher inventory knows. A suggestion only; AI is never paused for them |
 | `dismissed_suggestions` | `[]` | Executable paths answered with **Not a game**; never suggested again |
-| `providers` | LM Studio and Ollama enabled; Hermes disabled; no other apps chosen | Typed provider entries; see below |
+| `providers` | LM Studio, Ollama and Hermes enabled; no other apps chosen | Typed provider entries; see below |
 | `advanced_settings_visible` | `false` | Show noncore settings/tools in dashboard and tray |
 | `notifications_enabled` | `true` | Windows completion/failure notifications |
 | `sound_enabled` | `true` | One sound source per event; independent of visuals |
@@ -34,7 +34,7 @@ The complete starting configuration is [config.example.json](../config.example.j
 
 Each entry has a stable `id`, a `kind` (`lmstudio`, `ollama`, `hermes` or `process`) and an `enabled` boolean. At most four entries are allowed, one per kind. IDs, kinds and normalized endpoints must be unique. Endpoints accept only `localhost` or `127.0.0.1` with a valid port. Remote control is refused.
 
-Hermes stores `home`, its data directory, and defaults disabled. Empty `home` uses `HERMES_HOME` when set, otherwise `%LOCALAPPDATA%\hermes`. Enable it under **Advanced > Hermes**. Control and model-server ports are discovered from verified native owner records rather than fixed ports. The initial adapter supports local default-profile backends; independently managed servers and remote/SSH sessions are excluded. Do not also select Hermes's runtime under Other AI apps. Pending recovery blocks changes to the Hermes entry. See [Hermes behavior and limits](USAGE.md#hermes-local-models).
+Hermes stores `home`, its data directory, and defaults enabled on fresh installs and migrations from settings before version 5. Existing version-5 choices are preserved, including the disabled default saved by 2.6.0. Empty `home` uses `HERMES_HOME` when set, otherwise `%LOCALAPPDATA%\hermes`. Change it under **Advanced > Hermes**. Control and model-server ports are discovered from verified native owner records rather than fixed ports. The initial adapter supports local default-profile backends; independently managed servers and remote/SSH sessions are excluded. Do not also select Hermes's runtime under Other AI apps. Pending recovery blocks changes to the Hermes entry. See [Hermes behavior and limits](USAGE.md#hermes-local-models).
 
 LM Studio stores `endpoint` (default `127.0.0.1:1234`), `lms_path` (empty for autodetection) and `stop_server_during_gaming` (default `true`) inside `connection`. Ollama stores `endpoint` (default `127.0.0.1:11434`) directly on its entry and is enabled by default. When nothing answers at that address, GamePause treats Ollama as not running and does nothing with it. Set `enabled` to `false` to turn it off; read the [restore subset and limits](USAGE.md#background-ai-applications). Version-3 settings, where Ollama was off by default, get the Ollama entry enabled once when they migrate to version 4; a `false` saved afterwards is kept. Ordinary unloading does not start Ollama or download models.
 

@@ -1,5 +1,26 @@
 # Validation
 
+## v2.6.1 Hermes gateway and settings fixes - 2026-10-18
+
+The installed log confirmed manual pause failed because the managed router's owner was the messaging gateway rather than the Desktop HTTP backend. The patched read-only Doctor, using a private Hermes-only configuration, verified the current default-profile gateway identity, supported readable restart details and native Desktop control. It reported `gateway_restart_required=true` and `native_control=true`. Those diagnostics did not mutate providers. The owner then authorized the live cycle described below.
+
+| Command | Result |
+|---|---|
+| `cargo test --locked hermes --lib` | 11 passed before live fixes; the final full suite includes the additional startup-environment regression |
+| `cargo test --locked compact_provider_settings --lib` | 1 passed |
+| `cargo test --locked` | 352 library and 10 CLI tests passed; 6 interactive/child fixtures ignored |
+| `cargo fmt --check` | Passed |
+| `cargo clippy --locked --all-targets -- -D warnings` | Passed |
+| `git diff --check` | Passed |
+
+Regressions cover separate gateway stop/start checkpoints, restart after a failed gateway start with original evidence intact, version-1 recovery refusal of gateway evidence, encrypted command/environment round-trip, fresh-install enablement, guarded pre-v5 migration and preservation of later opt-outs. Offscreen Hermes/Ollama settings at the reported window size fit with detailed notes collapsed.
+
+The authorized live test captured a gateway-owned runtime with one `Qwen3.8-27B-UD-Q4_K_M` model at context `221184`. Initial pause/restore attempts retained recovery after delayed model-process exit, an exited-process inventory error and live-environment equality rejection. The fixes wait up to 15 seconds for recorded workers to exit, skip only confirmed exited inventory entries, and verify the gateway's home/image/command/working directory while allowing startup changes to its process environment. The captured environment remains encrypted and is replayed unchanged.
+
+The retained immutable gateway-fallback session was re-paused through the normal headless watcher using a harmless `ping.exe` registered only in its private configuration. Independent reads confirmed enabled=false and no gateway/engine processes during the verified pause. After that fixture exited, automatic recovery completed, the watcher exited 0, and an independent comparison matched the baseline model, live context and saved model/runtime preferences. The gateway was running under a new PID and `state.json` was cleared. No original journal was discarded or manually rewritten. This was a replay of the originally captured gateway-fallback obligation, rather than a new capture after ownership had moved to Desktop.
+
+Physical rendering, screen-reader behavior, installer upgrade, multi-model replay and sleep/reboot remain untested. Keep Hermes Desktop open for native runtime control; unsupported profiles, changed launch details, inaccessible processes and conflicting content retain recovery.
+
 ## v2.6.0 Hermes - 2026-10-15
 
 A private Hermes-only configuration passed the native CLI round-trip: stop, verified process absence, start, replay and original supported-field verification. LM Studio and Ollama were disabled. The resident model was `Qwen3.8-27B-UD-Q4_K_M` on CUDA llama.cpp `b11370`, with actual live context `147456` (saved UI override `131072`). An independent authenticated read-back matched the baseline model, enabled runtime and saved model/runtime preferences; `state.json` was cleared. No independently verified Hermes application release range is claimed.

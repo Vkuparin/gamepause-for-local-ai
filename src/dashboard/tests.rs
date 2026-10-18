@@ -510,6 +510,41 @@ fn three_main_providers_and_other_apps_have_stable_visible_rows() {
         );
     }
 }
+#[test]
+fn compact_provider_settings_fit_the_reported_window_without_expanding_details() {
+    let mut state = fixture();
+    state.config.advanced_settings_visible = true;
+    let mut d = dashboard(state.clone());
+    let ctx = Context::default();
+    design::fonts(&ctx);
+    for page in [SettingsPage::Hermes, SettingsPage::Ollama] {
+        d.settings_page = page;
+        let mut height = 0.0;
+        for _ in 0..2 {
+            let _ = ctx.run(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1110.0, 880.0))),
+                    ..Default::default()
+                },
+                |ctx| {
+                    CentralPanel::default().show(ctx, |ui| {
+                        let start = ui.cursor().top();
+                        d.advanced(
+                            ui,
+                            &state,
+                            design::Palette::for_mode(true, false, Look::Running),
+                        );
+                        height = ui.cursor().top() - start;
+                    });
+                },
+            );
+        }
+        assert!(
+            height < 500.0,
+            "provider settings should leave room for the hero and footer: {height}"
+        );
+    }
+}
 /// Render only fictional state. No watcher, provider, startup or config writes.
 #[test]
 #[ignore = "opens an isolated renderer window for visual review"]

@@ -32,7 +32,7 @@
     {
       "kind": "hermes",
       "id": "hermes-main",
-      "enabled": false,
+      "enabled": true,
       "home": ""
     }
   ],

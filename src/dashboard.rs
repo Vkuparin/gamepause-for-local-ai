@@ -53,14 +53,14 @@ pub fn is_dialog_message(_: &windows_sys::Win32::UI::WindowsAndMessaging::MSG) -
     false
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 enum Page {
     Games,
     Running,
     Ignored,
     Activity,
 }
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum SettingsPage {
     Hermes,
     General,
@@ -331,6 +331,7 @@ impl Dashboard {
             .frame(Frame::new().fill(palette.background).inner_margin(18))
             .show(ctx, |ui| {
                 ScrollArea::vertical()
+                    .id_salt((self.page, s.config.advanced_settings_visible.then_some(self.settings_page)))
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         self.hero(ui, s, &hero, palette);

@@ -6,8 +6,8 @@ use anyhow::{Context, Result, bail};
 use std::ffi::c_void;
 use windows_sys::Win32::{
     Foundation::{
-        CloseHandle, ERROR_NO_MORE_FILES, FILETIME, GetLastError, HANDLE, HWND,
-        INVALID_HANDLE_VALUE, LPARAM, WAIT_OBJECT_0,
+        CloseHandle, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, FILETIME, GetLastError, HANDLE,
+        HWND, INVALID_HANDLE_VALUE, LPARAM, WAIT_OBJECT_0,
     },
     System::{
         Diagnostics::{
@@ -115,26 +115,56 @@ pub fn running(paths: &[String]) -> Result<Vec<Found>> {
             .unwrap_or(entry.szExeFile.len());
         let name = String::from_utf16_lossy(&entry.szExeFile[..length]).to_ascii_lowercase();
         // Open only processes whose file name matches a configured app.
-        if names.contains(&name) {
-            let handle = open(entry.th32ProcessID, PROCESS_QUERY_LIMITED_INFORMATION)
-                .context("Matching process unavailable; residency is unknown")?;
-            let path = image(&handle)?;
-            if wanted.contains(&crate::discovery::canonical(&path)) {
-                if found.len() >= super::MAX_PROCESSES {
-                    bail!("Too many matching processes; residency is unknown");
-                }
-                found.push(Found {
-                    pid: entry.th32ProcessID,
-                    created_at: created_at(&handle)?,
-                    parent: entry.th32ParentProcessID,
-                    path,
-                });
+        if names.contains(&name)
+            && let Some((path, created_at)) = inventory_identity(entry.th32ProcessID)?
+            && wanted.contains(&crate::discovery::canonical(&path))
+        {
+            if found.len() >= super::MAX_PROCESSES {
+                bail!("Too many matching processes; residency is unknown");
             }
+            found.push(Found {
+                pid: entry.th32ProcessID,
+                created_at,
+                parent: entry.th32ParentProcessID,
+                path,
+            });
         }
         more = unsafe { Process32NextW(snapshot.0, &mut entry) } != 0;
     }
     enumeration_finished(unsafe { GetLastError() })?;
     Ok(found)
+}
+/// Toolhelp may include a process that exited after the snapshot was taken.
+/// Only a confirmed exit may be skipped; access failures remain unknown.
+pub(super) fn inventory_identity(pid: u32) -> Result<Option<(String, u64)>> {
+    let raw = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            0,
+            pid,
+        )
+    };
+    if raw.is_null() {
+        if unsafe { GetLastError() } == ERROR_INVALID_PARAMETER {
+            return Ok(None);
+        }
+        bail!("Matching process unavailable; residency is unknown");
+    }
+    let handle = Handle(raw);
+    let exited = || unsafe { WaitForSingleObject(handle.0, 0) } == WAIT_OBJECT_0;
+    if exited() {
+        return Ok(None);
+    }
+    let path = match image(&handle) {
+        Ok(path) => path,
+        Err(_) if exited() => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let birth = created_at(&handle)?;
+    if exited() {
+        return Ok(None);
+    }
+    Ok(Some((path, birth)))
 }
 fn read<T: Copy>(process: HANDLE, address: usize) -> Result<T> {
     let mut value = std::mem::MaybeUninit::<T>::zeroed();

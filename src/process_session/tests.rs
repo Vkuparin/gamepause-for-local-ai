@@ -516,3 +516,20 @@ fn drive_root_working_directory_survives_new_and_legacy_captures() {
         assert_eq!(c.runtime.os.launched[0].directory, r"D:\");
     }
 }
+
+#[test]
+fn exited_process_objects_do_not_make_inventory_unknown() {
+    use std::os::windows::process::CommandExt;
+    let mut child = std::process::Command::new("cmd.exe")
+        .args(["/d", "/c", "exit", "0"])
+        .creation_flags(0x08000000)
+        .spawn()
+        .unwrap();
+    child.wait().unwrap();
+    assert!(native::inventory_identity(child.id()).unwrap().is_none());
+    assert!(
+        native::inventory_identity(std::process::id())
+            .unwrap()
+            .is_some()
+    );
+}

@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.6.1 - 2026-10-18
+
+- Fix manual pause when Hermes's messaging gateway owns its managed router. Keep native runtime-only control when available; otherwise securely capture the verified gateway's restart details, close it for the pause, and reopen it after restoring the runtime and models. Each stop/start has a separate recovery checkpoint. Keep Hermes Desktop open for native runtime control. Closing the gateway suspends messaging and background tasks until it returns.
+- Enable Hermes on fresh installs and when migrating pre-Hermes settings. Keep existing version-5 provider choices, including saved opt-outs.
+- Shorten the Ollama and Hermes settings pages, move detailed restoration notes into expandable help, widen the Hermes path field and give settings pages separate scroll positions.
+
+A live gateway-fallback replay passed: the runtime was disabled and gateway/engine absence verified during a harmless registered process, then the gateway and captured model returned automatically, original preferences/context matched and recovery cleared. Initial attempts exposed delayed worker exit, exited-process enumeration and mutable startup environment handling; these were fixed before the passing replay. Physical UI acceptance and installer upgrade remain untested. Native-only pause/restore evidence from 2.6.0 remains limited to that tested topology. Restore pending AI before downgrading; older versions cannot read gateway-fallback recovery.
+
 ## 2.6.0 - 2026-10-15
 
 - Hermes is a main provider beside LM Studio and Ollama. Enable it under **Advanced > Hermes** to pause its verified managed local runtime while gaming, leaving Hermes open. GamePause records recovery before using Hermes's native off switch, then restores the runtime and captured local model content, live context and supported load fields. A Hermes-only setup needs no LM Studio installation.

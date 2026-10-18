@@ -171,14 +171,16 @@ impl Dashboard {
                     },
                     SettingsPage::Ollama=> {
                         ui.heading("Ollama");
-                        ui.label("Works when Ollama is running; nothing happens when it is not. Local models are unloaded for gaming. GGUF completion models come back with their context and the keep-alive time they had left; other local models, such as embedding models, stay unloaded. Full load options, parallelism, conversations and KV cache are not preserved.");
-                        ui.label("Ordinary unloading leaves Ollama running, so clients can reload models. GamePause does not download models.");
+                        ui.label("Unloads local models while paused and restores supported models afterward.");
                         let editable=!s.provider_pending(crate::provider::Kind::Ollama);
                         ui.add_enabled_ui(editable,|ui| {
                             if let Some(crate::config::Provider::Ollama{enabled,endpoint,prevent_reload,..})=self.edit_config.providers.iter_mut().find(|p|p.kind()==crate::provider::Kind::Ollama) {
-                                self.dirty |= ui.styled_checkbox(enabled,"Pause Ollama models while gaming").changed();
-                                self.dirty |= ui.styled_checkbox(prevent_reload,"Prevent Ollama from reloading models while gaming").changed();
-                                ui.label("Temporarily closes and restarts Ollama Desktop, including its UI. Supported with verified Windows Ollama 0.40.3; other installations use ordinary unloading. Requests arriving during shutdown may be canceled. External restarts are left alone.");
+                                self.dirty |= ui.styled_checkbox(enabled,"Pause Ollama").changed();
+                                self.dirty |= ui.styled_checkbox(prevent_reload,"Close Ollama Desktop while paused").changed();
+                                ui.collapsing("How restoration works", |ui| {
+                                    ui.label("GGUF completion models return with their context and remaining keep-alive time. Embedding and other local models stay unloaded. Conversations, KV cache and other load options are not restored.");
+                                    ui.label("Closing Desktop prevents requests from reloading models. Requires verified Windows Ollama 0.40.3; other installations keep ordinary unloading. Shutdown may cancel requests. External restarts are left alone. No models are downloaded.");
+                                });
                                 ui.label("Loopback endpoint");self.dirty |= ui.text_edit_singleline(endpoint).changed();
                             } else {ui.label("No Ollama entry is configured.");}
                         });
@@ -188,18 +190,22 @@ impl Dashboard {
                     },
                     SettingsPage::Hermes=> {
                         ui.heading("Hermes");
-                        ui.label("Temporarily turns off Hermes's managed local runtime while gaming, leaving Hermes open. Restores the captured resident models and supported load fields afterwards. Conversations and idle timing are not preserved.");
-                        ui.label("The runtime's enabled setting is saved by Hermes's native off switch. GamePause records recovery before changing it and turns it back on after gaming. If Hermes closes, reopen it to finish recovery. External changes can override the pause.");
+                        ui.label("Turns off local models while paused, then restores them.");
+                        ui.label("If the gateway owns the runtime, it closes and reopens too.");
                         let editable = !s.provider_pending(crate::provider::Kind::Hermes);
                         if !editable { ui.colored_label(p.accent,"Finish pending Hermes recovery before changing its configuration."); }
                         ui.add_enabled_ui(editable,|ui| {
                             if let Some(crate::config::Provider::Hermes { enabled,home,.. }) = self.edit_config.providers.iter_mut().find(|p|p.kind()==crate::provider::Kind::Hermes) {
-                                self.dirty |= ui.styled_checkbox(enabled,"Pause Hermes local models while gaming").changed();
+                                self.dirty |= ui.styled_checkbox(enabled,"Pause Hermes").changed();
                                 ui.label("Hermes data directory");
-                                self.dirty |= ui.add(TextEdit::singleline(home).hint_text("Automatic (HERMES_HOME or Windows default)")).changed();
+                                self.dirty |= ui.add(TextEdit::singleline(home).desired_width(ui.available_width()).hint_text("Automatic")).changed();
                             } else { ui.label("No Hermes entry is configured."); }
                         });
-                        ui.colored_label(p.muted,"Uses the verified local default-profile backend and installed runtime. Does not download models or start Hermes.");
+                        ui.collapsing("How restoration works", |ui| {
+                            ui.label("Automatic uses HERMES_HOME or the Windows default. Only a verified local default-profile runtime is controlled; no models are downloaded.");
+                            ui.label("Native pause leaves Hermes open. A gateway-owned runtime requires closing the gateway, suspending its messaging and background tasks. Its saved command and environment are encrypted for your Windows account and used to reopen it without a console.");
+                            ui.label("Loaded models return with supported settings. Conversations and idle timing are not restored. If Hermes closes, reopen it to finish recovery. External restarts can override a pause.");
+                        });
                         self.save_bar(ui,s,p);
                     },
                     SettingsPage::Apps=> {

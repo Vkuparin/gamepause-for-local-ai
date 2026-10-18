@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 pub(crate) fn original() -> Original {
     Original {
+        gateway: None,
         home: r"D:\Fixture\Hermes".into(),
         enabled: true,
         running: true,
@@ -34,11 +35,27 @@ pub(crate) fn original() -> Original {
 struct Mock {
     calls: Vec<&'static str>,
     fail_verify: bool,
+    gateway: bool,
+    fail_gateway_start: bool,
 }
 impl Backend for Mock {
     fn capture(&mut self) -> Result<Original> {
         self.calls.push("capture");
-        Ok(original())
+        let mut original = original();
+        if self.gateway {
+            original.gateway = Some(Box::new(crate::hermes::Gateway {
+                process: Process {
+                    pid: 124,
+                    start_time: 455,
+                },
+                image: FileIdentity {
+                    path: r"D:\Fixture\Hermes\python.exe".into(),
+                    sha256: "d".repeat(64),
+                },
+                sealed: "aa".repeat(32),
+            }));
+        }
+        Ok(original)
     }
     fn stop(&mut self, _: &Original) -> Result<()> {
         self.calls.push("stop");
@@ -63,6 +80,75 @@ impl Backend for Mock {
         self.calls.push("verify-restore");
         Ok(())
     }
+    fn stop_gateway(&mut self, _: &Original) -> Result<()> {
+        self.calls.push("stop-gateway");
+        Ok(())
+    }
+    fn start_gateway(&mut self, _: &Original) -> Result<()> {
+        self.calls.push("start-gateway");
+        if self.fail_gateway_start {
+            bail!("gateway unavailable");
+        }
+        Ok(())
+    }
+}
+#[test]
+fn gateway_fallback_checkpoints_each_change_and_retries_start_without_losing_original() {
+    let bind = binding("hermes-fixture");
+    let mut adapter = Adapter::new(
+        Mock {
+            gateway: true,
+            ..Default::default()
+        },
+        bind.clone(),
+    )
+    .unwrap();
+    let mut entry = adapter.capture(&bind, &[]).unwrap();
+    assert_eq!(entry.payload.version, 2);
+    let original = entry.payload.original.clone();
+    for (checkpoint, finished) in [
+        (Stage::GatewayStopping, Stage::GatewayStopped),
+        (Stage::Stopping, Stage::Stopped),
+        (Stage::Stopped, Stage::Stopped),
+    ] {
+        let before = adapter.backend.calls.clone();
+        let planned = adapter.plan(&entry, Intent::Pause).unwrap();
+        assert_eq!(planned.checkpoint.stage, checkpoint);
+        assert_eq!(
+            adapter.backend.calls, before,
+            "planning must not mutate Hermes"
+        );
+        entry.payload = adapter.execute(&bind, planned.work).unwrap().payload;
+        assert_eq!(entry.payload.stage, finished);
+    }
+    assert!(entry.payload.pause_complete);
+    assert_eq!(
+        adapter.backend.calls,
+        ["capture", "stop-gateway", "stop", "verify-pause"]
+    );
+    adapter.begin(&mut entry.payload, Intent::Restore).unwrap();
+    for _ in 0..2 {
+        let planned = adapter.plan(&entry, Intent::Restore).unwrap();
+        entry.payload = adapter.execute(&bind, planned.work).unwrap().payload;
+    }
+    assert_eq!(entry.payload.stage, Stage::Started);
+    let planned = adapter.plan(&entry, Intent::Restore).unwrap();
+    assert_eq!(planned.checkpoint.stage, Stage::GatewayStarting);
+    entry.payload = planned.checkpoint;
+    adapter.backend.fail_gateway_start = true;
+    assert!(adapter.execute(&bind, planned.work).is_err());
+    assert_eq!(entry.payload.original, original);
+    let mut restarted = Adapter::new(Mock::default(), bind.clone()).unwrap();
+    let planned = restarted.plan(&entry, Intent::Restore).unwrap();
+    entry.payload = restarted.execute(&bind, planned.work).unwrap().payload;
+    let planned = restarted.plan(&entry, Intent::Restore).unwrap();
+    let complete = restarted.execute(&bind, planned.work).unwrap();
+    assert!(complete.restore_complete);
+    assert_eq!(restarted.backend.calls, ["start-gateway", "verify-restore"]);
+    assert_eq!(complete.payload.original, original);
+    let mut legacy = complete.payload;
+    legacy.version = 1;
+    assert!(legacy.validate().is_err());
 }
 #[test]
 fn acknowledgement_does_not_complete_pause_and_restart_replays_checkpoint() {

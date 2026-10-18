@@ -25,9 +25,8 @@ unsafe extern "system" {
         returned: *mut u32,
     ) -> i32;
 }
-/// Reads only the data-directory variable from a bounded native environment.
-/// Neither the environment nor other variables are returned, logged or saved.
-pub(super) fn environment_home(identity: &Process) -> Result<Option<String>> {
+/// Reads a bounded native environment. Gateway restart data must be sealed before persistence.
+pub(super) fn environment_block(identity: &Process) -> Result<Vec<u16>> {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     let raw = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, identity.pid) };
     if raw.is_null() {
@@ -70,8 +69,7 @@ pub(super) fn environment_home(identity: &Process) -> Result<Option<String>> {
     }
     let parameters = pointer(handle.0, basic[1] + 0x20)?;
     let environment = pointer(handle.0, parameters + 0x80)?;
-    let mut entry = Vec::new();
-    let mut found = None;
+    let mut block = Vec::new();
     for index in 0..65536 {
         let mut unit = 0u16;
         let mut read = 0usize;
@@ -88,25 +86,28 @@ pub(super) fn environment_home(identity: &Process) -> Result<Option<String>> {
         {
             bail!("Hermes environment cannot be verified");
         }
-        if unit == 0 {
-            if entry.is_empty() {
-                return Ok(found);
-            }
-            let text = String::from_utf16(&entry).context("Invalid Hermes environment encoding")?;
-            if let Some((name, value)) = text.split_once('=')
-                && name.eq_ignore_ascii_case("HERMES_HOME")
-            {
-                if found.is_some() {
-                    bail!("Ambiguous Hermes data directory");
-                }
-                found = Some(value.to_owned());
-            }
-            entry.clear();
-        } else {
-            entry.push(unit);
+        block.push(unit);
+        if block.len() >= 2 && block.ends_with(&[0, 0]) {
+            return Ok(block);
         }
     }
     bail!("Hermes environment exceeds verification bounds")
+}
+pub(super) fn environment_home(identity: &Process) -> Result<Option<String>> {
+    let block = environment_block(identity)?;
+    let mut found = None;
+    for entry in block.split(|u| *u == 0) {
+        let text = String::from_utf16(entry).context("Invalid Hermes environment encoding")?;
+        if let Some((name, value)) = text.split_once('=')
+            && name.eq_ignore_ascii_case("HERMES_HOME")
+        {
+            if found.is_some() {
+                bail!("Ambiguous Hermes data directory");
+            }
+            found = Some(value.to_owned());
+        }
+    }
+    Ok(found)
 }
 pub(super) struct Handle(pub HANDLE);
 impl Drop for Handle {

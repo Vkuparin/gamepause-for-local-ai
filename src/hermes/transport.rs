@@ -158,8 +158,19 @@ impl Local {
                 })
             })
             .transpose()?;
+        let gateway_fallback = live
+            .as_ref()
+            .zip(control.as_ref())
+            .is_some_and(|((router, _), control)| router.owner_pid != control.owner.pid);
+        if gateway_fallback && let Some((router, _)) = &live {
+            super::gateway::verify_restart(
+                &self.home,
+                &self.host_dir,
+                (router.owner_pid, router.owner_start_time),
+            )?;
+        }
         Ok(
-            json!({"runtime":{"ok":true,"value":{"running":live.is_some(),"enabled":enabled,"resident_models":residents,"native_control":control.is_some()}},"compatibility":"Managed default-profile runtime; live restore compatibility depends on verified fields","detail":"Read-only; does not start Hermes or change model residency."}),
+            json!({"runtime":{"ok":true,"value":{"running":live.is_some(),"enabled":enabled,"resident_models":residents,"native_control":control.is_some(),"gateway_restart_required":gateway_fallback}},"compatibility":"Managed default-profile runtime; live restore compatibility depends on verified fields","detail":if gateway_fallback {"Gateway owns the runtime: pause closes the verified gateway and restore reopens it. Hermes Desktop must remain open for native runtime control."} else {"Read-only; does not start Hermes or change model residency."}}),
         )
     }
     pub(super) fn request(
@@ -235,6 +246,12 @@ impl Local {
         Ok(Some((router, held)))
     }
     fn control(&self, required_owner: Option<(u32, u64)>) -> Result<Option<Control>> {
+        let gateway_owned = match required_owner {
+            Some(identity) => {
+                super::gateway::owner(&self.home, &self.host_dir, Some(identity))?.is_some()
+            }
+            None => false,
+        };
         let mut choices = Vec::new();
         for role in ["desktop-serve", "serve"] {
             let path = self.host_dir.join(format!("host-{role}.json"));
@@ -244,6 +261,7 @@ impl Local {
             let record: Host = serde_json::from_slice(&read(&path)?)
                 .context("Unsupported Hermes control record")?;
             if let Some((pid, start)) = required_owner
+                && !gateway_owned
                 && (record.pid != pid || record.start_time != start)
             {
                 continue;
@@ -357,6 +375,7 @@ impl Local {
         for file in original
             .engine
             .iter()
+            .chain(original.gateway.iter().map(|g| &g.image))
             .chain(original.models.iter().flat_map(|m| &m.files))
         {
             if self.identity(&file.path)?.sha256 != file.sha256 {
@@ -633,6 +652,7 @@ impl Backend for Local {
             .map(|(r, _)| (r.owner_pid, r.owner_start_time));
         let control = self.control(owner)?;
         let mut original = Original {
+            gateway: None,
             home: self.home.to_string_lossy().into_owned(),
             enabled: false,
             running: false,
@@ -646,7 +666,9 @@ impl Backend for Local {
         };
         let Some(control) = control else {
             if live.is_some() {
-                bail!("Hermes runtime has no verified native control owner");
+                bail!(
+                    "Hermes runtime has no verified control backend; keep Hermes Desktop open and retry"
+                );
             }
             return Ok(original);
         };
@@ -671,6 +693,16 @@ impl Backend for Local {
             original.router = Some(held.identity.clone());
             original.children = native::tree(&held.identity, &router.executable)?;
             original.engine = Some(self.identity(&router.executable)?);
+            if control.owner.pid != router.owner_pid {
+                let gateway = super::gateway::owner(
+                    &self.home,
+                    &self.host_dir,
+                    Some((router.owner_pid, router.owner_start_time)),
+                )?
+                .context("Hermes runtime owner changed during capture")?;
+                let image = self.identity(&gateway.path()?)?;
+                original.gateway = Some(Box::new(super::gateway::capture(&gateway, image)?));
+            }
             let rows = self.inventory(&router)?;
             for row in rows
                 .iter()
@@ -739,20 +771,68 @@ impl Backend for Local {
         }
         Ok(())
     }
+    fn stop_gateway(&mut self, original: &Original) -> Result<()> {
+        let Some(gateway) = &original.gateway else {
+            return Ok(());
+        };
+        let control = self.control_original(original)?;
+        self.content(original)?;
+        self.verify_preferences(&control, original)?;
+        let live = self.live_router()?;
+        self.claim(&control, live.as_ref().map(|(r, _)| r), Some(original))?;
+        if let Some((router, _)) = live {
+            for row in self
+                .inventory(&router)?
+                .iter()
+                .filter(|r| matches!(r["status"]["value"].as_str(), Some("loaded" | "ready")))
+            {
+                let id = row["id"].as_str().unwrap();
+                self.idle(&router, id)?;
+                if !original.models.contains(&self.model(&router, row)?) {
+                    bail!("Hermes loadout changed before gateway stop; left running");
+                }
+            }
+        }
+        super::gateway::stop(&self.home, &self.host_dir, gateway)
+    }
+    fn start_gateway(&mut self, original: &Original) -> Result<()> {
+        let Some(gateway) = &original.gateway else {
+            return Ok(());
+        };
+        let control = self.control_original(original)?;
+        self.content(original)?;
+        if self.verify_preferences(&control, original)? != original.enabled {
+            bail!("Hermes enabled setting changed; recovery retained");
+        }
+        self.claim(&control, None, Some(original))?;
+        super::gateway::start(&self.home, &self.host_dir, gateway)
+    }
     fn verify_paused(&mut self, original: &Original) -> Result<()> {
+        if let Some(gateway) = &original.gateway {
+            super::gateway::paused(&self.home, &self.host_dir, gateway)?;
+        }
         let control = self.control_original(original)?;
         if self.verify_preferences(&control, original)? || self.live_router()?.is_some() {
             bail!("Hermes runtime is still enabled or running");
         }
-        for process in original.router.iter().chain(&original.children) {
-            if !native::gone(process)? {
+        let began = std::time::Instant::now();
+        loop {
+            let mut exited = true;
+            for process in original.router.iter().chain(&original.children) {
+                exited &= native::gone(process)?;
+            }
+            if exited {
+                if let Some(engine) = &original.engine
+                    && !native::no_engine(&engine.path)?
+                {
+                    bail!("Hermes model process absence is unverified");
+                }
+                break;
+            }
+            if began.elapsed() >= Duration::from_secs(15) {
                 bail!("Hermes managed model process is still running");
             }
-        }
-        if let Some(engine) = &original.engine
-            && !native::no_engine(&engine.path)?
-        {
-            bail!("Hermes model process absence is unverified");
+            std::thread::sleep(Duration::from_millis(100));
         }
         Ok(())
     }
@@ -848,6 +928,9 @@ impl Backend for Local {
             || original.models.iter().any(|m| !current.contains(m))
         {
             bail!("Hermes original resident models and supported fields are not restored");
+        }
+        if let Some(gateway) = &original.gateway {
+            super::gateway::restored(&self.home, &self.host_dir, gateway)?;
         }
         self.pins.clear();
         Ok(())

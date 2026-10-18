@@ -227,7 +227,7 @@ fn ollama_endpoint_and_enablement_persist() {
     assert!(!Config::default().providers[1].enabled());
 }
 #[test]
-fn version_four_adds_disabled_hermes_with_guarded_byte_identical_backup() {
+fn version_four_enables_new_hermes_with_guarded_backup_and_preserves_later_choices() {
     let fixture = Fixture::new();
     let mut four = serde_json::to_value(Config::default()).unwrap();
     four["settings_version"] = 4.into();
@@ -241,12 +241,17 @@ fn version_four_adds_disabled_hermes_with_guarded_byte_identical_backup() {
     let migrated = Config::load(&fixture.path()).unwrap();
     assert_eq!(migrated.settings_version, 5);
     assert_eq!(migrated.providers.len(), 4);
-    assert!(!migrated.hermes_enabled() && !migrated.ollama_enabled());
+    assert!(migrated.hermes_enabled() && !migrated.ollama_enabled());
     assert_eq!(
         fs::read(fixture.path().with_extension("v4.backup.json")).unwrap(),
         original
     );
     let mut opted_out = migrated;
+    if let Provider::Hermes { enabled, .. } = &mut opted_out.providers[3] {
+        *enabled = false;
+    }
+    write_json(&fixture.path(), &opted_out).unwrap();
+    assert!(!Config::load(&fixture.path()).unwrap().hermes_enabled());
     opted_out
         .providers
         .retain(|p| p.kind() != crate::provider::Kind::Hermes);

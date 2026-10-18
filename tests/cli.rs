@@ -8,6 +8,12 @@ use std::{
 };
 static SERIAL: AtomicU64 = AtomicU64::new(0);
 #[test]
+fn fresh_install_enables_hermes_alongside_ollama() {
+    let config = Config::default();
+    assert!(config.hermes_enabled());
+    assert!(config.ollama_enabled());
+}
+#[test]
 fn enabled_ollama_is_left_alone_in_observation() {
     let fixture = Fixture::new();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -95,7 +101,9 @@ impl Fixture {
         // Tests that exercise Ollama enable it against a private endpoint;
         // the rest must not probe a developer's real service.
         for provider in &mut config.providers {
-            if let config::Provider::Ollama { enabled, .. } = provider {
+            if let config::Provider::Ollama { enabled, .. }
+            | config::Provider::Hermes { enabled, .. } = provider
+            {
                 *enabled = false;
             }
         }

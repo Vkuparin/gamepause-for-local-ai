@@ -13,6 +13,10 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum Stage {
     Captured,
+    GatewayStopping,
+    GatewayStopped,
+    GatewayStarting,
+    GatewayStarted,
     Stopping,
     Stopped,
     Starting,
@@ -30,7 +34,14 @@ pub struct Snapshot {
 }
 impl Snapshot {
     pub fn units(&self) -> usize {
-        self.original.models.len().saturating_add(2)
+        self.original
+            .models
+            .len()
+            .saturating_add(if self.original.gateway.is_some() {
+                4
+            } else {
+                2
+            })
     }
     pub fn held(&self) -> bool {
         self.original.running
@@ -43,7 +54,16 @@ impl Snapshot {
     pub fn validate(&self) -> Result<()> {
         self.original.validate()?;
         let mut ids = std::collections::BTreeSet::new();
-        if self.version != 1
+        if !matches!(self.version, 1 | 2)
+            || (self.version == 1 && self.original.gateway.is_some())
+            || (self.original.gateway.is_none()
+                && matches!(
+                    self.stage,
+                    Stage::GatewayStopping
+                        | Stage::GatewayStopped
+                        | Stage::GatewayStarting
+                        | Stage::GatewayStarted
+                ))
             || (self.pause_complete && self.stage != Stage::Stopped)
             || self
                 .loaded
@@ -67,12 +87,16 @@ impl Snapshot {
     pub fn note(&self) -> String {
         if !self.original.running {
             "Not running; nothing to pause.".into()
+        } else if self.original.gateway.is_some() {
+            "Closes the runtime-owning Hermes gateway while paused, then reopens it and restores the captured models.".into()
         } else {
             "Restores the managed runtime, captured model content and supported live fields; conversations and idle timing are not preserved.".into()
         }
     }
 }
 enum Operation {
+    StopGateway,
+    StartGateway,
     Stop,
     VerifyPause,
     Start,
@@ -122,9 +146,10 @@ impl<B: Backend> Runtime for Adapter<B> {
     type Work = Work;
     fn capture(&mut self, binding: &Binding, _: &[Game]) -> Result<Entry<Snapshot>> {
         self.guard(binding)?;
+        let original = self.backend.capture()?;
         let snapshot = Snapshot {
-            version: 1,
-            original: self.backend.capture()?,
+            version: if original.gateway.is_some() { 2 } else { 1 },
+            original,
             stage: Stage::Captured,
             loaded: vec![],
             pause_complete: false,
@@ -164,11 +189,26 @@ impl<B: Backend> Runtime for Adapter<B> {
         }
         let operation = match intent {
             Intent::Pause if matches!(snapshot.stage, Stage::Stopped) => Operation::VerifyPause,
+            Intent::Pause
+                if snapshot.original.gateway.is_some()
+                    && matches!(snapshot.stage, Stage::Captured | Stage::GatewayStopping) =>
+            {
+                snapshot.stage = Stage::GatewayStopping;
+                Operation::StopGateway
+            }
             Intent::Pause => {
                 snapshot.stage = Stage::Stopping;
                 Operation::Stop
             }
-            Intent::Restore if matches!(snapshot.stage, Stage::Started | Stage::Restored) => {
+            Intent::Restore
+                if matches!(
+                    snapshot.stage,
+                    Stage::Started
+                        | Stage::Restored
+                        | Stage::GatewayStarting
+                        | Stage::GatewayStarted
+                ) =>
+            {
                 if let Some(index) = snapshot
                     .original
                     .models
@@ -176,6 +216,11 @@ impl<B: Backend> Runtime for Adapter<B> {
                     .position(|m| !snapshot.loaded.contains(&m.id))
                 {
                     Operation::Load(index)
+                } else if snapshot.original.gateway.is_some()
+                    && !matches!(snapshot.stage, Stage::GatewayStarted | Stage::Restored)
+                {
+                    snapshot.stage = Stage::GatewayStarting;
+                    Operation::StartGateway
                 } else {
                     Operation::VerifyRestore
                 }
@@ -204,6 +249,14 @@ impl<B: Backend> Runtime for Adapter<B> {
         snapshot.validate()?;
         let mut restore_complete = false;
         match work.operation {
+            Operation::StopGateway => {
+                self.backend.stop_gateway(&snapshot.original)?;
+                snapshot.stage = Stage::GatewayStopped;
+            }
+            Operation::StartGateway => {
+                self.backend.start_gateway(&snapshot.original)?;
+                snapshot.stage = Stage::GatewayStarted;
+            }
             Operation::Stop => {
                 if snapshot.original.running {
                     self.backend.stop(&snapshot.original)?;

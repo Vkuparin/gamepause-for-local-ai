@@ -6,7 +6,7 @@
 
 **Give your games the VRAM. Get your local AI back afterward.**
 
-GamePause is a small native Windows tray app. When a game starts, it saves the supported state of your local AI providers, pauses them, and restores them after you stop playing. LM Studio and Ollama work by default. Hermes's managed local runtime can be enabled under **Advanced > Hermes**. There is no model list to maintain.
+GamePause is a small native Windows tray app. When a game starts, it saves the supported state of your local AI providers, pauses them, and restores them after you stop playing. LM Studio, Ollama and Hermes are enabled by default. Existing provider choices are preserved when upgrading. There is no model list to maintain.
 
 ![A real session: AI running, paused when a game starts, restored after it closes](docs/images/pause-cycle.gif)
 
@@ -50,7 +50,7 @@ Closing the window leaves GamePause watching from the tray. Left-click the icon 
 ## Get started
 
 1. Download **Setup.exe** from [Releases](https://github.com/Vkuparin/gamepause-for-local-ai/releases) and install it. GamePause starts in the tray and, by default, at Windows sign-in.
-2. Use LM Studio, Ollama or Hermes as usual. For LM Studio, its `lms` command-line tool must be installed; GamePause finds it on its own. For Hermes, enable **Advanced > Hermes** and keep its local backend open. A Hermes-only setup needs no LM Studio installation.
+2. Use LM Studio, Ollama or Hermes as usual. For LM Studio, its `lms` command-line tool must be installed; GamePause finds it on its own. For Hermes, keep its Desktop/backend open; check **Advanced > Hermes** if upgrading from 2.6.0 with Hermes disabled. A Hermes-only setup needs no LM Studio installation.
 3. Play. Automatic pausing is on from the first launch.
 
 If a game is not recognized, open **Running apps** while it runs and choose **Add as game**. GamePause also points out fullscreen programs that look like games it does not know.
@@ -68,7 +68,7 @@ The installer and executables are unsigned, so Windows may show a publisher warn
 
 - **Busy models wait.** If a model is generating when a game starts, unloading waits until it finishes. Stop long-running agents before playing if you need the memory right away.
 - **Ollama restores a subset.** Embedding models and models with unknown format are unloaded but not reloaded; load options, parallelism and conversations are not preserved. [Details](docs/USAGE.md#background-ai-applications).
-- **Hermes uses its native runtime switch.** It leaves Hermes open and restores captured model content, live context and supported load fields. Conversation/KV state and idle timing are not preserved. A live pause/restore passed with Qwen3.8-27B-UD-Q4_K_M on CUDA llama.cpp b11370. [Details](docs/USAGE.md#hermes-local-models).
+- **Hermes pauses its managed runtime.** Native control leaves Hermes open. When the messaging gateway owns the runtime, GamePause closes and reopens that gateway as well. It restores captured model content, live context and supported load fields. Conversation/KV state and idle timing are not preserved. A live pause/restore passed with Qwen3.8-27B-UD-Q4_K_M on CUDA llama.cpp b11370. [Details](docs/USAGE.md#hermes-local-models).
 - **LM Studio updates can need a GamePause update.** Full settings restoration uses LM Studio's internal protocol. After upgrading LM Studio, check **Advanced > Diagnostics**. If a complete snapshot cannot be captured, GamePause refuses to unload.
 - **Quitting keeps a pending restore.** Models paused when you quit come back the next time GamePause runs. Restore before uninstalling.
 - **Detection is best effort.** Protected processes and unusual installations may need to be added by hand.

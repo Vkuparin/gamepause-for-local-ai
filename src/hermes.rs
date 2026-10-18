@@ -1,4 +1,5 @@
 //! Hermes's managed local runtime. Local evidence and HTTP stay on the worker.
+mod gateway;
 mod native;
 mod transport;
 
@@ -73,9 +74,32 @@ pub struct Original {
     /// Digest of the saved model/runtime preferences, excluding enabled state.
     pub preferences_sha256: String,
     pub models: Vec<Model>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<Box<Gateway>>,
+}
+/// The gateway's command, working directory and environment are sealed together.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Gateway {
+    pub process: Process,
+    pub image: FileIdentity,
+    pub sealed: String,
 }
 impl Original {
     pub fn validate(&self) -> Result<()> {
+        if let Some(gateway) = &self.gateway {
+            validate_file(&gateway.image)?;
+            if !self.running
+                || gateway.process.pid == 0
+                || gateway.process.start_time == 0
+                || gateway.sealed.is_empty()
+                || gateway.sealed.len() > 1024 * 1024
+                || !gateway.sealed.len().is_multiple_of(2)
+                || !gateway.sealed.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                bail!("Invalid Hermes gateway recovery; source retained");
+            }
+        }
         if self.home.is_empty()
             || !local_path(&self.home)
             || self.models.len() > MAX_MODELS
@@ -156,6 +180,12 @@ pub trait Backend {
     fn start(&mut self, original: &Original) -> Result<()>;
     fn load(&mut self, original: &Original, model: &Model) -> Result<()>;
     fn verify_restored(&mut self, original: &Original) -> Result<()>;
+    fn stop_gateway(&mut self, _: &Original) -> Result<()> {
+        Ok(())
+    }
+    fn start_gateway(&mut self, _: &Original) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

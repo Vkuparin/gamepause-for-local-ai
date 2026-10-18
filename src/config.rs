@@ -186,7 +186,8 @@ fn default_providers() -> Vec<Provider> {
         },
         Provider::Hermes {
             id: "hermes-main".into(),
-            enabled: false,
+            // Fixtures opt in only against isolated Hermes evidence.
+            enabled: !cfg!(test),
             home: String::new(),
         },
     ]
@@ -381,7 +382,9 @@ impl Config {
                     if providers.iter().any(|p| p["id"] == "hermes-main") {
                         bail!("Hermes provider ID is already used; source retained");
                     }
-                    providers.push(serde_json::to_value(&default_providers()[3])?);
+                    let mut hermes = serde_json::to_value(&default_providers()[3])?;
+                    hermes["enabled"] = true.into();
+                    providers.push(hermes);
                 } else {
                     bail!("Hermes entry in old settings format; source retained");
                 }
