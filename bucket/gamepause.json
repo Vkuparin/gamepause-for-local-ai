@@ -1,5 +1,5 @@
 {
-    "version": "2.6.0",
+    "version": "2.6.1",
     "description": "Pauses LM Studio, Ollama, Hermes and other local AI servers while you game, and restores them afterward.",
     "homepage": "https://github.com/Vkuparin/gamepause-for-local-ai",
     "license": "MIT",
@@ -9,8 +9,8 @@
     ],
     "architecture": {
         "64bit": {
-            "url": "https://github.com/Vkuparin/gamepause-for-local-ai/releases/download/v2.6.0/GamePause-2.6.0-windows-x64.zip",
-            "hash": "f2e1a9f70c08ee71444cb688eb6bbddd1449e46a10a42d71817fc574aece13be"
+            "url": "https://github.com/Vkuparin/gamepause-for-local-ai/releases/download/v2.6.1/GamePause-2.6.1-windows-x64.zip",
+            "hash": "a115d2b75517e14d6f4029568eaded591b464df34c0b3016d21422c2a2838471"
         }
     },
     "extract_dir": "GamePause",
